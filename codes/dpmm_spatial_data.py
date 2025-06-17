@@ -51,7 +51,6 @@ n_samples = 2000
 alpha = 15.0
 tau = 1e-2  # Seuil pour arrêt du SB
 
-
 means_base = [
     [0.5, 0.5],
     [1.5, 0.5],
@@ -64,7 +63,6 @@ weights_base /= weights_base.sum()
 kappa_0 = 4.0
 nu_0 = 5
 Psi_0 = ot.CovarianceMatrix([[0.03, 0.001], [0.001, 0.01]])
-
 
 def sample_mixture_niw():
     base_idx = np.random.choice(len(means_base), p=weights_base)
@@ -100,7 +98,6 @@ def sample_dpmm(n_samples=1000):
         data.append(list(point))
 
     return np.array(data)
-
 
 # ===== Visualisation ====
 samples = sample_dpmm(n_samples)
