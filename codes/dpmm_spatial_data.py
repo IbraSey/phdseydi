@@ -62,7 +62,7 @@ weights_base /= weights_base.sum()
 
 kappa_0 = 4.0
 nu_0 = 5
-Psi_0 = ot.CovarianceMatrix([[0.03, 0.001], [0.001, 0.01]])
+Psi_0 = ot.CovarianceMatrix([[0.03, 0.00], [0.00, 0.01]])
 
 def sample_mixture_niw():
     base_idx = np.random.choice(len(means_base), p=weights_base)
@@ -120,13 +120,13 @@ plt.show()
 dim = 2  # dimension
 n_sample = 500
 
-nu = dim + 5  # degrés de liberté (> dim)
-Psi = ot.CovarianceMatrix([[1.0, 0.3], [0.3, 1.0]])  # matrice d’échelle (dim x dim)
+nu_0 = dim + 5  # degrés de liberté (> dim)
+Psi_0 = ot.CovarianceMatrix([[1.0, 0.3], [0.3, 1.0]])  # matrice d’échelle (dim x dim)
 mu_0 = ot.Point([0.0, 0.0])  # moyenne de la normale conditionnelle
-kappa = 1.0  # "force" de la moyenne
+kappa_0 = 1.0  # "force" de la moyenne
 
-Sigma = ot.InverseWishart(Psi, nu).getRealizationAsMatrix()
-mu = ot.Normal(mu_0, ot.CovarianceMatrix(Sigma / kappa)).getRealization()
+Sigma = ot.InverseWishart(Psi_0, nu_0).getRealizationAsMatrix()
+mu = ot.Normal(mu_0, ot.CovarianceMatrix(Sigma / kappa_0)).getRealization()
 
 sample = ot.Normal(mu, Sigma).getSample(n_sample)
 
@@ -149,3 +149,5 @@ plt.show()
 
 
 
+
+# %%
