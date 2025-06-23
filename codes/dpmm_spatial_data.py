@@ -47,8 +47,8 @@ print("Somme des poid (proche de 1):", sum(weights))
 # =============================================================================================================
 # %%
 dim = 2
-n_samples = 2000
-alpha = 15.0
+n_samples = 10000
+alpha = 20.0
 tau = 1e-2  # Seuil pour arrêt du SB
 
 means_base = [
@@ -60,9 +60,10 @@ means_base = [
 weights_base = np.array([2.0, 1.0, 0.5, 0.1])
 weights_base /= weights_base.sum()
 
-lambda_0 = 4.0
-nu_0 = 5
-Psi_0 = ot.CovarianceMatrix([[0.03, 0.00], [0.00, 0.01]])
+lambda_0 = 100.0
+nu_0 = 4.0
+Psi_0 = ot.CovarianceMatrix([[0.01*(nu_0-3), 0.00], [0.00, 0.01*(nu_0-3)]])
+
 
 def sample_mixture_niw():
     base_idx = np.random.choice(len(means_base), p=weights_base)
@@ -81,12 +82,10 @@ def stick_breaking(alpha, tau=1e-3):
         w = v * r
         weights.append(w)
         r *= (1 - v)
-    print(weights)
     return np.array(weights) / np.sum(weights)
 
 def sample_dpmm(n_samples=1000):
     weights = stick_breaking(alpha, tau)
-    print(weights.sum())
     n_prior = len(weights)
     prior = [sample_mixture_niw() for _ in range(n_prior)]
 
@@ -99,7 +98,8 @@ def sample_dpmm(n_samples=1000):
 
     return np.array(data)
 
-# ===== Visualisation ====
+
+# ===== Visualisation =====
 samples = sample_dpmm(n_samples)
 
 plt.figure(figsize=(6, 6))
