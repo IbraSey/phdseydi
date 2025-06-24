@@ -47,7 +47,7 @@ print("Somme des poid (proche de 1):", sum(weights))
 # =============================================================================================================
 # %%
 dim = 2
-n_samples = 10000
+n_samples = 20000
 alpha = 20.0
 tau = 1e-2  # Seuil pour arrêt du SB
 
@@ -62,7 +62,7 @@ weights_base /= weights_base.sum()
 
 lambda_0 = 100.0
 nu_0 = 4.0
-Psi_0 = ot.CovarianceMatrix([[0.01*(nu_0-3), 0.00], [0.00, 0.01*(nu_0-3)]])
+Psi_0 = ot.CovarianceMatrix([[0.1*(nu_0-3), 0.00], [0.00, 0.1*(nu_0-3)]])
 
 
 def sample_mixture_niw():
@@ -99,16 +99,55 @@ def sample_dpmm(n_samples=1000):
     return np.array(data)
 
 
-# ===== Visualisation =====
+# ==================== Visualisation ====================
 samples = sample_dpmm(n_samples)
 
 plt.figure(figsize=(6, 6))
 plt.scatter(samples[:, 0], samples[:, 1], s=5, alpha=0.5)
 plt.xlim(0, 2)
 plt.ylim(0, 2)
-plt.title("Simu DPMM avec prior informatif")
+plt.title("Observations du DPMM avec prior informatif")
 plt.grid(True)
 plt.gca().set_aspect('equal')
+plt.show()
+
+
+def density_dpmm(n_samples=1000):
+    weights = stick_breaking(alpha, tau)
+    n_prior = len(weights)
+    prior = [sample_mixture_niw() for _ in range(n_prior)]
+
+    # Compute density
+    componants = [ot.Normal(mu, sigma) for mu, sigma in prior]
+    mixture = ot.Mixture(componants, weights)
+    return mixture
+
+# Génération
+mixture_density = density_dpmm(n_samples)
+
+# Grille 
+x = np.linspace(0, 2, 200)
+y = np.linspace(0, 2, 200)
+X, Y = np.meshgrid(x, y)
+points = np.column_stack([X.ravel(), Y.ravel()])
+
+Z = np.array([mixture_density.computePDF(ot.Point(p)) for p in points])
+Z = Z.reshape(X.shape)
+
+# ==================== Affichage heatmap et lignes de niveau ====================
+fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+heatmap = axs[0].imshow(Z, extent=[0, 2, 0, 2], origin='lower', cmap='jet', aspect='auto')
+axs[0].set_title("Heatmap DPMM")
+axs[0].grid(True)
+fig.colorbar(heatmap, ax=axs[0], label="Densité")
+
+contour = axs[1].contour(X, Y, Z, levels=20, cmap='jet')
+axs[1].set_title("Lignes de niveau DPMM")
+axs[1].grid(True)
+fig.colorbar(contour, ax=axs[1], label="Densité")
+
+plt.tight_layout()
 plt.show()
 
 
