@@ -21,7 +21,7 @@ dpmm_spatial/
 │   ├── alpha_sweep.py          # Étude de la variation de alpha
 │   └── dpmm_run.py             # Génération d'échantillons et estimation moyenne
 │
-├── main.py                     # Script principal pour lancer un workflow complet
+├── main.py                     # Script principal
 ├── requirements.txt            # Dépendances du projet
 └── README.md                   # Explication du projet, etc.
 ```
