@@ -18,8 +18,7 @@ dpmm_spatial/
 ├── experiments/
 │   ├── __init__.py
 │   ├── compute_l2.py           # Distances L2
-│   ├── alpha_sweep.py          # Étude de la variation de alpha
-│   └── dpmm_run.py             # Génération d'échantillons et estimation moyenne
+│   └── alpha_sweep.py          # Étude de la variation de alpha
 │
 ├── main.py                     # Script principal
 ├── requirements.txt            # Dépendances du projet
