@@ -63,13 +63,11 @@ def plot_density_marginal(Z, x_vals=np.linspace(0, 2, 100), y_vals=np.linspace(0
         marginal_vals = Z[idx, :]
         plt.plot(x_vals, marginal_vals)
         plt.xlabel("x")
-    elif fixed_axis == 'x':
+    else:
         idx = np.abs(x_vals - fixed_value).argmin()
         marginal_vals = Z[:, idx]
         plt.plot(y_vals, marginal_vals)
         plt.xlabel("y")
-    else:
-        raise ValueError("On doit fixer 'x' ou 'y'")
 
     plt.title(f"{title} (fixé {fixed_axis} = {fixed_value})")
     plt.ylabel("Densité marginale")
