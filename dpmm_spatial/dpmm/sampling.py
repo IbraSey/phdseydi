@@ -49,21 +49,20 @@ def sample_mixture_niw(means_base, weights_base, lambda_0, Psi_0, nu_0):
 
 def sample_from_f0(n_samples, zones, weights, areas):
     """
-    Génère des échantillons suivant la densité d'un zonage sismotectoniques f_0
+    Génère des échantillons selon la densité f0 d'un zonage sismotectonique 
 
     Paramètres :
-        - n_samples : nombre d’échantillons à générer
-        - zones : sous-zones du zonage
-        - weights : poids de chaque zone
-        - areas : aire des zones
+        - n_samples (int) : Nombre d’échantillons à générer.
+        - zones (list) : Liste des sous-domaines.
+        - weights (ndarray) : Poids w_j.
+        - areas (ndarray) : Aires A_j.
 
     Retourne :
-        - np.ndarray de forme (n_samples, 2)
+        - ndarray (n_samples, 2) : Échantillons tirés de f0.
     """
 
     probs = weights * areas
     probs /= probs.sum()
-
     samples = []
     for _ in range(n_samples):
         idx = np.random.choice(len(zones), p=probs)
@@ -71,6 +70,31 @@ def sample_from_f0(n_samples, zones, weights, areas):
         x = ot.Uniform(x0, x1).getRealization()[0]
         y = ot.Uniform(y0, y1).getRealization()[0]
         samples.append([x, y])
+    return np.array(samples)
+
+
+def sample_from_f0tilde(n_samples, mus, covariances, weights, areas):
+    """
+    Tire des échantillons depuis une densité mélange de gaussiennes f0_tilde
+
+    Paramètres :
+        - n_samples (int) : Nombre de points à générer.
+        - mus (list of ot.Point) : Moyennes μ_j des composantes.
+        - covariances (list of ot.CovarianceMatrix) : Matrices Σ_j.
+        - weights (ndarray) : Poids w_j
+        - areas (ndarray) : Aires A_j des zones
+
+    Retour :
+        - ndarray (n_samples, 2) : Échantillons de f0_tilde
+    """
+
+    probs = weights * areas
+    probs /= probs.sum()
+    samples = []
+    for _ in range(n_samples):
+        idx = np.random.choice(len(weights), p=probs)
+        sample = ot.Normal(mus[idx], covariances[idx]).getRealization()
+        samples.append([sample[0], sample[1]])
     return np.array(samples)
 
 

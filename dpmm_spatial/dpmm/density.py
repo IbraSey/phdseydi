@@ -65,49 +65,101 @@ def normalized_informative_dpmm_density(
     return normalized_density
 
 
-def define_zonage_grid(n_rows, n_cols, x_bounds, y_bounds):
+def define_zonage_grid(n_rows, n_cols, x_range=(0, 2), y_range=(0, 2)):
     """
-    Définie une grille de zonage sismotectonique.
+    Définit une grille de zonage sismotectonique.
 
     Paramètres :
-        - n_rows : nombre de lignes de la grille
-        - n_cols : nombre de colonnes de la grille
-        - x_bounds : tuple (xmin, xmax)
-        - y_bounds : tuple (ymin, ymax)
+        - n_rows (int) : Nombre de lignes de la grille.
+        - n_cols (int) : Nombre de colonnes de la grille.
+        - x_range (tuple) : Bornes (min, max) en x.
+        - y_range (tuple) : Bornes (min, max) en y.
 
     Retourne :
-        - zones : liste de tuples ((x0, x1), (y0, y1)) définissant les sous-zones
-        - areas : array des aires des sous-zones
+        - zones (list) : Liste de rectangles (x_bounds, y_bounds)
+        - x_bounds, y_bounds (ndarray) : Coordonnées des séparations en x et y.
     """
 
-    x_edges = np.linspace(*x_bounds, n_cols + 1)
-    y_edges = np.linspace(*y_bounds, n_rows + 1)
+    x_bounds = np.linspace(x_range[0], x_range[1], n_cols + 1)
+    y_bounds = np.linspace(y_range[0], y_range[1], n_rows + 1)
     zones = []
     for i in range(n_rows):
         for j in range(n_cols):
-            zones.append(((x_edges[j], x_edges[j + 1]), (y_edges[i], y_edges[i + 1])))
-    area = (x_edges[1] - x_edges[0]) * (y_edges[1] - y_edges[0])
-    return zones, np.full(n_rows * n_cols, area)
+            x0, x1 = x_bounds[j], x_bounds[j + 1]
+            y0, y1 = y_bounds[i], y_bounds[i + 1]
+            zones.append(((x0, x1), (y0, y1)))
+    return zones, x_bounds, y_bounds
 
 
 def compute_f0_density(x, y, zones, weights, areas):
     """
-    Évalue la densité f_0 du zonage sismotectonique à un point (x, y).
+    Calcule la densité par morceaux f0(x, y), constante sur chaque zone.
 
     Paramètres :
-        - x, y : coordonées du point
-        - zones : liste des sous-zones [(x0,x1),(y0,y1)]
-        - weights : poids associés à chaque zone
-        - areas : aire de chaque zone
+        - x, y (float) : Coordonnées du point à évaluer.
+        - zones (list) : Liste des sous-domaines S_j.
+        - weights (ndarray) : Poids w_j associés à chaque zone.
+        - areas (ndarray) : Aires A_j des zones.
 
     Retourne :
-        - f_0(x, y) : densité 
+        - float : Valeur de la densité f0(x, y)
     """
 
     for idx, ((x0, x1), (y0, y1)) in enumerate(zones):
         if x0 <= x < x1 and y0 <= y < y1:
             return weights[idx] / np.sum(weights * areas)
     return 0.0
+
+
+def compute_zone_gaussian_parameters(zones):
+    """
+    Calcule les centroïdes et les covariances associées aux zones.
+
+    Paramètres :
+        - zones (list) : Liste des zones [(x0, x1), (y0, y1)]
+
+    Retourne :
+        - mus (list of ot.Point) : Liste des centroïdes μ_j 
+        - covariances (list of ot.CovarianceMatrix) : Matrices Σ_j
+    """
+
+    mus = []
+    covariances = []
+    for (x_bounds, y_bounds) in zones:
+        x0, x1 = x_bounds
+        y0, y1 = y_bounds
+        center = [(x0 + x1) / 2, (y0 + y1) / 2]
+        mus.append(ot.Point(center))
+
+        # Approx. d'une distribution uniforme centrée sur le centroïde
+        std = (np.sqrt((x1 - x0)**2 + (y1 - y0)**2) / 2) / 1.96
+        Sigma = ot.CovarianceMatrix(2)
+        Sigma[0, 0] = std**2
+        Sigma[1, 1] = std**2
+        covariances.append(Sigma)
+
+    return mus, covariances
+
+
+def compute_f0tilde_density(x, y, mus, covariances, weights):
+    """
+    Calcule la densité d’un mélange de gaussiennes pondérées qui approxime un zonage.
+
+    Paramètres :
+        - x, y (float) : Coordonnées du point d’évaluation.
+        - mus (list of ot.Point) : Moyennes μ_j
+        - covariances (list of ot.CovarianceMatrix) : Matrices Σ_j
+        - weights (ndarray) : Poids w_j
+
+    Retour :
+        - float : Valeur de la densité f0_tilde(x, y)
+    """
+
+    pt = ot.Point([x, y])
+    density = 0.0
+    for w, mu, Sigma in zip(weights, mus, covariances):
+        density += w * ot.Normal(mu, Sigma).computePDF(pt)
+    return density
 
 
 
