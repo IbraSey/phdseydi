@@ -131,7 +131,7 @@ def compute_zone_gaussian_parameters(zones):
         center = [(x0 + x1) / 2, (y0 + y1) / 2]
         mus.append(ot.Point(center))
 
-        # Approx. d'une distribution uniforme centrée sur le centroïde
+        # 95% du support de la gaussienne recouvre la zone
         std = (np.sqrt((x1 - x0)**2 + (y1 - y0)**2) / 2) / 1.96
         Sigma = ot.CovarianceMatrix(2)
         Sigma[0, 0] = std**2
