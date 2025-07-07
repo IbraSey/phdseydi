@@ -27,7 +27,6 @@ dpmm_spatial/
 ├── brouillon_dpmm_spatial.ipynb            # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
 ├── main.py                                 # Script principal
 ├── requirements.txt                        # Dépendances du projet
-│
 └── README.md                               # Explication du projet, etc.
 ```
 
