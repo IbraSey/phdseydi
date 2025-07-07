@@ -36,10 +36,9 @@ def sample_mixture_niw(means_base, weights_base, lambda_0, Psi_0, nu_0):
         - nu_0 : degrés de liberté de la loi Inverse-Wishart (> dimension - 1)
 
     Retourne :
-        - mu : np.ndarray représentant la moyenne d’une composante
-        - Sigma : np.ndarray représentant la matrice de covariance de la composante
+        - mu : moyenne échantillonnée
+        - Sigma : matrice de covariance échantillonnée
     """
-
     base_idx = np.random.choice(len(means_base), p=weights_base)
     mu_0 = ot.Point(means_base[base_idx])
     Sigma = ot.InverseWishart(Psi_0, nu_0).getRealizationAsMatrix()
@@ -84,7 +83,7 @@ def sample_from_f0tilde(n_samples, mus, covariances, weights, areas):
         - weights (ndarray) : Poids w_j
         - areas (ndarray) : Aires A_j des zones
 
-    Retour :
+    Retourne :
         - ndarray (n_samples, 2) : Échantillons de f0_tilde
     """
 
@@ -96,6 +95,42 @@ def sample_from_f0tilde(n_samples, mus, covariances, weights, areas):
         sample = ot.Normal(mus[idx], covariances[idx]).getRealization()
         samples.append([sample[0], sample[1]])
     return np.array(samples)
+
+
+def sample_from_informative_dpmm(n_samples, alpha, tau, means_base, weights_base, lambda_0, Psi_0, nu_0):
+    """
+    Génère un échantillon aléatoire depuis un DPMM avec un prior informatif.
+
+    Paramètres :
+        - n_samples : int, nombre total d'échantillons à générer
+        - alpha : float, paramètre de concentration du DP
+        - tau : float, seuil d’arrêt pour le stick-breacking
+        - means_base : list[list[float]], centres des régions de base pour le prior
+        - weights_base : list[float], poids associés aux centres de base
+        - lambda_0 : float, paramètre de précision du prior normal
+        - Psi_0 : openturns.CovarianceMatrix, matrice d’échelle du prior Inverse-Wishart
+        - nu_0 : int, degrés de liberté du prior Inverse-Wishart
+
+    Retourne :
+        - samples : np.ndarray de forme (n_samples, 2), échantillons générés
+    """
+
+    component_weights = stick_breaking(alpha, tau)
+
+    component_params = [
+        sample_mixture_niw(means_base, weights_base, lambda_0, Psi_0, nu_0)
+        for _ in range(len(component_weights))
+    ]
+
+    samples = []
+    for _ in range(n_samples):
+        idx = np.random.choice(len(component_weights), p=component_weights)
+        mu_k, sigma_k = component_params[idx]
+        sample = ot.Normal(mu_k, sigma_k).getRealization()
+        samples.append([sample[0], sample[1]])
+
+    return np.array(samples)
+
 
 
 

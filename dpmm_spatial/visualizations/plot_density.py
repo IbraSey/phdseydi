@@ -24,21 +24,21 @@ def plot_density_heatmap(Z, title='Heatmap', extent=(0, 2, 0, 2), cmap='grey_r',
     ax.set_aspect('equal')
 
 
-def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='viridis'):
+def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='viridis', ax=None):
     """
-    En chantier
+    EN CHANTIER 
     """
-
-    plt.figure(figsize=(7, 6))
-    contour = plt.contour(X, Y, Z, levels=levels, cmap=cmap)
-    plt.title(title)
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.grid(True)
-    plt.gca().set_aspect('equal')
-    plt.colorbar(contour, label="Valeur")
-    plt.tight_layout()
-    plt.show()
+    
+    if ax is None:
+        ax = plt.gca()
+    contour = ax.contour(X, Y, Z, levels=levels, cmap=cmap)
+    plt.colorbar(contour, ax=ax, label="Densité")
+    ax.clabel(contour, inline=True, fontsize=8)
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.grid(True)
+    ax.set_aspect('equal')
 
 
 def plot_density_front(Z, x_vals=np.linspace(0, 2, 100), y_vals=np.linspace(0, 2, 100), fixed_axis='y', fixed_value=0.5, title="Densité d'une face"):
