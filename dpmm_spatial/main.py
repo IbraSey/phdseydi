@@ -105,9 +105,9 @@ plt.show()
 
 
 #%%
-# *********************************************************************************************************************
-# ************************************ AFFICHAGE du Monte Carlo du DPMM informatif ************************************
-# *********************************************************************************************************************
+# **************************************************************************************************************************
+# ********************************** AFFICHAGE de la moyenne empirique du DPMM informatif **********************************
+# **************************************************************************************************************************
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -155,7 +155,7 @@ Z_mean = Z_sum / N
 fig, axs = plt.subplots(1, 2, figsize=(14, 6))
 
 plot_density_heatmap(Z_mean, title="Heatmap de la densité moyenne", ax=axs[0])
-plot_contour_levels(X, Y, Z_mean, levels=20, title="Lignes de niveau", ax=axs[1])
+plot_contour_levels(X, Y, Z_mean, levels=20, title="Lignes de niveau de la densité moyenne", ax=axs[1])
 
 plt.tight_layout()
 plt.show()
