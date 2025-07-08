@@ -162,4 +162,55 @@ def compute_f0tilde_density(x, y, mus, covariances, weights):
     return density
 
 
+def average_informative_dpmm_density(
+    N,
+    alpha,
+    tau,
+    means_base,
+    weights_base,
+    lambda_0,
+    Psi_0,
+    nu_0,
+    grid_x=np.linspace(0, 2, 200),
+    grid_y=np.linspace(0, 2, 200)
+):
+    """
+    Calcule la moyenne empirique de N densités DPMM informatives.
+
+    Retourne :
+        Une grille (X, Y, Z_mean) où Z_mean est la densité moyenne.
+    """
+    X, Y = np.meshgrid(grid_x, grid_y)
+    Z_sum = np.zeros_like(X)
+
+    for _ in range(N):
+        f_density = normalized_informative_dpmm_density(
+            alpha=alpha,
+            tau=tau,
+            means_base=means_base,
+            weights_base=weights_base,
+            lambda_0=lambda_0,
+            Psi_0=Psi_0,
+            nu_0=nu_0
+        )
+        Z_sum += f_density(X, Y)
+
+    Z_mean = Z_sum / N
+    return X, Y, Z_mean
+
+
+def dpmm_avg_density_constructor_factory(N, grid_x=np.linspace(0, 2, 200), grid_y=np.linspace(0, 2, 200)):
+    def constructor(**kwargs):
+        X, Y, Z_mean = average_informative_dpmm_density(
+            N=N,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            **kwargs
+        )
+        return lambda X_eval, Y_eval: Z_mean  # Note : ici Z_mean est constant, adapté à la grille
+    return constructor
+
+
+
+
 
