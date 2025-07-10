@@ -158,6 +158,7 @@ for _ in range(N):
 
 Z_mean = Z_sum / N
 
+
 # ============================= Affichage =============================
 fig, axs = plt.subplots(1, 2, figsize=(14, 6))
 
