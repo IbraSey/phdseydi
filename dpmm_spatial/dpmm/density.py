@@ -4,7 +4,7 @@ from scipy import integrate
 from .sampling import stick_breaking, sample_mixture_niw
 
 
-def normalized_informative_dpmm_density(
+def informative_dpmm_density(
     alpha,
     tau,
     means_base,
@@ -91,24 +91,27 @@ def define_zonage_grid(n_rows, n_cols, x_range=(0, 2), y_range=(0, 2)):
     return zones, x_bounds, y_bounds
 
 
-def compute_f0_density(x, y, zones, weights, areas):
+def compute_f0_density(X, Y, zones, weights, areas):
     """
-    Calcule la densité par morceaux f0(x, y), constante sur chaque zone.
+    Calcule la densité f0(x, y) sur une grille (X, Y), constante par zone.
 
     Paramètres :
-        - x, y (float) : Coordonnées du point à évaluer.
-        - zones (list) : Liste des sous-domaines S_j.
-        - weights (ndarray) : Poids w_j associés à chaque zone.
-        - areas (ndarray) : Aires A_j des zones.
+        - X, Y : grilles (ndarray) générées avec np.meshgrid
+        - zones : liste des sous-domaines [(x0, x1), (y0, y1)]
+        - weights : tableau des poids w_j
+        - areas : tableau des aires A_j associées à chaque zone
 
-    Retourne :
-        - float : Valeur de la densité f0(x, y)
+    Retour :
+        - Z : ndarray de la densité f0 évaluée sur la grille
     """
+    Z = np.zeros_like(X)
+    normalization = np.sum(weights * areas)
 
     for idx, ((x0, x1), (y0, y1)) in enumerate(zones):
-        if x0 <= x < x1 and y0 <= y < y1:
-            return weights[idx] / np.sum(weights * areas)
-    return 0.0
+        mask = (X >= x0) & (X < x1) & (Y >= y0) & (Y < y1)
+        Z[mask] = weights[idx] / normalization
+
+    return Z
 
 
 def compute_zone_gaussian_parameters(zones):
@@ -141,25 +144,27 @@ def compute_zone_gaussian_parameters(zones):
     return mus, covariances
 
 
-def compute_f0tilde_density(x, y, mus, covariances, weights):
+def compute_f0tilde_density(X, Y, mus, covariances, weights):
     """
-    Calcule la densité d’un mélange de gaussiennes pondérées qui approxime un zonage.
+    Calcule la densité f0_tilde(x, y) d’un mélange de gaussiennes pondérées sur une grille.
 
     Paramètres :
-        - x, y (float) : Coordonnées du point d’évaluation.
-        - mus (list of ot.Point) : Moyennes μ_j
-        - covariances (list of ot.CovarianceMatrix) : Matrices Σ_j
-        - weights (ndarray) : Poids w_j
+        - X, Y : grilles 2D issues de np.meshgrid
+        - mus (list of ot.Point) : moyennes des gaussiennes
+        - covariances (list of ot.CovarianceMatrix) : matrices de covariance
+        - weights (array) : poids associés à chaque composante
 
     Retour :
-        - float : Valeur de la densité f0_tilde(x, y)
+        - Z : tableau 2D des valeurs de la densité sur la grille
     """
-
-    pt = ot.Point([x, y])
-    density = 0.0
+    Z = np.zeros_like(X)
+    points = np.column_stack((X.ravel(), Y.ravel()))
+    
     for w, mu, Sigma in zip(weights, mus, covariances):
-        density += w * ot.Normal(mu, Sigma).computePDF(pt)
-    return density
+        gaussian = ot.Normal(mu, Sigma)
+        Z += w * np.array([gaussian.computePDF(ot.Point(p)) for p in points]).reshape(X.shape)
+
+    return Z
 
 
 def average_informative_dpmm_density(
@@ -184,7 +189,7 @@ def average_informative_dpmm_density(
     Z_sum = np.zeros_like(X)
 
     for _ in range(N):
-        f_density = normalized_informative_dpmm_density(
+        f_density = informative_dpmm_density(
             alpha=alpha,
             tau=tau,
             means_base=means_base,
@@ -207,8 +212,10 @@ def dpmm_avg_density_constructor_factory(N, grid_x=np.linspace(0, 2, 200), grid_
             grid_y=grid_y,
             **kwargs
         )
-        return lambda X_eval, Y_eval: Z_mean  # Note : ici Z_mean est constant, adapté à la grille
+        return lambda X_eval, Y_eval: Z_mean  # retourne toujours la densité sur la grille définie
     return constructor
+
+
 
 
 
