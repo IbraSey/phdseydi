@@ -425,8 +425,8 @@ Z_f0_ref = compute_f0_density(X, Y, zones, weights_base, areas)
 Z_f0tilde_ref = compute_f0tilde_density(X, Y, mus, covariances, weights_base)
 
 # Paramètres à faire varier
-alphas = np.linspace(0.1, 40, 15)
-lambdas = np.linspace(0.1, 40, 15)
+alphas = np.linspace(0.1, 10, 15)
+lambdas = np.linspace(0.1, 10, 15)
 
 # Paramètres fixes
 kwargs_base = {
@@ -446,7 +446,7 @@ Z_f0 = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     reference_density_array=Z_f0_ref,
     grid_x=grid_x,
     grid_y=grid_y,
-    N=30,
+    N=5,
     dpmm_density_fn=informative_dpmm_density,
     constructor_kwargs_base=kwargs_base,
     verbose=True
@@ -460,7 +460,7 @@ Z_f0tilde = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     reference_density_array=Z_f0tilde_ref,
     grid_x=grid_x,
     grid_y=grid_y,
-    N=30,
+    N=5,
     dpmm_density_fn=informative_dpmm_density,
     constructor_kwargs_base=kwargs_base,
     verbose=True
@@ -521,7 +521,7 @@ plt.show()
 # *******************************************************************************************************
 
 
-
+lambdas
 
 
 
