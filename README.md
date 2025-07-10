@@ -12,8 +12,7 @@ dpmm_spatial/
 │
 ├── experiments/
 │   ├── __init__.py
-│   ├── compute_l2.py                       # Calcul de la distance L2
-│   └── alpha_sweep.py                      # Étude de la variation de alpha
+│   └── compute_l2.py                       # Calcul de la distance L2
 │
 ├── kde/kde.py
 │   ├── __init__.py
