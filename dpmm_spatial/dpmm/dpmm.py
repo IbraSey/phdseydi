@@ -170,10 +170,9 @@ class DirichletProcessMixtureModel:
             nu_0=nu_0
         )
 
-        # 6. Instancier objet
+        # 7. Mémoriser les infos de zonage et de l'approximation par des gaussiennes 
         instance = cls(alpha=alpha, tau=tau, G0_sampler=sample_mixture_niw, G0_kwargs=G0_kwargs)
 
-        # 7. Mémoriser les infos de zonage et de l'approximation par des gaussiennes
         instance.zones = zones
         instance.zone_weights = zone_weights
         instance.zone_areas = zone_areas
