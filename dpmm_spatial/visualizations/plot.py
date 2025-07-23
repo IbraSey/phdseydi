@@ -41,30 +41,34 @@ def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='vir
     ax.set_aspect('equal')
 
 
-def plot_density_front(Z, x_vals=np.linspace(0, 2, 100), y_vals=np.linspace(0, 2, 100), fixed_axis='y', fixed_value=0.5, title="Densité d'une face"):
+def plot_sampling(samples, title='Échantillons', s=5, alpha=0.5, xlim=(0, 2), ylim=(0, 2), ax=None):
     """
-    En chantier
+    Affiche un nuage de points représentant un échantillon 2D.
+
+    Paramètres :
+        - samples : ndarray, tableau (N, 2) des points (x, y)
+        - title : str, titre de l'axe
+        - s : float, taille des points
+        - alpha : float, transparence
+        - xlim, ylim : tuple, bornes des axes
+        - ax : matplotlib.axes.Axes, subplot cible (optionnel)
     """
+    samples = np.asarray(samples)
+    if ax is None:
+        ax = plt.gca()
 
-    plt.figure(figsize=(7, 6))
+    ax.scatter(samples[:, 0], samples[:, 1], s=s, alpha=alpha)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.grid(True)
+    ax.set_aspect('equal')
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
 
-    if fixed_axis == 'y':
-        idx = np.abs(y_vals - fixed_value).argmin()
-        marginal_vals = Z[idx, :]
-        plt.plot(x_vals, marginal_vals)
-        plt.xlabel("x")
-    else:
-        idx = np.abs(x_vals - fixed_value).argmin()
-        marginal_vals = Z[:, idx]
-        plt.plot(y_vals, marginal_vals)
-        plt.xlabel("y")
 
-    plt.title(f"{title} (fixé {fixed_axis} = {fixed_value})")
-    plt.ylabel("Densité")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
 
+    
 
 
 
