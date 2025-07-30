@@ -2,7 +2,6 @@
 # **************************************************************************************************************************
 # ************************************************ AFFICHAGE f0 et f0_tilde ************************************************
 # **************************************************************************************************************************
-
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture
@@ -79,6 +78,73 @@ plt.show()
 
 
 
+#%% 
+# ***************************************************************************************************************************
+# *********************************** AFFICHAGE de la moyenne empirique de f0 et f0_tilde ***********************************
+# ***************************************************************************************************************************
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.mixture import GaussianMixture
+import openturns as ot
+
+from dpmm.prior_utils import (
+    define_zonage_grid,
+    compute_zone_gaussian_parameters,
+    sample_from_f0,
+    sample_from_f0tilde,
+    compute_f0_density,
+    compute_f0tilde_density 
+)
+
+from visualizations.plot import (
+    plot_density_heatmap,
+    plot_contour_levels
+)
+
+
+n_rows, n_cols = 3, 3
+zone_weights = [0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.15, 0.15, 0.25]
+N = 50      # Nombre de tirages à moyenner
+n_samples = 5000
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
+
+zones, areas = define_zonage_grid(n_rows, n_cols)
+n_zones = len(zones)
+
+Z_f0_sum = np.zeros_like(X)
+for _ in range(N):
+    Z_f0 = compute_f0_density(X, Y, zones, zone_weights, areas)
+    Z_f0_sum += Z_f0
+Z_f0_mean = Z_f0_sum / N
+
+
+Z_f0tilde_sum = np.zeros_like(X)
+for _ in range(N):
+    X_samples = sample_from_f0(n_samples=n_samples, zones=zones, weights=zone_weights, areas=areas)
+    mus, covs, weights_gmm, _ = compute_zone_gaussian_parameters(X_samples, n_components=n_zones)
+    Z_f0tilde = compute_f0tilde_density(X, Y, mus, covs, weights_gmm)
+    Z_f0tilde_sum += Z_f0tilde
+Z_f0tilde_mean = Z_f0tilde_sum / N
+
+
+# ====================================== Visualisations ======================================
+fig, axs = plt.subplots(2, 2, figsize=(11, 10))
+
+plot_density_heatmap(Z_f0_mean, title=f"f0 (zonage) – moyenne sur {N} tirages", ax=axs[0, 0])
+axs[0, 1].axis("off")
+
+plot_density_heatmap(Z_f0tilde_mean, title=f"\nf0tilde (GMM) – moyenne sur {N} tirages\n", ax=axs[1, 0])
+plot_contour_levels(X, Y, Z_f0tilde_mean, title="\nf0tilde – lignes de niveau\n", ax=axs[1, 1])
+
+plt.suptitle(f"\nMoyenne empirique sur {N} tirages de f0 et f0tilde", fontsize=16)
+plt.tight_layout(rect=[0, 0, 1, 0.98])
+plt.show()
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_f0_f0tilde.png")
+
+
+
 # %% 
 # ************************************************************************************************************************
 # ************************************* AFFICHAGE f DPMM informatif / non-informatif *************************************
@@ -143,9 +209,9 @@ print(dpmm_inf.get_prior())
 
 
 #%%
-# *************************************************************************************************************************
-# ********************************** Impact du paramètre alpha sur le nombre composantes **********************************
-# *************************************************************************************************************************
+# *****************************************************************************************************************
+# ****************************** Impact du paramètre alpha sur le nombre composantes ******************************
+# *****************************************************************************************************************
 fig, axs = plt.subplots(1, 4, figsize=(15, 5))
 alphas = [0.1, 1.0, 10.0, 100.0]
 
@@ -164,372 +230,177 @@ plt.show()
 
 
 #%%
-# **************************************************************************************************************************
-# ********************************** AFFICHAGE de la moyenne empirique du DPMM informatif **********************************
-# **************************************************************************************************************************
-
+# *****************************************************************************************************************************
+# *************************** AFFICHAGE de la moyenne empirique du DPMM informatif / non informatif ***************************
+# *****************************************************************************************************************************
+import openturns as ot
 import numpy as np
 import matplotlib.pyplot as plt
-import openturns as ot
-from dpmm.density import informative_dpmm_density
-from dpmm.sampling import stick_breaking, sample_mixture_niw, sample_from_informative_dpmm
-from visualizations.plot_density import plot_density_heatmap
-from visualizations.plot_sampling import plot_sampling
-from visualizations.plot_density import plot_contour_levels
 
-# === Paramètres DPMM informatif ===
-alpha = 50
-tau = 1e-2
-means_base = [[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]]
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-lambda_0 = 30.0
-nu_0 = 4
-Psi_0 = ot.CovarianceMatrix([[0.26, 0.0], [0.0, 0.26]])
+from dpmm.dpmm import (
+    DirichletProcessMixtureModel,
+    sample_niw,
+    sample_mixture_niw,
+    compute_empirical_mean_density
+)
 
-# === Grille ===
-x = np.linspace(0, 2, 200)
-y = np.linspace(0, 2, 200)
+from visualizations.plot import (
+    plot_density_heatmap,
+    plot_contour_levels
+)
+
+# Grille d’évaluation
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
 X, Y = np.meshgrid(x, y)
 
-# === Moyenne empirique de N densités ===
-N = 50
-Z_sum = np.zeros_like(X)
+# Paramètres
+alpha = 20.0
+tau = 1e-3
+N = 50  # Nombre de tirages pour moyenne empirique
+n_rows=3
+n_cols=3
+zone_weights = [0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.15, 0.15, 0.25]
+lambda_0=50.0
+nu_0=5
+G0_kwargs={
+    "mu_0": ot.Point([1.0, 1.0]),
+    "lambda_0": 0.5,
+    "Psi_0": ot.CovarianceMatrix([[0.5, 0.0], [0.0, 0.5]]),
+    "nu_0": 8
+    }
 
-for _ in range(N):
-    f_density = informative_dpmm_density(
+
+# Fonctions de constructions qui permettent utilisation de la fonction 'compute_empirical_mean_density'
+def build_dpmm_noninf():
+    return DirichletProcessMixtureModel(
         alpha=alpha,
         tau=tau,
-        means_base=means_base,
-        weights_base=weights_base,
-        lambda_0=lambda_0,
-        Psi_0=Psi_0,
-        nu_0=nu_0
+        G0_sampler=sample_niw,
+        G0_kwargs=G0_kwargs
     )
-    Z_sum += f_density(X, Y)
 
-Z_mean = Z_sum / N
+def build_dpmm_inf():
+    return DirichletProcessMixtureModel.from_zonage(
+        alpha=alpha,
+        tau=tau,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        lambda_0=lambda_0,
+        nu_0=nu_0,
+        zone_weights=zone_weights
+    )
+
+# ESTIMATION MOYENNE EMPIRIQUE 
+Z_mean_noninf = compute_empirical_mean_density(build_dpmm_noninf, N, X, Y)
+Z_mean_inf = compute_empirical_mean_density(build_dpmm_inf, N, X, Y)
 
 
-# ============================= Affichage =============================
-fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+# ===================== VISUALISATION =====================
+fig, axs = plt.subplots(2, 2, figsize=(14, 10))
 
-plot_density_heatmap(Z_mean, title="Heatmap de la densité moyenne", ax=axs[0])
-plot_contour_levels(X, Y, Z_mean, levels=20, title="Lignes de niveau de la densité moyenne", ax=axs[1])
+plot_density_heatmap(Z_mean_noninf, title=f"Non-informatif – moyenne sur {N} DPMM", ax=axs[0, 0], cmap="viridis")
+plot_contour_levels(X, Y, Z_mean_noninf, title="Non-informatif – lignes de niveau", ax=axs[0, 1], cmap="viridis")
 
-plt.tight_layout()
-plt.show()
-fig.savefig("figure_MC_f_dpmm_inf.png")
-
-
-
-
-#%%
-# *************************************************************************************************************************
-# ************************************************** (1) Paramètre sweep **************************************************
-# *************************************************************************************************************************
-import numpy as np
-import matplotlib.pyplot as plt
-import openturns as ot
-from dpmm.density import (define_zonage_grid, compute_f0_density, 
-                          compute_zone_gaussian_parameters, compute_f0tilde_density, 
-                          informative_dpmm_density)
-from experiments.compute_l2 import compute_l2_distance, evaluate_l2_distance_vs_param
-
-# === Paramètres f0, f0_tilde ===
-n_rows, n_cols = 2, 2
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-zones, x_bounds, y_bounds = define_zonage_grid(n_rows, n_cols)
-area = (x_bounds[1] - x_bounds[0]) * (y_bounds[1] - y_bounds[0])
-areas = np.full(len(weights_base), area)
-mus, covariances = compute_zone_gaussian_parameters(zones)
-
-# === Paramètres DPMM informatif ===
-alpha = 50
-tau = 1e-2
-means_base = [[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]]
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-lambda_0 = 30.0
-nu_0 = 4
-Psi_0 = ot.CovarianceMatrix([[0.26, 0.0], [0.0, 0.26]])
-
-alphas = np.linspace(0.1, 50, 30)
-grid_x = np.linspace(0, 2, 200)
-grid_y = np.linspace(0, 2, 200)
-
-params = {
-    "tau": tau,
-    "means_base": means_base,
-    "weights_base": weights_base,
-    "lambda_0": lambda_0,
-    "Psi_0": Psi_0,
-    "nu_0": nu_0
-}
-
-ref_f0_args = {"zones": zones, "weights": weights_base, "areas": areas}
-ref_f0tilde_args={"mus": mus, "covariances": covariances, "weights": weights_base}
-
-alphas, distances_f0 = evaluate_l2_distance_vs_param(
-    param_values=alphas,
-    reference_density=compute_f0_density,
-    dpmm_density_constructor=informative_dpmm_density,
-    grid_x=np.linspace(0, 2, 200),
-    grid_y=np.linspace(0, 2, 200),
-    param_name="alpha",
-    constructor_kwargs=params,
-    ref_args=ref_f0_args
-)
-
-alphas, distances_f0tilde = evaluate_l2_distance_vs_param(
-    param_values=alphas,
-    reference_density=compute_f0tilde_density,
-    dpmm_density_constructor=informative_dpmm_density,
-    grid_x=np.linspace(0, 2, 200),
-    grid_y=np.linspace(0, 2, 200),
-    param_name="alpha",
-    constructor_kwargs=params, 
-    ref_args=ref_f0tilde_args
-)
-
-# === Affichage des deux courbes L²(alpha) ===
-fig, axs = plt.subplots(1, 2, figsize=(14, 5))
-
-# Plot pour f₀
-axs[0].plot(alphas, distances_f0, label=r'$L^2(f_0, \hat{f})$', color='C0')
-axs[0].set_title(r'Distance $L^2$ entre $f_0$ (zonage) et $\hat{f}$')
-axs[0].set_xlabel(r'$\alpha$')
-axs[0].set_ylabel(r'Distance $L^2$')
-axs[0].grid(True)
-axs[0].legend()
-
-# Plot pour f₀̃
-axs[1].plot(alphas, distances_f0tilde, label=r'$L^2(\tilde{f}_0, \hat{f})$', color='C1')
-axs[1].set_title(r'Distance $L^2$ entre $\tilde{f}_0$ (mélange gaussien) et $\hat{f}$')
-axs[1].set_xlabel(r'$\alpha$')
-axs[1].set_ylabel(r'Distance $L^2$')
-axs[1].grid(True)
-axs[1].legend()
+plot_density_heatmap(Z_mean_inf, title=f"Informatif – moyenne sur {N} DPMM", ax=axs[1, 0], cmap="viridis")
+plot_contour_levels(X, Y, Z_mean_inf, title="Informatif – lignes de niveau", ax=axs[1, 1], cmap="viridis")
 
 plt.tight_layout()
 plt.show()
-fig.savefig("figure_alpha_sweep.png")
-
-
-
-#%%
-# *************************************************************************************************************************
-# ***************************************** (2) Paramètres sweep - alpha/lambda_0 *****************************************
-# *************************************************************************************************************************
-import numpy as np
-import matplotlib.pyplot as plt
-import openturns as ot
-from dpmm.density import (define_zonage_grid, compute_f0_density, 
-                          compute_zone_gaussian_parameters, compute_f0tilde_density, 
-                          informative_dpmm_density)
-from experiments.compute_l2 import compute_l2_distance, evaluate_l2_distance_vs_param, evaluate_l2_distance_vs_two_params
-from visualizations.plot_density import plot_density_heatmap
-
-# === Paramètres f0, f0_tilde ===
-n_rows, n_cols = 2, 2
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-zones, x_bounds, y_bounds = define_zonage_grid(n_rows, n_cols)
-area = (x_bounds[1] - x_bounds[0]) * (y_bounds[1] - y_bounds[0])
-areas = np.full(len(weights_base), area)
-mus, covariances = compute_zone_gaussian_parameters(zones)
-
-# === Paramètres DPMM informatif ===
-alpha = 50
-tau = 1e-2
-means_base = [[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]]
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-lambda_0 = 30.0
-nu_0 = 4
-Psi_0 = ot.CovarianceMatrix([[0.26, 0.0], [0.0, 0.26]])
-
-grid_x = np.linspace(0, 2, 200)
-grid_y = np.linspace(0, 2, 200)
-
-alphas = np.linspace(0.1, 40, 30)
-lambdas = np.linspace(0.1, 40, 30)
-
-params = {"tau": tau, "means_base": means_base, "weights_base": weights_base, "nu_0": nu_0, "Psi_0": Psi_0}
-ref_f0_args = {"zones": zones, "weights": weights_base, "areas": areas}
-ref_f0tilde_args={"mus": mus, "covariances": covariances, "weights": weights_base}
-
-alpha_grid, lambda_grid, L2_matrix_f0 = evaluate_l2_distance_vs_two_params(
-    param1_values=alphas,
-    param2_values=lambdas,
-    param1_name="alpha",
-    param2_name="lambda_0",
-    reference_density=compute_f0_density,
-    dpmm_density_constructor=informative_dpmm_density,
-    grid_x=grid_x,
-    grid_y=grid_y,
-    constructor_kwargs_base=params,
-    ref_args=ref_f0_args
-)
-
-alpha_grid, lambda_grid, L2_matrix_f0tilde = evaluate_l2_distance_vs_two_params(
-    param1_values=alphas,
-    param2_values=lambdas,
-    param1_name="alpha",
-    param2_name="lambda_0",
-    reference_density=compute_f0tilde_density,
-    dpmm_density_constructor=informative_dpmm_density,
-    grid_x=grid_x,
-    grid_y=grid_y,
-    constructor_kwargs_base=params,
-    ref_args= ref_f0tilde_args,
-    verbose=False
-)
-
-# ============================== Affichage ==============================
-extent = (lambdas[0], lambdas[-1], alphas[0], alphas[-1])
-fig, axs = plt.subplots(1, 2, figsize=(15, 6))
-
-plot_density_heatmap(
-    Z=L2_matrix_f0,
-    title=r"Distance L² entre $f_0$ et DPMM",
-    extent=extent,
-    cmap='viridis',
-    ax=axs[0]
-)
-axs[0].set_xlabel(r"$\lambda_0$")
-axs[0].set_ylabel(r"$\alpha$")
-
-# Trouver le minimum et l'annoter
-min_idx_f0 = np.unravel_index(np.nanargmin(L2_matrix_f0), L2_matrix_f0.shape)
-min_alpha_f0 = alphas[min_idx_f0[0]]
-min_lambda_f0 = lambdas[min_idx_f0[1]]
-min_val_f0 = L2_matrix_f0[min_idx_f0]
-axs[0].plot(min_lambda_f0, min_alpha_f0, 'ro')
-axs[0].annotate(f"{min_val_f0:.4f}", (min_lambda_f0, min_alpha_f0), color='white',
-                xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
-
-
-plot_density_heatmap(
-    Z=L2_matrix_f0tilde,
-    title=r"Distance L² entre $\tilde{f}_0$ et DPMM",
-    extent=extent,
-    cmap='viridis',
-    ax=axs[1]
-)
-axs[1].set_xlabel(r"$\lambda_0$")
-axs[1].set_ylabel(r"$\alpha$")
-
-# Trouver le minimum et l'annoter
-min_idx_f0tilde = np.unravel_index(np.nanargmin(L2_matrix_f0tilde), L2_matrix_f0tilde.shape)
-min_alpha_f0tilde = alphas[min_idx_f0tilde[0]]
-min_lambda_f0tilde = lambdas[min_idx_f0tilde[1]]
-min_val_f0tilde = L2_matrix_f0tilde[min_idx_f0tilde]
-axs[1].plot(min_lambda_f0tilde, min_alpha_f0tilde, 'ro')
-axs[1].annotate(f"{min_val_f0tilde:.4f}", (min_lambda_f0tilde, min_alpha_f0tilde), color='white',
-                xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
-
-plt.tight_layout()
-plt.show()
-fig.savefig("figure_alpha_lambda_sweep.png")
-
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_dpmm_inf_et_noninf.png")
 
 
 
 #%%
 # ****************************************************************************************************************************
-# ****************************** (2) Paramètres sweep - alpha/lambda_0 - Moyenne empirique DPMM ******************************
+# ****************************** Paramètres sweep - alpha/lambda_0 - Moyenne empirique DPMM ******************************
 # ****************************************************************************************************************************
 import numpy as np
 import matplotlib.pyplot as plt
 import openturns as ot
-from dpmm.density import (define_zonage_grid, compute_f0_density, 
-                          compute_zone_gaussian_parameters, compute_f0tilde_density, 
-                          informative_dpmm_density)
-from experiments.compute_l2 import (compute_l2_distance, evaluate_l2_distance_vs_param, 
-                                    evaluate_l2_distance_vs_two_params, eval_l2_dist_vs_two_params_avg_dpmm_inf)
-from visualizations.plot_density import plot_density_heatmap
 
-# === Paramètres f0, f0_tilde ===
-n_rows, n_cols = 2, 2
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-zones, x_bounds, y_bounds = define_zonage_grid(n_rows, n_cols)
-area = (x_bounds[1] - x_bounds[0]) * (y_bounds[1] - y_bounds[0])
-areas = np.full(len(weights_base), area)
-mus, covariances = compute_zone_gaussian_parameters(zones)
-
-# === Paramètres DPMM informatif ===
-alpha = 50
-tau = 1e-2
-means_base = [[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]]
-weights_base = np.array([2.0, 1.0, 0.5, 0.1])
-weights_base /= weights_base.sum()
-lambda_0 = 30.0
-nu_0 = 4
-Psi_0 = ot.CovarianceMatrix([[0.26, 0.0], [0.0, 0.26]])
+from dpmm.dpmm import DirichletProcessMixtureModel, sample_mixture_niw
+from dpmm.prior_utils import (
+    define_zonage_grid,
+    sample_from_f0,
+    compute_zone_gaussian_parameters,
+    compute_f0_density,
+    compute_f0tilde_density
+)
+from visualizations.plot import plot_density_heatmap
+from experiments.compute_l2 import eval_l2_dist_vs_two_params_avg_dpmm_inf
 
 
-# Grille
-grid_x = np.linspace(0, 2, 200)
-grid_y = np.linspace(0, 2, 200)
-X, Y = np.meshgrid(grid_x, grid_y)
+n_rows, n_cols = 3, 3
+zones, areas = define_zonage_grid(n_rows, n_cols)
+n_zones = len(zones)
+zone_weights = [0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.15, 0.15, 0.25]
+X_samples = sample_from_f0(n_samples=10000, zones=zones, weights=zone_weights, areas=areas)
+mus, covariances, weights_base, _ = compute_zone_gaussian_parameters(X_samples, n_components=n_zones)
 
-# Référence : f0_tilde
-Z_f0_ref = compute_f0_density(X, Y, zones, weights_base, areas)
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
+
+Z_f0_ref = compute_f0_density(X, Y, zones, zone_weights, areas)
 Z_f0tilde_ref = compute_f0tilde_density(X, Y, mus, covariances, weights_base)
 
-# Paramètres à faire varier
-alphas = np.linspace(0.1, 10, 15)
-lambdas = np.linspace(0.1, 10, 15)
+def informative_dpmm_factory(alpha, lambda_0):
+    nu_0 = 5
+    Psi_0 = []
+    for Sigma in covariances:
+        Sigma_reg = Sigma + 1e-6 * np.eye(2)
+        Psi = ot.CovarianceMatrix(Sigma_reg * (nu_0 - 3))
+        Psi_0.append(Psi)
 
-# Paramètres fixes
-kwargs_base = {
-    "tau": tau,
-    "means_base": means_base,
-    "weights_base": weights_base,
-    "nu_0": nu_0,
-    "Psi_0": Psi_0
-}
+    return lambda: DirichletProcessMixtureModel(
+        alpha=alpha,
+        tau=1e-3,
+        G0_sampler=sample_mixture_niw,
+        G0_kwargs={
+            "means_base": [ot.Point(mu) for mu in mus],
+            "weights_base": weights_base.tolist(),
+            "lambda_0": lambda_0,
+            "Psi_0": Psi_0,
+            "nu_0": nu_0
+        }
+    )
 
-# Évaluation
+alphas = np.linspace(0.1, 10, 20)
+lambdas = np.linspace(0.1, 10, 20)
+
 Z_f0 = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     param1_values=alphas,
     param2_values=lambdas,
     param1_name="alpha",
     param2_name="lambda_0",
     reference_density_array=Z_f0_ref,
-    grid_x=grid_x,
-    grid_y=grid_y,
-    N=10,
-    dpmm_density_fn=informative_dpmm_density,
-    constructor_kwargs_base=kwargs_base,
-    verbose=True
+    grid_x=x,
+    grid_y=y,
+    N=20,
+    dpmm_factory_fn=informative_dpmm_factory
 )
-
 Z_f0tilde = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     param1_values=alphas,
     param2_values=lambdas,
     param1_name="alpha",
     param2_name="lambda_0",
     reference_density_array=Z_f0tilde_ref,
-    grid_x=grid_x,
-    grid_y=grid_y,
-    N=10,
-    dpmm_density_fn=informative_dpmm_density,
-    constructor_kwargs_base=kwargs_base,
-    verbose=True
+    grid_x=x,
+    grid_y=y,
+    N=20,
+    dpmm_factory_fn=informative_dpmm_factory
 )
 
 
-# ============================== Affichage ==============================
+# =========================== Affichage ===========================
 extent = (lambdas[0], lambdas[-1], alphas[0], alphas[-1])
 fig, axs = plt.subplots(1, 2, figsize=(15, 6))
 
+# f0
 plot_density_heatmap(
     Z=Z_f0,
-    title="Distance L² entre f0 et DPMM (en fonction de α et λ₀)",
+    title="Distance L² entre f0 et DPMM (alpha, lambda_0)",
     extent=extent,
     cmap='viridis',
     ax=axs[0]
@@ -537,7 +408,6 @@ plot_density_heatmap(
 axs[0].set_xlabel(r"$\lambda_0$")
 axs[0].set_ylabel(r"$\alpha$")
 
-# Trouver le minimum et l'annoter
 min_idx_f0 = np.unravel_index(np.nanargmin(Z_f0), Z_f0.shape)
 min_alpha_f0 = alphas[min_idx_f0[0]]
 min_lambda_f0 = lambdas[min_idx_f0[1]]
@@ -546,10 +416,10 @@ axs[0].plot(min_lambda_f0, min_alpha_f0, 'ro')
 axs[0].annotate(f"{min_val_f0:.4f}", (min_lambda_f0, min_alpha_f0), color='white',
                 xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
 
-
+# f0tilde
 plot_density_heatmap(
     Z=Z_f0tilde,
-    title="Distance L² entre f0_tilde et DPMM (en fonction de α et λ₀)",
+    title="Distance L² entre f0tilde et DPMM (alpha, lambda_0)",
     extent=extent,
     cmap='viridis',
     ax=axs[1]
@@ -557,7 +427,6 @@ plot_density_heatmap(
 axs[1].set_xlabel(r"$\lambda_0$")
 axs[1].set_ylabel(r"$\alpha$")
 
-# Trouver le minimum et l'annoter
 min_idx_f0tilde = np.unravel_index(np.nanargmin(Z_f0tilde), Z_f0tilde.shape)
 min_alpha_f0tilde = alphas[min_idx_f0tilde[0]]
 min_lambda_f0tilde = lambdas[min_idx_f0tilde[1]]
@@ -568,275 +437,11 @@ axs[1].annotate(f"{min_val_f0tilde:.4f}", (min_lambda_f0tilde, min_alpha_f0tilde
 
 plt.tight_layout()
 plt.show()
-fig.savefig("figure_alpha_lambda_sweep_MC.png")
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_dpmm_alpha_lambda0_sweep.png")
 
 
 
-#%%
-# *******************************************************************************************************
-# ******************************************* (EN CHANTIER !) *******************************************
-# *******************************************************************************************************
-import numpy as np
-import matplotlib.pyplot as plt
-import openturns as ot
-from dpmm.density import (define_zonage_grid, compute_f0_density, 
-                          compute_zone_gaussian_parameters, compute_f0tilde_density, 
-                          informative_dpmm_density, noninformative_dpmm_density)
-from experiments.compute_l2 import (evaluate_l2_distance_vs_param, evaluate_l2_distance_vs_two_params, 
-                                    eval_l2_dist_vs_two_params_avg_dpmm_inf)
-from visualizations.plot_density import plot_density_heatmap
-from visualizations.plot_sampling import plot_sampling
-from dpmm.sampling import sample_from_noninformative_dpmm
 
-
-# === Paramètres du DPMM non-informatif ===
-n_samples = 10000
-alpha = 20.0
-tau = 1e-2
-
-mu_0 = ot.Point([1.0, 1.0])
-lambda_0 = 100.0
-nu_0 = 4.0
-Psi_0 = ot.CovarianceMatrix([[1.0 * (nu_0 - 3), 0.0], [0.0, 1.0 * (nu_0 - 3)]])
-
-samples_f_noninf = sample_from_noninformative_dpmm(
-    n_samples=n_samples,
-    alpha=alpha,
-    tau=tau,
-    mu_0=mu_0,
-    lambda_0=lambda_0,
-    Psi_0=Psi_0,
-    nu_0=nu_0
-)
-
-f_noninf_density = noninformative_dpmm_density(
-    alpha=alpha,
-    tau=tau,
-    mu_0=mu_0,
-    lambda_0=lambda_0,
-    Psi_0=Psi_0,
-    nu_0=nu_0
-)
-
-# Grille    
-x = np.linspace(0, 2, 200)
-y = np.linspace(0, 2, 200)
-X, Y = np.meshgrid(x, y)
-
-Z_noninf = f_noninf_density(X, Y)
-
-
-# ============================= Affichage =============================
-fig, axs = plt.subplots(1, 2, figsize=(14, 6))
-
-plot_density_heatmap(Z_noninf, title="Densité du DPMM non-informatif", ax=axs[0])
-plot_sampling(samples_f_noninf, title="Échantillons selon $f$", ax=axs[1])
-
-plt.tight_layout()
-plt.show()
-fig.savefig("figure_f_noninf.png")
-
-
-
-
-#%%
-# *******************************************************************************************************
-# ******************************************* (EN CHANTIER !) *******************************************
-# *******************************************************************************************************
-import numpy as np
-import matplotlib.pyplot as plt
-import openturns as ot
-from dpmm.density import (define_zonage_grid, compute_f0_density, 
-                          compute_zone_gaussian_parameters, compute_f0tilde_density, 
-                          informative_dpmm_density, noninformative_dpmm_density)
-from experiments.compute_l2 import (evaluate_l2_distance_vs_param, evaluate_l2_distance_vs_two_params, 
-                                    eval_l2_dist_vs_two_params_avg_dpmm_inf)
-from visualizations.plot_density import plot_density_heatmap
-from visualizations.plot_sampling import plot_sampling
-from dpmm.sampling import sample_from_noninformative_dpmm
-
-# === Paramètres du DPMM non-informatif ===
-N = 20 
-alpha = 20.0
-tau = 1e-2
-
-mu_0 = ot.Point([1.0, 1.0])
-lambda_0 = 100.0
-nu_0 = 4.0
-Psi_0 = ot.CovarianceMatrix([[1.0 * (nu_0 - 3), 0.0], [0.0, 1.0 * (nu_0 - 3)]])
-
-# Grille    
-x = np.linspace(0, 2, 200)
-y = np.linspace(0, 2, 200)
-X, Y = np.meshgrid(x, y)
-
-# === Moyenne empirique de N densités DPMM non-informatives ===
-Z_sum = np.zeros_like(X)
-
-for _ in range(N):
-    mixture = noninformative_dpmm_density(
-        alpha=alpha,
-        tau=tau,
-        mu_0=mu_0,
-        lambda_0=lambda_0,
-        Psi_0=Psi_0,
-        nu_0=nu_0
-    )
-    Z = f_noninf_density(X, Y)
-    Z_sum += Z
-
-Z_mean = Z_sum / N
-
-# ============================= Affichage =============================
-fig, ax = plt.subplots(figsize=(7, 6))
-plot_density_heatmap(Z_mean, title=f"Moyenne empirique ({N} densités DPMM non-informatives)", ax=ax)
-plt.tight_layout()
-plt.show()
-fig.savefig("figure_MC_f_noninf.png")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#%%
-# *******************************************************************************************************
-# ******************************************* (EN CHANTIER !) *******************************************
-# *******************************************************************************************************
-
-import numpy as np
-from scipy.stats import multivariate_normal
-import matplotlib.pyplot as plt
-
-# -----------------------------
-# GMM avec l'algorithme EM
-# -----------------------------
-def gmm_em(X, G, mu_init, sigma_init=None, max_iter=100, tol=1e-6):
-    n, d = X.shape
-    mu = mu_init.copy()
-    pi_k = np.full(G, 1.0 / G)
-
-    # Initialisation des matrices de covariance
-    if sigma_init is None:
-        cov_global = np.cov(X, rowvar=False)
-        sigma = np.stack([cov_global.copy() for _ in range(G)])
-    else:
-        assert sigma_init.shape == (G, d, d)
-        sigma = sigma_init.copy()
-
-    loglik = []
-    loglik_prev = -np.inf
-
-    for iteration in range(max_iter):
-        # ----- E-Step -----
-        gamma = np.zeros((n, G))
-        for k in range(G):
-            mvn = multivariate_normal(mean=mu[k], cov=sigma[k])
-            gamma[:, k] = pi_k[k] * mvn.pdf(X)
-        gamma /= gamma.sum(axis=1, keepdims=True)
-
-        # ----- M-Step -----
-        Nk = gamma.sum(axis=0)
-        pi_k = Nk / n
-
-        for k in range(G):
-            mu[k] = (gamma[:, k][:, np.newaxis] * X).sum(axis=0) / Nk[k]
-            X_centered = X - mu[k]
-            sigma_k = (gamma[:, k][:, np.newaxis] * X_centered).T @ X_centered / Nk[k]
-            sigma[k] = sigma_k + np.eye(d) * 1e-6  # stabilité numérique
-
-        # ----- Log-vraisemblance -----
-        log_prob = np.zeros((n, G))
-        for k in range(G):
-            mvn = multivariate_normal(mean=mu[k], cov=sigma[k])
-            log_prob[:, k] = pi_k[k] * mvn.pdf(X)
-        log_likelihood = np.sum(np.log(log_prob.sum(axis=1)))
-        loglik.append(log_likelihood)
-
-        if abs(log_likelihood - loglik_prev) < tol:
-            break
-        loglik_prev = log_likelihood
-
-    return {
-        'G': G,
-        'pro': pi_k,
-        'mean': mu,
-        'sigma': sigma,
-        'loglik': loglik
-    }
-
-# -----------------------------
-# Affectation finale aux clusters
-# -----------------------------
-def assign_clusters(X, result):
-    G = result['G']
-    probs = np.array([
-        result['pro'][k] * multivariate_normal(mean=result['mean'][k], cov=result['sigma'][k]).pdf(X)
-        for k in range(G)
-    ]).T
-    return np.argmax(probs, axis=1)
-
-# -----------------------------
-# Génération de données
-# -----------------------------
-np.random.seed(0)
-X1 = np.random.multivariate_normal([0, 0], [[0.05, 0], [0, 0.05]], size=100)
-X2 = np.random.multivariate_normal([1, 1], [[0.05, 0], [0, 0.05]], size=100)
-X3 = np.random.multivariate_normal([0, 1.5], [[0.05, 0], [0, 0.05]], size=100)
-X = np.vstack([X1, X2, X3])
-
-# Initialisation aléatoire des centres
-G = 3
-d = X.shape[1]
-mu_init = X[np.random.choice(X.shape[0], G, replace=False)]
-
-# -----------------------------
-# Lancement de l'algorithme EM
-# -----------------------------
-result = gmm_em(X, G, mu_init)
-
-# -----------------------------
-# Visualisation
-# -----------------------------
-labels = assign_clusters(X, result)
-
-plt.figure(figsize=(8, 6))
-plt.scatter(X[:, 0], X[:, 1], c=labels, cmap='viridis', s=10)
-plt.scatter(result['mean'][:, 0], result['mean'][:, 1], c='red', marker='x', s=100, label='Centres')
-plt.title("Clustering GMM (EM)")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-
-
-
-# %%
 
 
 
@@ -966,23 +571,6 @@ plt.show()
 
 
 
-#%%
-
-
-
-
-
-
-
-
-
-
-#%%
-
-
-
-
-
 
 
 
@@ -1015,5 +603,11 @@ plt.show()
 
 
 #%%
+
+
+
+
+
+
 
 

@@ -4,14 +4,28 @@ import numpy as np
 
 def plot_density_heatmap(Z, title='Heatmap', extent=(0, 2, 0, 2), cmap='grey_r', ax=None):
     """
-    Affiche une heatmap 2D de la densité.
+    Display a heatmap of a 2D density matrix.
 
-    Paramètres :
-        - Z : ndarray 2D, les valeurs de densité
-        - title : str, titre de la figure
-        - extent : tuple, domaine des axes
-        - cmap : str, colormap utilisée
-        - ax : matplotlib.axes.Axes, axe cible (optionnel). Si None, utilise plt.gca()
+    Parameters
+    ----------
+    Z : ndarray of shape (n_y, n_x)
+        2D array representing the evaluated density over a grid.
+
+    title : str, default='Heatmap'
+        Title of the plot.
+
+    extent : tuple of float, default=(0, 2, 0, 2)
+        Boundaries of the heatmap image (x_min, x_max, y_min, y_max).
+
+    cmap : str, default='grey_r'
+        Colormap used to display the heatmap.
+
+    ax : matplotlib.axes.Axes or None, default=None
+        Axis to plot on. If None, uses the current axis.
+
+    Returns
+    -------
+    None
     """
     
     if ax is None:
@@ -26,7 +40,34 @@ def plot_density_heatmap(Z, title='Heatmap', extent=(0, 2, 0, 2), cmap='grey_r',
 
 def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='viridis', ax=None):
     """
-    EN CHANTIER 
+    Plot contour lines for a 2D density function.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n_y, n_x)
+        Meshgrid for the x-coordinates.
+
+    Y : ndarray of shape (n_y, n_x)
+        Meshgrid for the y-coordinates.
+
+    Z : ndarray of shape (n_y, n_x)
+        Scalar field values evaluated at each (X, Y) point.
+
+    levels : int or list of float, default=20
+        Number or explicit values of contour levels.
+
+    title : str, default='Lignes de niveaux'
+        Title of the plot.
+
+    cmap : str, default='viridis'
+        Colormap used for contour lines.
+
+    ax : matplotlib.axes.Axes or None, default=None
+        Axis to plot on. If None, uses the current axis.
+
+    Returns
+    -------
+    None
     """
     
     if ax is None:
@@ -43,16 +84,36 @@ def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='vir
 
 def plot_sampling(samples, title='Échantillons', s=5, alpha=0.5, xlim=(0, 2), ylim=(0, 2), ax=None):
     """
-    Affiche un nuage de points représentant un échantillon 2D.
+    Scatter plot of 2D samples, e.g. from a density or generative model.
 
-    Paramètres :
-        - samples : ndarray, tableau (N, 2) des points (x, y)
-        - title : str, titre de l'axe
-        - s : float, taille des points
-        - alpha : float, transparence
-        - xlim, ylim : tuple, bornes des axes
-        - ax : matplotlib.axes.Axes, subplot cible (optionnel)
+    Parameters
+    ----------
+    samples : array-like of shape (n_samples, 2)
+        2D coordinates of the sampled points.
+
+    title : str, default='Échantillons'
+        Title of the plot.
+
+    s : float, default=5
+        Marker size.
+
+    alpha : float, default=0.5
+        Opacity level for points (0 = transparent, 1 = opaque).
+
+    xlim : tuple of float, default=(0, 2)
+        Limits of the x-axis.
+
+    ylim : tuple of float, default=(0, 2)
+        Limits of the y-axis.
+
+    ax : matplotlib.axes.Axes or None, default=None
+        Axis to plot on. If None, uses the current axis.
+
+    Returns
+    -------
+    None
     """
+    
     samples = np.asarray(samples)
     if ax is None:
         ax = plt.gca()

@@ -1,9 +1,29 @@
 import numpy as np
+import traceback
 
 
 def compute_l2_distance(Z_f, Z_g, grid_x, grid_y):
     """
+    Compute the L2 distance between two 2D density estimates over a grid.
+
+    Parameters
+    ----------
+    Z_f : ndarray of shape (n_y, n_x)
+        First density evaluated on the grid.
     
+    Z_g : ndarray of shape (n_y, n_x)
+        Second density evaluated on the grid.
+    
+    grid_x : ndarray of shape (n_x,)
+        Grid values along the x-axis.
+    
+    grid_y : ndarray of shape (n_y,)
+        Grid values along the y-axis.
+
+    Returns
+    -------
+    float
+        L2 distance between Z_f and Z_g over the grid.
     """
 
     dx = grid_x[1] - grid_x[0]
@@ -23,7 +43,45 @@ def evaluate_l2_distance_vs_param(
     verbose=True,
 ):
     """
+    Evaluate the L2 distance between a reference density and a set of DPMM-estimated
+    densities across values of a single parameter.
 
+    Parameters
+    ----------
+    param_values : array-like
+        List of parameter values to evaluate.
+    
+    reference_density : callable
+        Reference density function, evaluated on a grid (X, Y).
+    
+    dpmm_density_constructor : callable
+        Function that returns a callable density estimator when passed parameter values.
+    
+    grid_x : ndarray of shape (n_x,)
+        Grid values along the x-axis.
+    
+    grid_y : ndarray of shape (n_y,)
+        Grid values along the y-axis.
+
+    param_name : str, default="alpha"
+        Name of the varying parameter.
+
+    constructor_kwargs : dict or None, default=None
+        Base keyword arguments to pass to the DPMM constructor.
+
+    ref_args : dict or None, default=None
+        Additional arguments passed to the reference density function.
+
+    verbose : bool, default=True
+        If True, print progress and L2 distances during evaluation.
+
+    Returns
+    -------
+    param_values : list
+        List of parameter values used.
+
+    l2_distances : list of float
+        Corresponding L2 distances to the reference density.
     """
     constructor_kwargs = constructor_kwargs or {}
     ref_args = ref_args or {}
@@ -61,7 +119,54 @@ def evaluate_l2_distance_vs_two_params(
     verbose=True
 ):
     """
-    
+    Evaluate the L2 distance between a reference density and DPMM-estimated densities
+    across a grid of two varying parameters.
+
+    Parameters
+    ----------
+    param1_values : array-like
+        Values for the first varying parameter.
+
+    param2_values : array-like
+        Values for the second varying parameter.
+
+    param1_name : str
+        Name of the first parameter.
+
+    param2_name : str
+        Name of the second parameter.
+
+    reference_density : callable
+        Reference density function, evaluated on (X, Y).
+
+    dpmm_density_constructor : callable
+        Function that builds a density estimator from parameters.
+
+    grid_x : ndarray
+        Grid values along the x-axis.
+
+    grid_y : ndarray
+        Grid values along the y-axis.
+
+    constructor_kwargs_base : dict or None, default=None
+        Base parameters passed to the density constructor.
+
+    ref_args : dict or None, default=None
+        Additional arguments passed to the reference density.
+
+    verbose : bool, default=True
+        If True, print progress and L2 values.
+
+    Returns
+    -------
+    param1_values : array
+        Values of the first parameter.
+
+    param2_values : array
+        Values of the second parameter.
+
+    distances : ndarray of shape (len(param1_values), len(param2_values))
+        L2 distances between estimated and reference densities.
     """
     constructor_kwargs_base = constructor_kwargs_base or {}
     ref_args = ref_args or {}
@@ -105,53 +210,79 @@ def eval_l2_dist_vs_two_params_avg_dpmm_inf(
     grid_x,
     grid_y,
     N,
-    dpmm_density_fn,
-    constructor_kwargs_base,
+    dpmm_factory_fn,
     verbose=True
 ):
     """
-    Évalue la distance L² entre une densité de référence (déjà évaluée sur grille)
-    et une moyenne empirique de densités DPMM en faisant varier deux hyperparamètres.
+    Evaluate the average L2 distance between a reference density and 
+    an ensemble of DPMM density estimates across a 2D parameter grid.
 
-    Paramètres :
-        - param1_values, param2_values : listes des valeurs à tester pour chaque hyperparamètre
-        - param1_name, param2_name : noms des hyperparamètres à faire varier
-        - reference_density_array : grille 2D de la densité de référence (Z)
-        - grid_x, grid_y : vecteurs 1D de la grille
-        - N : nombre de densités DPMM à moyenner
-        - dpmm_density_fn : fonction `informative_dpmm_density(...)`
-        - constructor_kwargs_base : dictionnaire des autres paramètres
-        - verbose : bool
+    For each (param1, param2) pair, N realizations of the DPMM are averaged 
+    before computing the L2 distance to the reference.
 
-    Retourne :
-        - distances : matrice (len(param1_values), len(param2_values)) des distances L²
+    Parameters
+    ----------
+    param1_values : array-like
+        Grid values for the first parameter.
+
+    param2_values : array-like
+        Grid values for the second parameter.
+
+    param1_name : str
+        Name of the first parameter.
+
+    param2_name : str
+        Name of the second parameter.
+
+    reference_density_array : ndarray
+        Ground-truth density values evaluated over the grid.
+
+    grid_x : ndarray
+        Grid values along the x-axis.
+
+    grid_y : ndarray
+        Grid values along the y-axis.
+
+    N : int
+        Number of DPMM samples to average per grid point.
+
+    dpmm_factory_fn : callable
+        Function of (param1, param2) returning a DPMM estimator instance with `.evaluate_density(X, Y)`.
+
+    verbose : bool, default=True
+        Whether to print progress and L2 scores.
+
+    Returns
+    -------
+    distances : ndarray of shape (len(param1_values), len(param2_values))
+        Averaged L2 distances for each parameter pair.
     """
-    distances = np.zeros((len(param1_values), len(param2_values)))
     X, Y = np.meshgrid(grid_x, grid_y)
+    distances = np.zeros((len(param1_values), len(param2_values)))
 
     for i, val1 in enumerate(param1_values):
         for j, val2 in enumerate(param2_values):
-            kwargs = constructor_kwargs_base.copy()
-            kwargs[param1_name] = val1
-            kwargs[param2_name] = val2
-
             try:
                 Z_sum = np.zeros_like(X)
                 for _ in range(N):
-                    f_density = dpmm_density_fn(**kwargs)
-                    Z_sum += f_density(X, Y)
-                Z_mean = Z_sum / N
+                    dpmm = dpmm_factory_fn(val1, val2)()
+                    Z = dpmm.evaluate_density(X, Y)
+                    Z_sum += Z
+                Z_avg = Z_sum / N
 
-                l2 = compute_l2_distance(Z_mean, reference_density_array, grid_x, grid_y)
-                distances[i, j] = l2
+                dist = compute_l2_distance(Z_avg, reference_density_array, grid_x, grid_y)
+                distances[i, j] = dist
 
                 if verbose:
-                    print(f"{param1_name}={val1:.2f}, {param2_name}={val2:.2f} → L² = {l2:.4f}")
+                    print(f"{param1_name}={val1:.2f}, {param2_name}={val2:.2f} → L² = {dist:.4f}")
+
             except Exception as e:
                 distances[i, j] = np.nan
                 print(f"[ERREUR] {param1_name}={val1}, {param2_name}={val2} → {e}")
+                traceback.print_exc()
 
     return distances
+
 
 
 

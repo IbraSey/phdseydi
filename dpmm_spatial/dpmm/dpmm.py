@@ -13,16 +13,21 @@ from dpmm.prior_utils import (
 
 def stick_breaking(alpha, tau=1e-3):
     """
-    Génère des poids selon le processus de Stick-Breaking pour approximer une réalisation d’un DP.
+    Generate stick-breaking weights for a Dirichlet process.
 
-    Paramètres :
-        - alpha : paramètre de concentration du processus de Dirichlet 
-        - tau : seuil pour arrêter l'approximation (par défaut 1e-3)
+    Parameters
+    ----------
+    alpha : float
+        Concentration parameter of the Dirichlet process.
 
-    Retourne :
-        - np.ndarray : tableau de poids normalisés
+    tau : float, default=1e-3
+        Threshold for stopping the stick-breaking process. The process stops when the remaining stick length is below tau.
+
+    Returns
+    -------
+    weights : ndarray of shape (n_components,)
+        Normalized weights sampled via the stick-breaking construction.
     """
-
     weights = []
     r = 1.0
     while r > tau:
@@ -34,6 +39,31 @@ def stick_breaking(alpha, tau=1e-3):
 
 
 def sample_niw(mu_0, lambda_0, Psi_0, nu_0):
+    """
+    Sample a mean and covariance pair from a Normal-Inverse-Wishart (NIW) distribution.
+
+    Parameters
+    ----------
+    mu_0 : array-like of shape (d,)
+        Mean of the prior distribution.
+
+    lambda_0 : float
+        Precision parameter for the mean.
+
+    Psi_0 : ndarray of shape (d, d)
+        Scale matrix for the Inverse-Wishart distribution.
+
+    nu_0 : float
+        Degrees of freedom for the Inverse-Wishart distribution.
+
+    Returns
+    -------
+    mu : ndarray of shape (d,)
+        Sampled mean vector.
+
+    Sigma : ndarray of shape (d, d)
+        Sampled covariance matrix.
+    """
     Sigma = ot.InverseWishart(Psi_0, nu_0).getRealizationAsMatrix()
     mu = ot.Normal(mu_0, ot.CovarianceMatrix(Sigma / lambda_0)).getRealization()
     return mu, Sigma
@@ -41,18 +71,32 @@ def sample_niw(mu_0, lambda_0, Psi_0, nu_0):
 
 def sample_mixture_niw(means_base, weights_base, lambda_0, Psi_0, nu_0):
     """
-    Échantillonne une moyenne et une matrice de covariance à partir d’un mélange de Normal-Inverse-Wishart (NIW).
+    Sample a mean and covariance pair from a mixture of Normal-Inverse-Wishart (NIW) priors.
 
-    Paramètres :
-        - means_base : liste des centres moyens potentiels pour les composantes
-        - weights_base : poids associés à chaque centre de moyenne 
-        - lambda_0 : précision sur la moyenne 
-        - Psi_0 : matrice d’échelle pour l’Inverse-Wishart
-        - nu_0 : degrés de liberté de la loi Inverse-Wishart (> dimension - 1)
+    Parameters
+    ----------
+    means_base : list of arrays
+        List of mean vectors for each component in the mixture.
 
-    Retourne :
-        - mu : moyenne échantillonnée
-        - Sigma : matrice de covariance échantillonnée
+    weights_base : array-like of shape (n_components,)
+        Mixture weights for each component.
+
+    lambda_0 : float
+        Precision parameter of the normal distribution in NIW.
+
+    Psi_0 : list of ndarrays
+        List of scale matrices for the inverse-Wishart distribution, one per component.
+
+    nu_0 : float
+        Degrees of freedom for the inverse-Wishart distribution.
+
+    Returns
+    -------
+    mu : ndarray
+        Sampled mean vector.
+
+    Sigma : ndarray
+        Sampled covariance matrix.
     """
     base_idx = np.random.choice(len(means_base), p=weights_base)
     mu_0 = ot.Point(means_base[base_idx])
@@ -63,7 +107,41 @@ def sample_mixture_niw(means_base, weights_base, lambda_0, Psi_0, nu_0):
 
 class DirichletProcessMixtureModel:
     """
+    Dirichlet Process Mixture Model using stick-breaking construction and Normal-Inverse-Wishart priors.
 
+    Parameters
+    ----------
+    alpha : float
+        Concentration parameter of the Dirichlet process.
+
+    tau : float
+        Threshold for stopping the stick-breaking construction.
+
+    G0_sampler : callable
+        Function to sample from the base distribution G₀.
+
+    G0_kwargs : dict
+        Keyword arguments passed to the base distribution sampler.
+
+    Attributes
+    ----------
+    weights : ndarray
+        Mixture weights obtained via stick-breaking.
+
+    components : list of (mu, Sigma)
+        List of Gaussian parameters sampled from the base distribution.
+
+    zones : list or None
+        List of zones if defined via `from_zonage`.
+
+    zone_weights : array or None
+        Associated weights for each zone.
+
+    zone_areas : array or None
+        Area of each zone.
+
+    zonage_defined : bool
+        Whether the model was constructed using a zoned prior.
     """
     def __init__(self, alpha, tau, G0_sampler, G0_kwargs):
         self.alpha = alpha
@@ -82,6 +160,19 @@ class DirichletProcessMixtureModel:
 
 
     def sample(self, n_samples):
+        """
+        Sample points from the Dirichlet process mixture model.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of samples to generate.
+
+        Returns
+        -------
+        samples : ndarray of shape (n_samples, 2)
+            Sampled points.
+        """
         samples = []
         for _ in range(n_samples):
             idx = np.random.choice(len(self.weights), p=self.weights)
@@ -91,6 +182,22 @@ class DirichletProcessMixtureModel:
         return np.array(samples)
 
     def evaluate_density(self, X, Y):
+        """
+        Evaluate the mixture density on a 2D meshgrid.
+
+        Parameters
+        ----------
+        X : ndarray
+            Grid values along the x-axis.
+
+        Y : ndarray
+            Grid values along the y-axis.
+
+        Returns
+        -------
+        Z : ndarray of shape equal to X.shape
+            Density values evaluated on the meshgrid.
+        """
         mesh_pts = np.column_stack((X.ravel(), Y.ravel()))
         mixture = ot.Mixture(
             [ot.Normal(mu, sigma) for mu, sigma in self.components],
@@ -100,6 +207,26 @@ class DirichletProcessMixtureModel:
         return np.array(Z).reshape(X.shape)
 
     def plot_density(self, X, Y, ax=None, title='Densité du DPMM', cmap='viridis'):
+        """
+        Plot the evaluated density on a 2D grid.
+
+        Parameters
+        ----------
+        X : ndarray
+            Meshgrid for x-axis.
+
+        Y : ndarray
+            Meshgrid for y-axis.
+
+        ax : matplotlib.axes.Axes or None
+            Axis on which to plot. If None, uses current axis.
+
+        title : str, default='Densité du DPMM'
+            Title of the plot.
+
+        cmap : str, default='viridis'
+            Colormap used for the density plot.
+        """
         Z = self.evaluate_density(X, Y)
         if ax is None:
             ax = plt.gca()
@@ -110,6 +237,23 @@ class DirichletProcessMixtureModel:
         ax.grid(True)
 
     def plot_samples(self, n_samples=1000, ax=None, title='Échantillons', s=5):
+        """
+        Plot a scatter of samples drawn from the model.
+
+        Parameters
+        ----------
+        n_samples : int, default=1000
+            Number of samples to draw.
+
+        ax : matplotlib.axes.Axes or None
+            Axis on which to plot. If None, uses current axis.
+
+        title : str, default='Échantillons'
+            Title of the plot.
+
+        s : float, default=5
+            Marker size for scatter plot.
+        """
         samples = self.sample(n_samples)
         if ax is None:
             ax = plt.gca()
@@ -121,6 +265,14 @@ class DirichletProcessMixtureModel:
         ax.grid(True)
 
     def get_prior(self):
+        """
+        Return a dictionary describing the base distribution G0.
+
+        Returns
+        -------
+        prior_info : dict
+            Dictionary with sampler function, prior type, and parameters.
+        """
         is_informative = self.G0_sampler.__name__ == 'sample_mixture_niw'
         return {
             'sampler': self.G0_sampler,
@@ -129,8 +281,38 @@ class DirichletProcessMixtureModel:
         }
 
     @classmethod
-    def from_zonage(cls, alpha, tau, n_rows, n_cols, lambda_0, nu_0, zone_weights=None, seed=0):
-        np.random.seed(seed)
+    def from_zonage(cls, alpha, tau, n_rows, n_cols, lambda_0, nu_0, zone_weights=None):
+        """
+        Create a DPMM instance with an informative prior based on spatial zonation.
+
+        Parameters
+        ----------
+        alpha : float
+            Concentration parameter of the Dirichlet process.
+
+        tau : float
+            Truncation threshold for the stick-breaking process.
+
+        n_rows : int
+            Number of rows in the zonation grid.
+
+        n_cols : int
+            Number of columns in the zonation grid.
+
+        lambda_0 : float
+            Precision parameter for the NIW prior.
+
+        nu_0 : float
+            Degrees of freedom for the Inverse-Wishart distribution.
+
+        zone_weights : array-like or None, default=None
+            Custom weights for each zone. If None, assumes uniform weights.
+
+        Returns
+        -------
+        instance : DirichletProcessMixtureModel
+            Initialized DPMM with informative prior from zonation.
+        """
 
         # 1. Définir le zonage
         zones, zone_areas = define_zonage_grid(n_rows, n_cols)
@@ -170,7 +352,7 @@ class DirichletProcessMixtureModel:
             nu_0=nu_0
         )
 
-        # 7. Mémoriser les infos de zonage et de l'approximation par des gaussiennes 
+        # 6. Mémoriser les infos de zonage et de l'approximation par des gaussiennes 
         instance = cls(alpha=alpha, tau=tau, G0_sampler=sample_mixture_niw, G0_kwargs=G0_kwargs)
 
         instance.zones = zones
@@ -182,6 +364,39 @@ class DirichletProcessMixtureModel:
         instance.weights_base = weights_base
 
         return instance
+
+
+def compute_empirical_mean_density(factory_fn, N, X, Y):
+    """
+    Compute the average density over N realizations of a DPMM model.
+
+    Parameters
+    ----------
+    factory_fn : callable
+        Function returning a new instance of a DPMM model with `.evaluate_density(X, Y)`.
+
+    N : int
+        Number of realizations to average over.
+
+    X : ndarray
+        Grid values along the x-axis.
+
+    Y : ndarray
+        Grid values along the y-axis.
+
+    Returns
+    -------
+    Z_mean : ndarray of shape equal to X.shape
+        Empirical average of the densities evaluated at each grid point.
+    """
+    Z_sum = np.zeros_like(X)
+    for _ in range(N):
+        dpmm = factory_fn()
+        Z_sum += dpmm.evaluate_density(X, Y)
+    return Z_sum / N
+
+
+
 
 
 
