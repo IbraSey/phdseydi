@@ -38,7 +38,7 @@ def plot_density_heatmap(Z, title='Heatmap', extent=(0, 2, 0, 2), cmap='grey_r',
     ax.set_aspect('equal')
 
 
-def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='viridis', ax=None):
+def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='viridis', ax=None, inline=True):
     """
     Plot contour lines for a 2D density function.
 
@@ -74,7 +74,7 @@ def plot_contour_levels(X, Y, Z, levels=20, title="Lignes de niveaux", cmap='vir
         ax = plt.gca()
     contour = ax.contour(X, Y, Z, levels=levels, cmap=cmap)
     plt.colorbar(contour, ax=ax, label="Densité")
-    ax.clabel(contour, inline=True, fontsize=8)
+    ax.clabel(contour, inline=inline, fontsize=8)
     ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
