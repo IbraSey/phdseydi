@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from numpy.linalg import pinv
+from shapely.geometry import Point
 
 
 def define_zonage_grid(n_rows, n_cols, x_range=(0, 2), y_range=(0, 2)):
@@ -88,34 +89,56 @@ def compute_zone_gaussian_parameters(X, n_components):
     return gmm.means_, gmm.covariances_, gmm.weights_, gmm
 
 
-def sample_from_f0(n_samples, zones, weights, areas):
+def sample_from_f0(n_samples, zones, weights, areas, irregular=False):
     """
-    Generate samples from a piecewise-uniform spatial density.
+    Generate samples from either rectangular zones or shapely polygons using weighted sampling.
 
     Parameters
     ----------
     n_samples : int
         Number of samples to generate.
-    zones : list of tuple
-        List of rectangular zones defined by ((x0, x1), (y0, y1)).
+    zones : list
+        - If irregular=False: list of rectangular zones ((x0, x1), (y0, y1)).
+        - If irregular=True: list of shapely.geometry.Polygon.
     weights : ndarray of shape (n_zones,)
-        Weight associated with each zone.
+        Probability weights for sampling each zone.
     areas : ndarray of shape (n_zones,)
         Area of each zone.
+    irregular : bool
+        If True, sample from polygons using rejection sampling.
+        If False, sample uniformly from rectangles.
 
     Returns
     -------
     samples : ndarray of shape (n_samples, 2)
-        Random samples drawn uniformly within the zones.
+        Points sampled uniformly from the specified spatial structure.
     """
-    
+
     samples = []
-    for _ in range(n_samples):
-        idx = np.random.choice(len(zones), p=weights)
-        (x0, x1), (y0, y1) = zones[idx]
-        x = ot.Uniform(x0, x1).getRealization()[0]
-        y = ot.Uniform(y0, y1).getRealization()[0]
-        samples.append([x, y])
+
+    if not irregular:
+        # Régulier : zones rectangulaires
+        for _ in range(n_samples):
+            idx = np.random.choice(len(zones), p=weights)
+            (x0, x1), (y0, y1) = zones[idx]
+            x = ot.Uniform(x0, x1).getRealization()[0]
+            y = ot.Uniform(y0, y1).getRealization()[0]
+            samples.append([x, y])
+    else:
+        # Irrégulier : polygones shapely
+        for _ in range(n_samples):
+            accepted = False
+            while not accepted:
+                idx = np.random.choice(len(zones), p=weights)
+                poly = zones[idx]
+                minx, miny, maxx, maxy = poly.bounds
+                x = ot.Uniform(minx, maxx).getRealization()[0]
+                y = ot.Uniform(miny, maxy).getRealization()[0]
+                point = Point(x, y)
+                if poly.contains(point):
+                    samples.append([x, y])
+                    accepted = True
+
     return np.array(samples)
 
 

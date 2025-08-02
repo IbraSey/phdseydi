@@ -9,6 +9,8 @@ from dpmm.prior_utils import (
                                 define_zonage_grid,
                                 sample_from_f0
                                 )
+from shapely.geometry import Polygon
+
 
 
 def stick_breaking(alpha, tau=1e-3):
@@ -281,7 +283,7 @@ class DirichletProcessMixtureModel:
         }
 
     @classmethod
-    def from_zonage(cls, alpha, tau, n_rows, n_cols, lambda_0, nu_0, zone_weights=None):
+    def from_regular_zonage(cls, alpha, tau, n_rows, n_cols, lambda_0, nu_0, zone_weights=None):
         """
         Create a DPMM instance with an informative prior based on spatial zonation.
 
@@ -353,6 +355,43 @@ class DirichletProcessMixtureModel:
         )
 
         # 6. Mémoriser les infos de zonage et de l'approximation par des gaussiennes 
+        instance = cls(alpha=alpha, tau=tau, G0_sampler=sample_mixture_niw, G0_kwargs=G0_kwargs)
+
+        instance.zones = zones
+        instance.zone_weights = zone_weights
+        instance.zone_areas = zone_areas
+        instance.zonage_defined = True
+        instance.gaussian_centroids = mus
+        instance.gaussian_covariances = covs
+        instance.weights_base = weights_base
+
+        return instance
+    
+    @classmethod
+    def from_irregular_zonage(cls, alpha, tau, zones, zone_weights, lambda_0, nu_0):
+
+        if len(zone_weights) != len(zones):
+            raise ValueError(f"zone_weights doit avoir {n_zones} éléments.")
+        elif np.sum(zone_weights) != 1:
+            raise ValueError(f"zone_weights doit sommer à 1.")
+
+        zone_areas = np.array([poly.area for poly in zones])
+        n_zones = len(zones)
+
+        X = sample_from_f0(n_samples=10000, zones=zones, weights=zone_weights, areas=zone_areas, irregular=True)
+
+        mus, covs, weights_base, _ = compute_zone_gaussian_parameters(X, n_components=n_zones)
+
+        Psi_0_list = [ot.CovarianceMatrix(Sigma * (nu_0 - 3)) for Sigma in covs]
+
+        G0_kwargs = dict(
+            means_base=[ot.Point(mu) for mu in mus],
+            weights_base=weights_base.tolist(),
+            lambda_0=lambda_0,
+            Psi_0=Psi_0_list,
+            nu_0=nu_0
+        )
+
         instance = cls(alpha=alpha, tau=tau, G0_sampler=sample_mixture_niw, G0_kwargs=G0_kwargs)
 
         instance.zones = zones

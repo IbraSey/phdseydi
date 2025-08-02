@@ -74,7 +74,7 @@ plot_sampling(X_tilde_samples, title="Échantillons f0tilde", ax=axs[1, 1])
 plt.suptitle("Visualisation d'un zonage (f0) et de son approximation GMM (f0tilde)", fontsize=16)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
 plt.show()
-#fig.savefig("visualizations/figures/figure_f0_f0tilde.png")
+#fig.savefig("visualizations/figures/figure_f0_f0tilde_regulier.png")
 
 
 
@@ -141,7 +141,7 @@ plot_contour_levels(X, Y, Z_f0tilde_mean, title="\nf0tilde – lignes de niveau\
 plt.suptitle(f"\nMoyenne empirique sur {N} tirages de f0 et f0tilde", fontsize=16)
 plt.tight_layout(rect=[0, 0, 1, 0.98])
 plt.show()
-#fig.savefig("visualizations/figures/figure_moyenne_empirique_f0_f0tilde.png")
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_f0_f0tilde_regulier.png")
 
 
 
@@ -172,9 +172,9 @@ dpmm_noninf = DirichletProcessMixtureModel(
     }
 )
 
-# Prior INFORMATIF : via zonage
+# Prior INFORMATIF : via zonage régulier
 zone_weights = [0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.15, 0.15, 0.25]
-dpmm_inf = DirichletProcessMixtureModel.from_zonage(
+dpmm_inf = DirichletProcessMixtureModel.from_regular_zonage(
     alpha=20.0,
     tau=1e-3,
     n_rows=3,
@@ -198,7 +198,7 @@ axs[1, 1].scatter(centers[:, 0], centers[:, 1], c='red', s=100, marker='x', labe
 
 plt.tight_layout()
 plt.show()
-#fig.savefig("visualizations/figures/figure_f_dpmm_inf_noninf.png")
+#fig.savefig("visualizations/figures/figure_f_dpmm_inf_noninf_regulier.png")
 
 print("== Prior non-informatif ==")
 print(dpmm_noninf.get_prior())
@@ -281,7 +281,7 @@ def build_dpmm_noninf():
     )
 
 def build_dpmm_inf():
-    return DirichletProcessMixtureModel.from_zonage(
+    return DirichletProcessMixtureModel.from_regular_zonage(
         alpha=alpha,
         tau=tau,
         n_rows=n_rows,
@@ -307,7 +307,7 @@ plot_contour_levels(X, Y, Z_mean_inf, title="Informatif – lignes de niveau", a
 
 plt.tight_layout()
 plt.show()
-#fig.savefig("visualizations/figures/figure_moyenne_empirique_dpmm_inf_et_noninf.png")
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_dpmm_inf_et_noninf_regulier.png")
 
 
 
@@ -441,131 +441,222 @@ plt.show()
 
 
 
+# %%
+# ****************************************************************************************************************************
+# ******************************************** Construction zonage pour cas jouet ********************************************
+# ****************************************************************************************************************************
+import matplotlib.pyplot as plt
+import numpy as np
+from shapely.geometry import Polygon
+from matplotlib.colors import Normalize
+
+# Polygones dans [0,2]²
+polygons = [
+    Polygon([(0.5,0.2), (0.55,0.2), (0.51,0.22), (0.39,0.48), (0.25,0.57), (0.13,0.68), (0.15,0.4), (0.35,0.28)]),
+    Polygon([(0.4,0.1), (1.15,0.1), (1.25,0.3), (1.7,0.4), (1.7,0.6), (1.2,0.5), (1.1,0.47), (0.9,0.4), (0.55,0.2)]),
+    Polygon([(0.55,0.2), (0.9,0.4), (0.85,0.58), (0.62,0.6), (0.5,0.6), (0.39,0.48), (0.51,0.22), (0.55,0.2)]),
+    Polygon([(0.13,0.68), (0.25,0.57), (0.39,0.48), (0.5,0.6), (0.62,0.6), (0.58,1.0), (0.4,1.25), (0.37,1.4), 
+             (0.55,1.6), (0.75,1.59), (1.0,1.05), (1.35,1.2), (1.55,1.5), (1.35,1.6), (1.1, 1.7),
+             (0.6,1.7), (0.23,1.4), (0.05,1.0)]),
+    Polygon([(0.62,0.6), (0.85,0.58), (0.9,0.4), (1.1,0.47), (1.2,0.5), (1.5,1.25), (1.35,1.2), (1.0,1.05), (0.58,1.0)]),
+    Polygon([(0.58,1.0), (1.0,1.05), (0.75,1.59), (0.55,1.6), (0.37,1.4), (0.4,1.25)]),
+    Polygon([(0.23,1.4), (0.35,1.9), (1.45,1.85), (1.35,1.6), (1.1, 1.7), (0.6,1.7), (0.23,1.4)]),
+    Polygon([(1.45,1.85), (1.35,1.6), (1.55,1.5), (1.35,1.2), (1.5,1.25), (1.75,1.4), (1.75,1.6), (1.7,1.77), (1.65,1.80)]),
+    Polygon([(1.5,1.25), (1.2,0.5), (1.7,0.6), (1.7,0.4), (1.78,0.5), (1.82,0.75), (1.83,1.0), (1.82,1.15), (1.75,1.4)])
+]
+
+# Intensités (poids de zone)
+zone_weights = np.array([0.05, 0.05, 0.25, 0.01, 0.1, 0.14, 0.14, 0.01, 0.25]) 
+cmap = plt.cm.plasma
+norm = Normalize(vmin=zone_weights.min(), vmax=zone_weights.max())
+
+# Calcul des aires
+areas = np.array([poly.area for poly in polygons])
+for i, area in enumerate(areas, 1):
+    print(f"Aiire du polygone P{i} : {area:.4f}")
+
+
+# =========================================== Affichage ===========================================
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.set_xlim(0, 2)
+ax.set_ylim(0, 2)
+ax.set_aspect('equal')
+
+for i, (poly, intensity) in enumerate(zip(polygons, zone_weights), start=1):
+    color = cmap(norm(intensity))
+    patch = plt.Polygon(list(poly.exterior.coords), facecolor=color, edgecolor='black')
+    ax.add_patch(patch)
+
+    # Position du label
+    if i == 4:
+        label_x, label_y = 0.32, 0.9  # Coordonnées choisies manuellement pour P4
+    else:
+        centroid = poly.centroid
+        label_x, label_y = centroid.x, centroid.y
+
+    ax.text(label_x, label_y, f'P{i}', color='black', weight='bold',
+            ha='center', va='center', fontsize=10,
+            bbox=dict(facecolor='white', alpha=0.3, edgecolor='none'))
+
+# Colorbar et finalisation
+plt.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=norm), ax=ax, label="Intensité")
+plt.title("\nZonage sismotectonique - Cas jouet\n")
+plt.grid(True)
+plt.show()
+#fig.savefig("visualizations/figures/figure_zonage_cas_jouet.png")
 
 
 
-
-
-
-
-
-
-
-#%%
+# %%
+# *********************************************************************************************************************************
+# *************************************** AFFICHAGE f0 et f0_tilde (Cas jouet zonage sismo) ***************************************
+# *********************************************************************************************************************************
 import numpy as np
 import matplotlib.pyplot as plt
-from shapely.geometry import Polygon, Point
-from scipy.stats import multivariate_normal
+from shapely.geometry import Polygon
+from matplotlib.colors import Normalize
+from dpmm.dpmm import DirichletProcessMixtureModel
+from dpmm.prior_utils import *
+from visualizations.plot import *
 
-# 1. Échantillonnage dans un polygone
-def sample_points_in_polygon(polygon, n):
-    minx, miny, maxx, maxy = polygon.bounds
-    points = []
-    while len(points) < n:
-        candidates = np.random.uniform([minx, miny], [maxx, maxy], size=(n, 2))
-        accepted = [Point(p).within(polygon) for p in candidates]
-        accepted_points = candidates[accepted]
-        points.extend(accepted_points)
-    return np.array(points[:n])
-
-# 2. Densité analytique (mélange d'uniformes)
-def polygon_density_mixture(xy, polygons, weights):
-    density = np.zeros(xy.shape[0])
-    for poly, w in zip(polygons, weights):
-        inside = np.array([poly.contains(Point(p)) for p in xy])
-        density[inside] += w / poly.area
-    return density
-
-# 3. Apprentissage GMM avec moyennes et poids fixés
-def fit_covariances_with_fixed_centroids(X, G, mu_fixed, pi_fixed, max_iter=100, tol=1e-6):
-    n, d = X.shape
-    mu = mu_fixed.copy()
-    pi_k = pi_fixed.copy()
-    sigma = np.stack([np.cov(X, rowvar=False) for _ in range(G)])
-
-    loglik = []
-    loglik_prev = -np.inf
-
-    for iteration in range(max_iter):
-        gamma = np.zeros((n, G))
-        for k in range(G):
-            mvn = multivariate_normal(mean=mu[k], cov=sigma[k])
-            gamma[:, k] = pi_k[k] * mvn.pdf(X)
-        gamma /= gamma.sum(axis=1, keepdims=True)
-
-        for k in range(G):
-            Nk = gamma[:, k].sum()
-            X_centered = X - mu[k]
-            sigma_k = (gamma[:, k][:, np.newaxis] * X_centered).T @ X_centered / Nk
-            sigma[k] = sigma_k + np.eye(d) * 1e-6
-
-        log_prob = np.zeros((n, G))
-        for k in range(G):
-            mvn = multivariate_normal(mean=mu[k], cov=sigma[k])
-            log_prob[:, k] = pi_k[k] * mvn.pdf(X)
-        log_likelihood = np.sum(np.log(log_prob.sum(axis=1)))
-        loglik.append(log_likelihood)
-
-        if abs(log_likelihood - loglik_prev) < tol:
-            break
-        loglik_prev = log_likelihood
-
-    return {'G': G, 'pro': pi_k, 'mean': mu, 'sigma': sigma, 'loglik': loglik}
-
-# 4. Évaluation de la densité GMM
-def evaluate_gmm_density(xy, result):
-    density = np.zeros(xy.shape[0])
-    for k in range(result['G']):
-        mvn = multivariate_normal(mean=result['mean'][k], cov=result['sigma'][k])
-        density += result['pro'][k] * mvn.pdf(xy)
-    return density
-
-# 5. Définition des 6 zones polygonales
-zones = [
-    Polygon([(0.2, 0.2), (0.4, 0.3), (0.3, 0.6), (0.1, 0.5)]),
-    Polygon([(1.3, 0.4), (1.6, 0.4), (1.5, 0.7), (1.2, 0.6)]),
-    Polygon([(0.7, 1.2), (1.3, 1.1), (1.2, 1.7), (0.6, 1.6)]),
-    Polygon([(0.8, 0.2), (1.0, 0.3), (0.9, 0.6), (0.7, 0.5)]),
-    Polygon([(1.5, 1.3), (1.7, 1.4), (1.6, 1.7), (1.4, 1.6)]),
-    Polygon([(0.2, 1.3), (0.4, 1.4), (0.3, 1.7), (0.1, 1.6)])
+# -----------------------------------
+# 1. Définition du zonage irrégulier
+# -----------------------------------
+polygons = [
+    Polygon([(0.5,0.2), (0.55,0.2), (0.51,0.22), (0.39,0.48), (0.25,0.57), (0.13,0.68), (0.15,0.4), (0.35,0.28)]),
+    Polygon([(0.4,0.1), (1.15,0.1), (1.25,0.3), (1.7,0.4), (1.7,0.6), (1.2,0.5), (1.1,0.47), (0.9,0.4), (0.55,0.2)]),
+    Polygon([(0.55,0.2), (0.9,0.4), (0.85,0.58), (0.62,0.6), (0.5,0.6), (0.39,0.48), (0.51,0.22), (0.55,0.2)]),
+    Polygon([(0.13,0.68), (0.25,0.57), (0.39,0.48), (0.5,0.6), (0.62,0.6), (0.58,1.0), (0.4,1.25), (0.37,1.4), 
+             (0.55,1.6), (0.75,1.59), (1.0,1.05), (1.35,1.2), (1.55,1.5), (1.35,1.6), (1.1, 1.7),
+             (0.6,1.7), (0.23,1.4), (0.05,1.0)]),
+    Polygon([(0.62,0.6), (0.85,0.58), (0.9,0.4), (1.1,0.47), (1.2,0.5), (1.5,1.25), (1.35,1.2), (1.0,1.05), (0.58,1.0)]),
+    Polygon([(0.58,1.0), (1.0,1.05), (0.75,1.59), (0.55,1.6), (0.37,1.4), (0.4,1.25)]),
+    Polygon([(0.23,1.4), (0.35,1.9), (1.45,1.85), (1.35,1.6), (1.1, 1.7), (0.6,1.7), (0.23,1.4)]),
+    Polygon([(1.45,1.85), (1.35,1.6), (1.55,1.5), (1.35,1.2), (1.5,1.25), (1.75,1.4), (1.75,1.6), (1.7,1.77), (1.65,1.80)]),
+    Polygon([(1.5,1.25), (1.2,0.5), (1.7,0.6), (1.7,0.4), (1.78,0.5), (1.82,0.75), (1.83,1.0), (1.82,1.15), (1.75,1.4)])
 ]
-weights = [0.2, 0.15, 0.15, 0.2, 0.15, 0.15]
+zone_weights = np.array([0.05, 0.05, 0.25, 0.01, 0.1, 0.14, 0.14, 0.01, 0.25])
+areas = np.array([poly.area for poly in polygons])
+n_zones = len(polygons)
+cmap = plt.cm.plasma
+norm = Normalize(vmin=zone_weights.min(), vmax=zone_weights.max())
 
-# 6. Échantillonnage
-n_samples = 6000
-n_per_zone = np.random.multinomial(n_samples, weights)
-X = np.vstack([
-    sample_points_in_polygon(polygon, n) for polygon, n in zip(zones, n_per_zone)
-])
+# Grille pour visualisation
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
 
-# 7. Centroïdes et poids
-mu_fixed = np.array([np.array(p.centroid.coords[0]) for p in zones])
-pi_fixed = np.array(weights)
+# -------------------------------------------
+# 2. Construction DPMM par zonage irrégulier
+# -------------------------------------------
+lambda_0 = 5
+nu_0 = 5
+dpmm = DirichletProcessMixtureModel.from_irregular_zonage(
+    alpha=1,
+    tau=1e-4,
+    zones=polygons,
+    zone_weights=zone_weights,
+    lambda_0=lambda_0,
+    nu_0=nu_0
+)
 
-# 8. Apprentissage
-result = fit_covariances_with_fixed_centroids(X, G=6, mu_fixed=mu_fixed, pi_fixed=pi_fixed)
+# -------------------------------
+# 3. Approximation f0tilde (GMM)
+# -------------------------------
+mus = dpmm.gaussian_centroids
+covs = dpmm.gaussian_covariances
+w_gmm = dpmm.weights_base
+Z_f0tilde = compute_f0tilde_density(X, Y, mus, covs, w_gmm)
 
-# 9. Grille d’évaluation
-grid_x, grid_y = np.meshgrid(np.linspace(0, 2, 200), np.linspace(0, 2, 200))
-grid_points = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+# -------------------
+# 4. Échantillonnage
+# -------------------
+X_samples = sample_from_f0(n_samples=5000, zones=polygons, weights=zone_weights, areas=areas, irregular=True)
+X_tilde_samples = sample_from_f0tilde(n_samples=5000, mus=mus, covariances=covs, weights=w_gmm)
 
-true_density = polygon_density_mixture(grid_points, zones, weights).reshape(200, 200)
-gmm_density = evaluate_gmm_density(grid_points, result).reshape(200, 200)
+# -----------------
+# 5. Visualisation
+# -----------------
+fig, axs = plt.subplots(2, 3, figsize=(18, 10))
 
-# 10. Heatmaps comparatives
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+# f0 (zonage)
+plot_sampling(X_samples, title="Échantillons f0", ax=axs[0, 1])
+for i, (poly, intensity) in enumerate(zip(polygons, zone_weights), start=1):
+    color = cmap(norm(intensity))
+    patch = plt.Polygon(list(poly.exterior.coords), facecolor=color, edgecolor='black')
+    axs[0,0].add_patch(patch)
+    axs[0,0].set_title("Zonage sismo - Cas jouet")
+    axs[0,0].set_xlim(0, 2)
+    axs[0,0].set_ylim(0, 2)
+    axs[0,0].set_aspect('equal')
+    axs[0,0].grid()
+axs[0, 2].axis("off")
 
-im0 = axs[0].imshow(true_density, origin='lower', extent=(0, 2, 0, 2), cmap='viridis')
-axs[0].set_title("Densité réelle (6 zones polygonales)")
-plt.colorbar(im0, ax=axs[0])
+# f0tilde (GMM)
+plot_density_heatmap(Z_f0tilde, title="f0tilde (approx. GMM)", ax=axs[1, 0], cmap='plasma')
+plot_sampling(X_tilde_samples, title="Échantillons f0tilde", ax=axs[1, 1])
+plot_contour_levels(X, Y, Z_f0tilde, title="f0tilde - Lignes de niveau", ax=axs[1, 2], inline=False)
 
-im1 = axs[1].imshow(gmm_density, origin='lower', extent=(0, 2, 0, 2), cmap='viridis')
-axs[1].set_title("Densité GMM approchée")
-plt.colorbar(im1, ax=axs[1])
-
-plt.tight_layout()
+plt.suptitle("\nZonage irrégulier (f0) et approximation par GMM (f0tilde)\n", fontsize=16)
+plt.tight_layout(rect=[0, 0, 1, 1])
 plt.show()
+#fig.savefig("visualizations/figures/figure_f0_f0tilde_cas_jouet_zonage_sismo.png")
 
+
+
+#%% 
+# *********************************************************************************************************************************
+# ******************************** AFFICHAGE de la moyenne empirique de f0 et f0_tilde (Cas jouet) ********************************
+# *********************************************************************************************************************************
+import numpy as np
+import matplotlib.pyplot as plt
+from shapely.geometry import Polygon
+import openturns as ot
+
+N = 10
+n_samples = 5000
+lambda_0, nu_0 = 5, 5
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
+
+Z_f0tilde_sum = np.zeros_like(X)
+for _ in range(N):
+    X_samples = sample_from_f0(n_samples=n_samples, zones=polygons, weights=zone_weights, areas=areas, irregular=True)
+    mus, covs, weights_gmm, _ = compute_zone_gaussian_parameters(X_samples, n_components=n_zones)
+    Z_f0tilde = compute_f0tilde_density(X, Y, mus, covs, weights_gmm)
+    Z_f0tilde_sum += Z_f0tilde
+Z_f0tilde_mean = Z_f0tilde_sum / N
+
+
+# ============================================== Visualisation ==============================================
+fig, axs = plt.subplots(2, 2, figsize=(11, 10))
+
+for i, (poly, intensity) in enumerate(zip(polygons, zone_weights), start=1):
+    color = cmap(norm(intensity))
+    patch = plt.Polygon(list(poly.exterior.coords), facecolor=color, edgecolor='black')
+    axs[0,0].add_patch(patch)
+    axs[0,0].set_title("Zonage sismo - Cas jouet")
+    axs[0,0].set_xlim(0, 2)
+    axs[0,0].set_ylim(0, 2)
+    axs[0,0].set_aspect('equal')
+    axs[0,0].grid()
+axs[0, 1].axis("off")
+
+plot_density_heatmap(Z_f0tilde_mean, title=f"\nf0tilde (GMM) – moyenne sur {N} tirages", cmap='viridis', ax=axs[1, 0])
+plot_contour_levels(X, Y, Z_f0tilde_mean, title="\nf0tilde – lignes de niveau", ax=axs[1, 1])
+
+plt.suptitle(f"\nMoyenne empirique sur {N} tirages de f0 et f0tilde (zonage irrégulier)", fontsize=16)
+plt.tight_layout(rect=[0, 0, 1, 0.98])
+plt.show()
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_f0_f0tilde_irregulier.png")
+
+
+
+# %% 
+# *************************************************************************************************************************
+# ********************************************** AFFICHAGE f DPMM informatif **********************************************
+# *************************************************************************************************************************
 
 
 
@@ -600,14 +691,7 @@ plt.show()
 
 
 
-
-
-#%%
-
-
-
-
-
+# %%
 
 
 
