@@ -313,7 +313,7 @@ plt.show()
 
 #%%
 # ****************************************************************************************************************************
-# ****************************** Paramètres sweep - alpha/lambda_0 - Moyenne empirique DPMM ******************************
+# ******************************** Paramètres sweep - alpha/lambda_0 - Moyenne empirique DPMM ********************************
 # ****************************************************************************************************************************
 import numpy as np
 import matplotlib.pyplot as plt
@@ -654,29 +654,249 @@ plt.show()
 
 
 # %% 
-# *************************************************************************************************************************
-# ********************************************** AFFICHAGE f DPMM informatif **********************************************
-# *************************************************************************************************************************
+# ************************************************************************************************************************************
+# **************************************** AFFICHAGE f DPMM informatif avec moyenne empirique ****************************************
+# ************************************************************************************************************************************
+import numpy as np
+import matplotlib.pyplot as plt
+import openturns as ot
+from shapely.geometry import Polygon
 
+from dpmm.dpmm import DirichletProcessMixtureModel, compute_empirical_mean_density, sample_niw
+from visualizations.plot import plot_density_heatmap, plot_contour_levels
 
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
 
+alpha = 20.0
+tau = 1e-3
+N = 50
+lambda_0 = 50.0
+nu_0 = 5
+G0_kwargs_noninf = {
+    "mu_0": ot.Point([1.0, 1.0]),
+    "lambda_0": 0.5,
+    "Psi_0": ot.CovarianceMatrix([[0.5, 0.0], [0.0, 0.5]]),
+    "nu_0": 8
+}
 
+# -----------------------------
+# Création des deux DPMM
+# -----------------------------
+dpmm_noninf = DirichletProcessMixtureModel(
+    alpha=alpha,
+    tau=tau,
+    G0_sampler=sample_niw,
+    G0_kwargs=G0_kwargs_noninf
+)
 
+dpmm_inf = DirichletProcessMixtureModel.from_irregular_zonage(
+    alpha=alpha,
+    tau=tau,
+    zones=polygons,
+    zone_weights=zone_weights,
+    lambda_0=lambda_0,
+    nu_0=nu_0
+)
 
+# -----------------------------
+# Visualisation directe
+# -----------------------------
+fig, axs = plt.subplots(2, 2, figsize=(12, 10))
 
+dpmm_noninf.plot_density(X, Y, ax=axs[0, 0], title="Prior non-informatif - densité")
+dpmm_noninf.plot_samples(5000, ax=axs[0, 1], title="Prior non-informatif - échantillons")
 
+dpmm_inf.plot_density(X, Y, ax=axs[1, 0], title="Prior informatif - densité (irrégulier)")
+dpmm_inf.plot_samples(5000, ax=axs[1, 1], title="Prior informatif - échantillons")
 
+centers = np.array(dpmm_inf.gaussian_centroids)
+axs[1, 1].scatter(centers[:, 0], centers[:, 1], c='red', s=100, marker='x', label='Centroïdes f̃₀')
+
+plt.tight_layout()
+plt.show()
+#fig.savefig("visualizations/figures/figure_f_dpmm_inf_cas_jouet_zonage_sismo.png")
+
+print("== Prior non-informatif ==")
+print(dpmm_noninf.get_prior())
+print("\n== Prior informatif (irrégulier) ==")
+print(dpmm_inf.get_prior())
+
+# ------------------------------------------------
+# Fonctions de construction pour moyenne empirique
+# ------------------------------------------------
+def build_dpmm_noninf():
+    return DirichletProcessMixtureModel(
+        alpha=alpha,
+        tau=tau,
+        G0_sampler=sample_niw,
+        G0_kwargs=G0_kwargs_noninf
+    )
+
+def build_dpmm_inf():
+    return DirichletProcessMixtureModel.from_irregular_zonage(
+        alpha=alpha,
+        tau=tau,
+        zones=polygons,
+        zone_weights=zone_weights,
+        lambda_0=lambda_0,
+        nu_0=nu_0
+    )
+
+# -----------------------------
+# Moyenne empirique sur N DPMM
+# -----------------------------
+Z_mean_noninf = compute_empirical_mean_density(build_dpmm_noninf, N, X, Y)
+Z_mean_inf = compute_empirical_mean_density(build_dpmm_inf, N, X, Y)
+
+# -----------------------------
+# Visualisation des moyennes
+# -----------------------------
+fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+plot_density_heatmap(Z_mean_noninf, title=f"Non-informatif – moyenne sur {N} DPMM", ax=axs[0, 0], cmap="viridis")
+plot_contour_levels(X, Y, Z_mean_noninf, title="Non-informatif – lignes de niveau", ax=axs[0, 1], cmap="viridis")
+
+plot_density_heatmap(Z_mean_inf, title=f"Informatif (irrégulier) – moyenne sur {N} DPMM", ax=axs[1, 0], cmap="viridis")
+plot_contour_levels(X, Y, Z_mean_inf, title="Informatif – lignes de niveau", ax=axs[1, 1], cmap="viridis")
+
+plt.tight_layout()
+plt.show()
+#fig.savefig("visualizations/figures/figure_moyenne_empirique_f_dpmm_inf_cas_jouet_zonage_sismo.png")
 
 
 
 #%%
+# *****************************************************************************************************************************************
+# **************************** Paramètres sweep - alpha/lambda_0 - Moyenne empirique DPMM sur zonage cas jouet ****************************
+# *****************************************************************************************************************************************
+import numpy as np
+import matplotlib.pyplot as plt
+import openturns as ot
+from shapely.geometry import Polygon
+
+from dpmm.dpmm import DirichletProcessMixtureModel, sample_mixture_niw
+from dpmm.prior_utils import (
+    sample_from_f0,
+    compute_zone_gaussian_parameters,
+    compute_f0_density,
+    compute_f0tilde_density
+)
+from visualizations.plot import plot_density_heatmap
+from experiments.compute_l2 import eval_l2_dist_vs_two_params_avg_dpmm_inf
+
+polygons = [
+    Polygon([(0.5,0.2), (0.55,0.2), (0.51,0.22), (0.39,0.48), (0.25,0.57), (0.13,0.68), (0.15,0.4), (0.35,0.28)]),
+    Polygon([(0.4,0.1), (1.15,0.1), (1.25,0.3), (1.7,0.4), (1.7,0.6), (1.2,0.5), (1.1,0.47), (0.9,0.4), (0.55,0.2)]),
+    Polygon([(0.55,0.2), (0.9,0.4), (0.85,0.58), (0.62,0.6), (0.5,0.6), (0.39,0.48), (0.51,0.22), (0.55,0.2)]),
+    Polygon([(0.13,0.68), (0.25,0.57), (0.39,0.48), (0.5,0.6), (0.62,0.6), (0.58,1.0), (0.4,1.25), (0.37,1.4), 
+             (0.55,1.6), (0.75,1.59), (1.0,1.05), (1.35,1.2), (1.55,1.5), (1.35,1.6), (1.1, 1.7),
+             (0.6,1.7), (0.23,1.4), (0.05,1.0)]),
+    Polygon([(0.62,0.6), (0.85,0.58), (0.9,0.4), (1.1,0.47), (1.2,0.5), (1.5,1.25), (1.35,1.2), (1.0,1.05), (0.58,1.0)]),
+    Polygon([(0.58,1.0), (1.0,1.05), (0.75,1.59), (0.55,1.6), (0.37,1.4), (0.4,1.25)]),
+    Polygon([(0.23,1.4), (0.35,1.9), (1.45,1.85), (1.35,1.6), (1.1, 1.7), (0.6,1.7), (0.23,1.4)]),
+    Polygon([(1.45,1.85), (1.35,1.6), (1.55,1.5), (1.35,1.2), (1.5,1.25), (1.75,1.4), (1.75,1.6), (1.7,1.77), (1.65,1.80)]),
+    Polygon([(1.5,1.25), (1.2,0.5), (1.7,0.6), (1.7,0.4), (1.78,0.5), (1.82,0.75), (1.83,1.0), (1.82,1.15), (1.75,1.4)])
+]
+zone_weights = np.array([0.05, 0.05, 0.25, 0.01, 0.1, 0.14, 0.14, 0.01, 0.25]) 
+areas = np.array([poly.area for poly in polygons])
+
+X_samples = sample_from_f0(n_samples=10000, zones=polygons, weights=zone_weights, areas=areas, irregular=True)
+mus, covariances, weights_base, _ = compute_zone_gaussian_parameters(X_samples, n_components=len(polygons))
+
+x = np.linspace(0, 2, 300)
+y = np.linspace(0, 2, 300)
+X, Y = np.meshgrid(x, y)
+
+Z_f0_ref = compute_f0_density(X, Y, zones=polygons, weights=zone_weights, areas=areas, irregular=True)
+Z_f0tilde_ref = compute_f0tilde_density(X, Y, mus, covariances, weights_base)
+
+def informative_dpmm_factory(alpha, lambda_0):
+    nu_0 = 5
+    Psi_0 = []
+    for Sigma in covariances:
+        Sigma_reg = Sigma + 1e-6 * np.eye(2)
+        Psi = ot.CovarianceMatrix(Sigma_reg * (nu_0 - 3))
+        Psi_0.append(Psi)
+
+    return lambda: DirichletProcessMixtureModel(
+        alpha=alpha,
+        tau=1e-3,
+        G0_sampler=sample_mixture_niw,
+        G0_kwargs={
+            "means_base": [ot.Point(mu) for mu in mus],
+            "weights_base": weights_base.tolist(),
+            "lambda_0": lambda_0,
+            "Psi_0": Psi_0,
+            "nu_0": nu_0
+        }
+    )
+
+alphas = np.linspace(0.1, 15, 20)
+lambdas = np.linspace(0.1, 15, 20)
+
+Z_f0 = eval_l2_dist_vs_two_params_avg_dpmm_inf(
+    param1_values=alphas,
+    param2_values=lambdas,
+    param1_name="alpha",
+    param2_name="lambda_0",
+    reference_density_array=Z_f0_ref,
+    grid_x=x,
+    grid_y=y,
+    N=50,
+    dpmm_factory_fn=informative_dpmm_factory
+)
+Z_f0tilde = eval_l2_dist_vs_two_params_avg_dpmm_inf(
+    param1_values=alphas,
+    param2_values=lambdas,
+    param1_name="alpha",
+    param2_name="lambda_0",
+    reference_density_array=Z_f0tilde_ref,
+    grid_x=x,
+    grid_y=y,
+    N=50,
+    dpmm_factory_fn=informative_dpmm_factory
+)
 
 
+# ======================================== Affichage ========================================
+extent = (lambdas[0], lambdas[-1], alphas[0], alphas[-1])
+fig, axs = plt.subplots(1, 2, figsize=(15, 6))
 
+# f0
+plot_density_heatmap(
+    Z=Z_f0,
+    title="Distance L² entre f0 et DPMM (alpha, lambda_0)",
+    extent=extent,
+    cmap='viridis',
+    ax=axs[0]
+)
+axs[0].set_xlabel(r"$\lambda_0$")
+axs[0].set_ylabel(r"$\alpha$")
+min_idx_f0 = np.unravel_index(np.nanargmin(Z_f0), Z_f0.shape)
+axs[0].plot(lambdas[min_idx_f0[1]], alphas[min_idx_f0[0]], 'ro')
+axs[0].annotate(f"{Z_f0[min_idx_f0]:.4f}", (lambdas[min_idx_f0[1]], alphas[min_idx_f0[0]]),
+                color='white', xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
 
+# f0tilde
+plot_density_heatmap(
+    Z=Z_f0tilde,
+    title="Distance L² entre f0tilde et DPMM (alpha, lambda_0)",
+    extent=extent,
+    cmap='viridis',
+    ax=axs[1]
+)
+axs[1].set_xlabel(r"$\lambda_0$")
+axs[1].set_ylabel(r"$\alpha$")
+min_idx_f0tilde = np.unravel_index(np.nanargmin(Z_f0tilde), Z_f0tilde.shape)
+axs[1].plot(lambdas[min_idx_f0tilde[1]], alphas[min_idx_f0tilde[0]], 'ro')
+axs[1].annotate(f"{Z_f0tilde[min_idx_f0tilde]:.4f}", (lambdas[min_idx_f0tilde[1]], alphas[min_idx_f0tilde[0]]),
+                color='white', xytext=(5, 5), textcoords='offset points', fontsize=10, weight='bold')
 
-
-
+plt.tight_layout()
+plt.show()
+#fig.savefig("visualizations/figures/figure_moyenne_emp_dpmm_alpha_lambda0_sweep_zonage_cas_jouet.png")
 
 
 
@@ -688,10 +908,9 @@ plt.show()
 
 
 
-
-
-
 # %%
+
+
 
 
 
