@@ -173,34 +173,52 @@ def sample_from_f0tilde(n_samples, mus, covariances, weights):
     return np.array(samples)
 
 
-def compute_f0_density(X, Y, zones, weights, areas):
+def compute_f0_density(X, Y, zones, weights, areas, irregular=False):
     """
-    Evaluate a piecewise-uniform density f₀ over a mesh grid.
+    Evaluate a piecewise-uniform density f0.
 
     Parameters
     ----------
     X : ndarray of shape (n_rows, n_cols)
         Grid of x-coordinates.
+
     Y : ndarray of shape (n_rows, n_cols)
         Grid of y-coordinates.
-    zones : list of tuple
-        List of zones defined by ((x0, x1), (y0, y1)).
+
+    zones : list
+        - If irregular=False: list of rectangles defined as ((x0, x1), (y0, y1)).
+        - If irregular=True: list of shapely.geometry.Polygon.
+
     weights : ndarray of shape (n_zones,)
-        Weights for each zone.
+        Weights for each zone or polygon.
+
     areas : ndarray of shape (n_zones,)
-        Area of each zone.
+        Area of each zone or polygon.
+
+    irregular : bool, default=False
+        Whether zones are polygons (True) or rectangles (False).
 
     Returns
     -------
     Z : ndarray of shape (n_rows, n_cols)
         Density values of f₀ evaluated over the mesh grid.
     """
-
     Z = np.zeros_like(X)
 
-    for idx, ((x0, x1), (y0, y1)) in enumerate(zones):
-        mask = (X >= x0) & (X < x1) & (Y >= y0) & (Y < y1)
-        Z[mask] = weights[idx] / areas[idx] 
+    if not irregular:
+        # Cas régulier 
+        for idx, ((x0, x1), (y0, y1)) in enumerate(zones):
+            mask = (X >= x0) & (X < x1) & (Y >= y0) & (Y < y1)
+            Z[mask] = weights[idx] / areas[idx]
+    else:
+        # Cas irrégulier 
+        n_rows, n_cols = X.shape
+        for idx, poly in enumerate(zones):
+            for i in range(n_rows):
+                for j in range(n_cols):
+                    pt = Point(X[i, j], Y[i, j])
+                    if poly.contains(pt):
+                        Z[i, j] = weights[idx] / areas[idx]
 
     return Z
 
