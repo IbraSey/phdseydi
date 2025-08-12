@@ -844,7 +844,7 @@ Z_f0 = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     reference_density_array=Z_f0_ref,
     grid_x=x,
     grid_y=y,
-    N=50,
+    N=5,
     dpmm_factory_fn=informative_dpmm_factory
 )
 Z_f0tilde = eval_l2_dist_vs_two_params_avg_dpmm_inf(
@@ -855,7 +855,7 @@ Z_f0tilde = eval_l2_dist_vs_two_params_avg_dpmm_inf(
     reference_density_array=Z_f0tilde_ref,
     grid_x=x,
     grid_y=y,
-    N=50,
+    N=5,
     dpmm_factory_fn=informative_dpmm_factory
 )
 
@@ -901,7 +901,6 @@ plt.show()
 
 
 # %%
-
 
 
 
