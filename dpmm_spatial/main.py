@@ -671,7 +671,7 @@ X, Y = np.meshgrid(x, y)
 
 alpha = 20.0
 tau = 1e-3
-N = 50
+N = 10
 lambda_0 = 50.0
 nu_0 = 5
 G0_kwargs_noninf = {
@@ -700,9 +700,9 @@ dpmm_inf = DirichletProcessMixtureModel.from_irregular_zonage(
     nu_0=nu_0
 )
 
-# -----------------------------
-# Visualisation directe
-# -----------------------------
+# -----------------
+# Visualisation 
+# -----------------
 fig, axs = plt.subplots(2, 2, figsize=(12, 10))
 
 dpmm_noninf.plot_density(X, Y, ax=axs[0, 0], title="Prior non-informatif - densité")
