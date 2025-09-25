@@ -439,4 +439,45 @@ def compute_empirical_mean_density(factory_fn, N, X, Y):
 
 
 
+n = 10000
+
+
+def hyperparameters_posterior_niw(mu_0, lambda_0, Psi_0, nu_0, k, x_bar, S):
+    """
+    
+    """
+    if k == 0:
+        return mu_0, lambda_0, Psi_0, nu_0
+    
+    lambda_k = lambda_0 + k
+    mu_k = (lambda_0*mu_0 + k*x_bar) / lambda_k
+    nu_k = nu_0 + k
+    delta = x_bar - mu_0
+    Psi_k = Psi_0 + S + (lambda_0 * k / lambda_k) * np.outer(delta, delta)
+
+    return mu_k, lambda_k, Psi_k, nu_k
+
+
+def prob_cluster(x_i, mu_k, Sigma_k, alpha, k, xbar_k, S_k):
+    """
+    
+    """
+    pri = k / n+alpha-1
+    dist = ot.Normal(mu_k, Sigma_k)
+    lik = dist.computePDF(x_i)
+
+    return pri * lik
+
+
+
+
+
+class DPMMGibbsSampler:
+    """
+    
+    """
+
+
+
+
 
