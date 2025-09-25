@@ -23,9 +23,9 @@ papers/
     │    └── Lu/
     │
 spatial_density_estimation/
-    ├── brouillon_spatial.ipynb                                 # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
-    ├── data/                                                   # Pour stocker les données (simulées ou non)
-    ├── dpmm_spatial/                                           # Estimation de densité spatiale par DPMM
+    ├── brouillon_spatial.ipynb                                  # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
+    ├── data/                                                    # Pour stocker les données (simulées ou non)
+    ├── dpmm_spatial/                                            # Estimation de densité spatiale par DPMM
     │    ├── dpmm/
     │    │    ├── __init__.py
     │    │    ├── dpmm.py                                        # Fonctions et classes concernant DPMM (construction, inférence, etc.) 
