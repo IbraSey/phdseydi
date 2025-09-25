@@ -1,32 +1,52 @@
 # PhD Thesis SEYDI
 
+
 ```
-dpmm_spatial/
-│
-├── data/                                   # Pour stocker les données (simulées ou non)
-│
-├── dpmm/
-│   ├── __init__.py
-│   ├── sampling.py                         # Fonctions pour échantillonnage
-│   └── density.py                          # Fonctions pour calculs de densité (f0, ftilde0, f, fbar)
-│
-├── experiments/
-│   ├── __init__.py
-│   └── compute_l2.py                       # Calcul de la distance L2
-│
-├── kde/kde.py
-│   ├── __init__.py
-│   └── kde.py                              # Estimation de la densité spatiale par KDE
-│
-├── visualizations/
-│   ├── __init__.py
-│   ├── plot_density.py                     # Visualisation heatmap, scatter, contours
-│   └── plot_distL2.py                      # Courbes de convergence
-│
-├── brouillon_dpmm_spatial.ipynb            # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
-├── main.py                                 # Script principal
-├── requirements.txt                        # Dépendances du projet
-└── README.md                               # Explication du projet, etc.
+
+JdB/ 
+    ├── Fiche_Bayésien_NP.pdf
+    ├── Livret_de_rapports.pdf
+    └── Notes-Bayesian_modeling_earthquake.pdf
+    │
+papers/
+    ├── BNP/
+    │    ├── À lire/
+    │    ├── En cours/
+    │    └── Lu/
+    ├── GP/
+    │    ├── À lire/
+    │    ├── En cours/
+    │    └── Lu/
+    └── Sismo/
+    │    ├── À lire/
+    │    ├── En cours/
+    │    └── Lu/
+    │
+spatial_density_estimation/
+    ├── brouillon_dpmm_spatial.ipynb                            # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
+    ├── data/                                                   # Pour stocker les données (simulées ou non)
+    ├── dpmm_spatial/                                           # Estimation de densité spatiale par DPMM
+    │    ├── dpmm/
+    │    │    ├── __init__.py
+    │    │    ├── dpmm.py                                        # Fonctions et classes concernant DPMM (construction, inférence, etc.) 
+    │    │    └── prior_utils.py                                 # Fonctions concernant la construction des priors 
+    │    ├── experiments/
+    │    │    ├── __init__.py
+    │    │    └── compute_l2.py                                  # Fonctions pour calcul de distances L2
+    │    ├── visualizations/
+    │    │    ├── figures/                                       # Figures illustratives concernant le DPMM
+    │    │    ├── __init__.py
+    │    │    └── plot.py                                        # Fonctions pour visualisations (heatmap, scatter, contours, etc.)
+    │    └── main_dpmm.py                                       # Script principal pour DPMM
+    │ 
+    ├── kde_spatial/                                            # Estimation de la densité spatiale par KDE
+    │    ├── __init__.py
+    │    ├── kde.py
+    │    ├── main_kde.py                                        # Script principal pour KDE
+    │
+requirements.txt                                                # Dépendances du projet
+    │
+README.md                                                       # Explication du projet, etc.
 ```
 
 
