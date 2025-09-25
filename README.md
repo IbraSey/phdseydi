@@ -37,16 +37,16 @@ spatial_density_estimation/
     │    │    ├── figures/                                       # Figures illustratives concernant le DPMM
     │    │    ├── __init__.py
     │    │    └── plot.py                                        # Fonctions pour visualisations (heatmap, scatter, contours, etc.)
-    │    └── main_dpmm.py                                       # Script principal pour DPMM
+    │    └── main_dpmm.py                                        # Script principal pour DPMM
     │ 
-    ├── kde_spatial/                                            # Estimation de la densité spatiale par KDE
+    ├── kde_spatial/                                             # Estimation de la densité spatiale par KDE
     │    ├── __init__.py
     │    ├── kde.py
-    │    ├── main_kde.py                                        # Script principal pour KDE
+    │    ├── main_kde.py                                         # Script principal pour KDE
     │
-requirements.txt                                                # Dépendances du projet
+requirements.txt                                                 # Dépendances du projet
     │
-README.md                                                       # Explication du projet, etc.
+README.md                                                        # Explication du projet, etc.
 ```
 
 
