@@ -6,7 +6,7 @@
 JdB/                                                    # Journal de bord
     ├── Fiche_Bayésien_NP.pdf
     ├── Livret_de_rapports.pdf
-    └── Notes-Bayesian_modeling_earthquake.pdf
+    └── Notes_Bayesian_modeling_earthquake.pdf
     │
 papers/
     ├── BNP/
