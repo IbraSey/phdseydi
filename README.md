@@ -23,7 +23,7 @@ papers/
     │    └── Lu/
     │
 spatial_density_estimation/
-    ├── brouillon_dpmm_spatial.ipynb                            # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
+    ├── brouillon_spatial.ipynb                                 # Notebook faisant office de brouillon (amener à disparaître sur un temps suffisamment long)
     ├── data/                                                   # Pour stocker les données (simulées ou non)
     ├── dpmm_spatial/                                           # Estimation de densité spatiale par DPMM
     │    ├── dpmm/
