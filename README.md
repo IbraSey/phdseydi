@@ -42,7 +42,7 @@ spatial_density_estimation/
     ├── kde_spatial/                                             # Estimation de la densité spatiale par KDE
     │    ├── __init__.py
     │    ├── kde.py
-    │    ├── main_kde.py                                         # Script principal pour KDE
+    │    └── main_kde.py                                         # Script principal pour KDE
     │
 requirements.txt                                                 # Dépendances du projet
     │
