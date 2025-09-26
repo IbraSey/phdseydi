@@ -29,14 +29,17 @@ spatial_density_estimation/
     │    ├── dpmm/
     │    │    ├── __init__.py
     │    │    ├── dpmm.py                              # Fonctions et classes concernant DPMM (construction, inférence, etc.) 
-    │    │    └── prior_utils.py                       # Fonctions concernant la construction des priors 
+    │    │    └── prior_utils.py                       # Fonctions concernant la construction des priors
+    │    │ 
     │    ├── experiments/
     │    │    ├── __init__.py
     │    │    └── compute_l2.py                        # Fonctions pour calcul de distances L2
+    │    │ 
     │    ├── visualizations/
     │    │    ├── figures/                             # Figures illustratives concernant le DPMM
     │    │    ├── __init__.py
     │    │    └── plot.py                              # Fonctions pour visualisations (heatmap, scatter, contours, etc.)
+    │    │ 
     │    └── main_dpmm.py                              # Script principal pour DPMM
     │ 
     ├── kde_spatial/                                   # Estimation de la densité spatiale par KDE
