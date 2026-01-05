@@ -2,6 +2,10 @@
 # **************************************************************************************************************************
 # ************************************************ AFFICHAGE f0 et f0_tilde ************************************************
 # **************************************************************************************************************************
+from pathlib import Path
+import os, sys
+ROOT = Path.cwd().parent
+sys.path.insert(0, str(ROOT))
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture

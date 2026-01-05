@@ -1,3 +1,7 @@
+from pathlib import Path
+import os, sys
+ROOT = Path.cwd().parent
+sys.path.insert(0, str(ROOT))
 import numpy as np
 import openturns as ot
 import matplotlib.pyplot as plt
@@ -10,7 +14,6 @@ from dpmm.prior_utils import (
                                 sample_from_f0
                                 )
 from shapely.geometry import Polygon
-
 
 
 def stick_breaking(alpha, tau=1e-3):
@@ -481,3 +484,5 @@ class DPMMGibbsSampler:
 
 
 
+
+# %%
