@@ -443,4 +443,145 @@ class SGCP_GibbsSampler:
         }
     
 
+    # =====================================================================================
+    # ---------------------------- Analyse postérieure ------------------------------------
+    # =====================================================================================
+    def posterior_summary(self, results, burn_in=0.3):
+        """
+        
+        """
+        mutilde_chain = np.asarray(results["mu_tilde"])
+        eps_chain = np.asarray(results["eps"])
+        f_chain = np.asarray(results["f_data"])
+        burn = int(len(mutilde_chain) * burn_in)
+
+        return {
+            "mutilde_hat": float(mutilde_chain[burn:].mean()),
+            "eps_hat": eps_chain[burn:].mean(axis=0),
+            "f_data_hat": f_chain[burn:].mean(axis=0),
+        }
+    
+    def posterior_gp(self, XY_data, f_data_hat, mesh, eps_hat):
+        """
+        
+        """
+        # Extraction des vertices du mesh
+        XY_grid = mesh.getVertices()
+        
+        # Moyennes (U * eps)
+        U_data = self.compute_U_from_areas(XY_data)
+        U_grid = self.compute_U_from_areas(XY_grid)
+        eps_col = ot.Matrix([[float(eps_hat[j])] for j in range(self.J)])
+        m_data_mat = U_data * eps_col
+        m_grid_mat = U_grid * eps_col
+        m_data = ot.Point([float(m_data_mat[i, 0]) for i in range(U_data.getNbRows())])
+        m_grid = ot.Point([float(m_grid_mat[i, 0]) for i in range(U_grid.getNbRows())])
+        
+        # Kernels
+        N = XY_data.getSize()
+        M = XY_grid.getSize()
+        K_dd, K_gd, K_gg = self.compute_kernel(XY_data, XY_grid)
+        
+        K_dd_reg = ot.CovarianceMatrix(K_dd)
+        for i in range(N):
+            K_dd_reg[i, i] += float(self.jitter)    # Régularisation
+        K_inv = K_dd_reg.inverse()
+
+        # Moyenne postérieure : mu_post = m_grid + K_gd * K_dd^{-1} * (f_data - m_data)
+        delta = f_data_hat - m_data
+        mu_post = m_grid + K_gd * (K_inv * delta)
+
+        # Covariance postérieure : Sigma_post = K_gg - K_gd * K_dd^{-1} * K_dg
+        Sigma_post_mat = ot.Matrix(K_gg) - K_gd * (K_inv * K_gd.transpose())
+        Sigma_post_np = np.array(Sigma_post_mat, dtype=float)
+        Sigma_post_np = 0.5 * (Sigma_post_np + Sigma_post_np.T)   # Symétrisation, passage par numpy peut être pas nécessaire
+        Sigma_post_np += float(self.jitter) * np.eye(M)     # Régularisation
+        Sigma_post = ot.CovarianceMatrix(Sigma_post_np.tolist())
+        
+        return mu_post, Sigma_post
+
+    def plot_posterior_intensity(
+        self,
+        x,
+        y,
+        t,
+        results,
+        nx=60,
+        ny=60,
+        burn_in=0.3
+    ):
+        """
+        
+        """
+        post_sum = self.posterior_summary(results, burn_in)
+        mutilde_hat = post_sum["mutilde_hat"]
+        eps_hat = post_sum["eps_hat"]
+        f_data_hat = post_sum["f_data_hat"]
+        N = len(t)
+        XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
+        
+        # Création du mesh 
+        xmin, xmax = self.X_bounds
+        ymin, ymax = self.Y_bounds
+        interval = ot.Interval([xmin, ymin], [xmax, ymax])
+        mesher = ot.IntervalMesher([nx - 1, ny - 1])      # nb d'arêtes
+        mesh = mesher.build(interval)
+
+        M = mesh.getVertices().getSize()
+        if M > 10000:            # Critère pour éviter maillage trop grand (question de compléxité)
+            raise ValueError(f"Maillage trop grand: {M} points.")
+
+        mu_post_grid, Sigma_post_grid = self.posterior_gp(XY_data, f_data_hat, mesh, eps_hat)
+        f_hat = mu_post_grid        # Estimateur de la moyenne a posteriori
+
+        mu_hat = mutilde_hat * self.sigma(f_hat)         # Calcul de l'intensité estimée
+        mu_sample = ot.Sample([[mu_hat[i]] for i in range(len(mu_hat))])
+        mu_field = ot.Field(mesh, mu_sample)
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+        # Subplot 1 : Données
+        ax = axes[0]
+        sc = ax.scatter(
+            x,
+            y,
+            c=t,
+            s=18,
+            alpha=0.7,
+            edgecolors="black",
+        )
+        ax.set_title("Données observées (couleur = temps)")
+        ax.set_xlim(self.X_bounds)
+        ax.set_ylim(self.Y_bounds)
+        ax.set_aspect("equal")
+        ax.grid(alpha=0.3)
+        plt.colorbar(sc, ax=ax).set_label("t")
+
+        # Subplot 2 : Intensité avec plot_field
+        ax = axes[1]
+        plot_field(mu_field, mode="subplot", ax=ax, title=r"Intensité postérieure $\hat{\mu}(s)$", 
+                   add_colorbar=True)
+        ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
+        ax.set_xlim(self.X_bounds)
+        ax.set_ylim(self.Y_bounds)
+        ax.grid(alpha=0.3, color="white", linewidth=0.5)
+
+        # Titre global
+        fig.suptitle(r"Analyse postérieure : $\hat{\mu}(s) = \hat{\tilde{\mu}} \cdot \sigma(\hat{f}(s))$", 
+                     fontsize=13, fontweight="bold",)
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            "mu_hat": mu_hat,
+            "eps_hat": eps_hat,
+            "f_data_hat": f_data_hat,
+            "mu_post_grid": mu_post_grid,
+            "Sigma_post_grid": Sigma_post_grid,
+            "mu_field": mu_field,
+            "mesh": mesh,
+        }
+
+
+
+
 
