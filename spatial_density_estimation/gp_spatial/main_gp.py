@@ -30,7 +30,7 @@ X, zones, X_bounds, Y_bounds, T, mus_vec = generate_data(X_bounds=(0, 2), Y_boun
     n_cols=2, n_rows=2, mus=[1.5, 3.0, 5.0, 0.5], rng_seed=42, shuffle=True)
 
 plot_poisson_zones_data(X=X, zones=zones, mus_vec=mus_vec, X_bounds=X_bounds, Y_bounds=Y_bounds,
-    savefigure=False, title_savefig='figure_données_simulées_4_zones.pdf'
+    savefigure=True, title_savefig='figure_données_simulées_4_zones.pdf'
 )
 
 
@@ -38,6 +38,26 @@ plot_poisson_zones_data(X=X, zones=zones, mus_vec=mus_vec, X_bounds=X_bounds, Y_
 
 
 # %%
+
+
+
+
+
+
+
+
+# %%
+
+
+
+
+
+
+
+
+# %%
+
+
 
 
 

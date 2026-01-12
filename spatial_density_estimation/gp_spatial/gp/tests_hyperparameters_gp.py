@@ -17,14 +17,21 @@ from visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 
 
-#%%
+# %%
+# ============================================================================================
+# ----------------------------------------- MAILLAGE -----------------------------------------
+# ============================================================================================
+mesher = ot.IntervalMesher([50, 50])
+mesh = mesher.build(ot.Interval([0.0, 0.0], [2.0, 2.0]))
+
+
+
+# %%
 # =========================================================================================================
 # ----------------------------------------- Tests hyperparameters -----------------------------------------
 # =========================================================================================================
 
-# ======================== Maillage & Transformation par sigmoïde ========================
-mesher = ot.IntervalMesher([50, 50])
-mesh = mesher.build(ot.Interval([0.0, 0.0], [2.0, 2.0]))
+# ======================== Transformation par sigmoïde ========================
 sigmoid = ot.SymbolicFunction(['z'], ['1/(1+exp(-z))'])
 field_function = ot.PythonFieldFunction(mesh, 1, mesh, 1, sigmoid)
 
@@ -208,4 +215,9 @@ plot_field(field_f, title='Realization GP with zonage trend')
 
 
 
+
 # %%
+
+
+
+
