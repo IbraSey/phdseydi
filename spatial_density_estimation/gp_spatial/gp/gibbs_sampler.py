@@ -14,6 +14,7 @@ import math
 from polyagamma import random_polyagamma
 from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
+import arviz as az
 from visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 
@@ -458,7 +459,7 @@ class SGCP_GibbsSampler:
         return {
             "mutilde_hat": float(mutilde_chain[burn:].mean()),
             "eps_hat": eps_chain[burn:].mean(axis=0),
-            "f_data_hat": f_chain[burn:].mean(axis=0),
+            "f_data_hat": f_chain[burn:].mean(axis=0)
         }
     
     def posterior_gp(self, XY_data, f_data_hat, mesh, eps_hat):
@@ -500,16 +501,7 @@ class SGCP_GibbsSampler:
         
         return mu_post, Sigma_post
 
-    def plot_posterior_intensity(
-        self,
-        x,
-        y,
-        t,
-        results,
-        nx=60,
-        ny=60,
-        burn_in=0.3
-    ):
+    def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3):
         """
         
         """
@@ -580,6 +572,118 @@ class SGCP_GibbsSampler:
             "mu_field": mu_field,
             "mesh": mesh,
         }
+
+    def plot_chains(self, results, figsize=(9, 5)):
+        """
+
+        """
+        mutilde_chain = np.asarray(results["mu_tilde"])
+        eps_chain = np.asarray(results["eps"])
+        n_iter = len(mutilde_chain)
+        iters = np.arange(n_iter)
+
+        # =====================
+        # 1) mu_tilde
+        # =====================
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+
+        ax[0].plot(iters, mutilde_chain[:], linewidth=1)
+        ax[0].set_title(r"Trace de $\tilde{\mu}$")
+        ax[0].set_xlabel("Itération")
+        ax[0].grid(alpha=0.3)
+
+        ax[1].hist(mutilde_chain[:], bins=30, density=True, edgecolor="black", alpha=0.7)
+        ax[1].set_title(r"Histogramme de $\tilde{\mu}$")
+        ax[1].grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        # =====================
+        # 2) epsilons
+        # =====================
+        J = eps_chain.shape[1]
+        fig, axes = plt.subplots(J, 2, figsize=(figsize[0], 3 * J), squeeze=False)
+
+        for j in range(J):
+            axes[j, 0].plot(iters, eps_chain[:, j], linewidth=1)
+            axes[j, 0].set_title(rf"Trace de $\epsilon_{j}$")
+            axes[j, 0].set_xlabel("Itération")
+            axes[j, 0].grid(alpha=0.3)
+
+            axes[j, 1].hist(
+                eps_chain[:, j],
+                bins=30,
+                density=True,
+                edgecolor="black",
+                alpha=0.7,
+            )
+            axes[j, 1].set_title(rf"Histogramme de $\epsilon_{j}$")
+            axes[j, 1].grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_acf(self, results, burn_in=0.3, max_lag=50, figsize=(8, 6)):
+        """
+        
+        """
+        mutilde_chain = np.asarray(results["mu_tilde"])
+        eps_chain = np.asarray(results["eps"])
+        n_iter = len(mutilde_chain)
+        burn = int(burn_in * n_iter)
+        lags = np.arange(max_lag + 1)
+
+        plots = []
+        plots.append((r"$\tilde{\mu}$", mutilde_chain[burn:]))
+        for j in range(eps_chain.shape[1]):
+            plots.append((rf"$\epsilon_{j}$", eps_chain[burn:, j]))
+
+        n_plots = len(plots)
+        fig, axes = plt.subplots(n_plots, 1, figsize=(figsize[0], 3.0 * n_plots))
+
+        for ax, (param, chain) in zip(axes, plots):
+            acf_vals = self._acf(chain, max_lag)
+
+            ax.plot(lags, acf_vals)
+            ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.set_xlim(0, max_lag)
+            ax.set_ylim(-1.0, 1.0)
+            ax.set_title(f"ACF de {param}")
+            ax.set_xlabel("Lag")
+            ax.grid(alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_ess_arviz(self, results, burn_in=0.3, kind="evolution", figsize=None):
+        """
+        
+        """
+        mutilde_chain = np.asarray(results["mu_tilde"])
+        eps_chain = np.asarray(results["eps"])
+        n_iter = len(mutilde_chain)
+        burn = int(float(burn_in) * n_iter)
+        mutilde_post = mutilde_chain[burn:]
+        eps_post = eps_chain[burn:, :]
+
+        posterior = { "mu_tilde": mutilde_post[None, :] }
+        for j in range(eps_post.shape[1]):
+            posterior[f"eps_{j}"] = eps_post[:, j][None, :]
+
+        idata = az.from_dict(posterior=posterior)
+        ess = az.ess(idata)
+        ess_dict = {
+            var: float(ess[var].values) for var in ess.data_vars
+        }
+
+        # Plot ESS
+        az.plot_ess(idata, kind=kind, figsize=figsize)
+        plt.suptitle( f"ESS | N = {mutilde_post.size}", fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+        return ess_dict
 
 
 
