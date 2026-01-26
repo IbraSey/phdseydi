@@ -37,7 +37,9 @@ class SGCP_GibbsSampler:
         nu,
         a_mu,
         b_mu,
-        jitter=1e-5,          # Paramètre sensible : trop grand peut biaiser, trop petit pas significatif
+        delta,                 # hyperparamètre qui module confiance au prior
+        polygons,              # attention ordre, identique à Areas
+        jitter=1e-5,           # Paramètre sensible : trop grand peut biaiser, trop petit pas significatif
         rng_seed=None,
     ):
         self.X_bounds = tuple(X_bounds)
@@ -47,46 +49,63 @@ class SGCP_GibbsSampler:
         self.nu = ot.Point(nu)
         self.a_mu = a_mu
         self.b_mu = b_mu
+        self.delta = ot.Point(delta)
         self.jitter = jitter
-
-        if rng_seed is not None:
-            ot.RandomGenerator.SetSeed(rng_seed)
-            self.rng_state = ot.RandomGenerator.GetState()
-
         self.areas = [a[0] for a in self.Areas]
         self.epsilons = [a[1] for a in self.Areas]
         self.J = len(self.areas)
+        self.polygons = polygons
+        if rng_seed is not None:
+            ot.RandomGenerator.SetSeed(int(rng_seed))
+            self.rng_state = ot.RandomGenerator.GetState()
+        
+        self.centroids_xy, self.Sigma_eps = self.compute_Sigma_eps()
+        Sigma_eps_reg = ot.CovarianceMatrix((self.Sigma_eps + self.jitter * np.eye(self.J)).tolist())
+        self.Sigma_eps_inv = Sigma_eps_reg.inverse()        # Calcul fait une fois, pas besoind d'être répété
 
+    # ==========================================================================
+    # ------------------------------- Outillage --------------------------------
+    # ==========================================================================
 
-    # ==================================
-    # ----------- Outillage ------------
-    # ==================================
     @staticmethod
     def sigma(z):
-        """
-        
-        """
         z_array = np.array(z)
         return ot.Point(1.0 / (1.0 + np.exp(-z_array)))
+    
+    #@staticmethod
+    def compute_Sigma_eps(self):
+        """
+
+        """
+        delta0, delta1 = map(float, self.delta)
+        centroids_xy = np.array([[p.centroid.x, p.centroid.y] for p in self.polygons])
+        dx = centroids_xy[:, 0].reshape(len(self.polygons),-1) - centroids_xy[:, 0]
+        dy = centroids_xy[:, 1].reshape(len(self.polygons),-1) - centroids_xy[:, 1]
+        dist2 = dx * dx + dy * dy
+
+        Sigma_eps = delta0 * np.exp(-dist2 / (2.0 * delta1 ** 2))
+        Sigma_eps = 0.5 * (Sigma_eps + Sigma_eps.T)       # Symétrisation
+
+        return centroids_xy, Sigma_eps
 
     def compute_kernel(self, XY_data, XY_new=None):
         """
         
         """
-        nu0, nu1, nu2 = map(float, self.nu)
+        nu0, nu1 = map(float, self.nu)
 
         if not isinstance(XY_data, ot.Sample):
-            XY_data = ot.Sample(np.asarray(XY_data, dtype=float).tolist())
+            XY_data = ot.Sample(np.asarray(XY_data).tolist())
         N_data = XY_data.getSize()
 
-        kernel = ot.SquaredExponential([nu1, nu2], [nu0])
+        kernel = ot.SquaredExponential([nu1, nu1], [nu0])
 
         if XY_new is None:
             K = kernel.discretize(XY_data)
-            return ot.CovarianceMatrix(np.array(K, dtype=float).tolist())
+            return ot.CovarianceMatrix(np.array(K).tolist())
 
         if not isinstance(XY_new, ot.Sample):
-            XY_new = ot.Sample(np.asarray(XY_new, dtype=float).tolist())
+            XY_new = ot.Sample(np.asarray(XY_new).tolist())
         N_new = XY_new.getSize()
 
         XY_all = ot.Sample(N_data + N_new, 2)
@@ -120,20 +139,22 @@ class SGCP_GibbsSampler:
         
         """
         if not isinstance(D_xy, ot.Sample):
-            D_xy_sample = ot.Sample(np.asarray(D_xy, dtype=float).tolist())
+            D_xy_sample = ot.Sample(np.asarray(D_xy).tolist())
         else:
             D_xy_sample = D_xy
-            
+
         n = D_xy_sample.getSize()
         U = ot.Sample(n, self.J)
-        
+
         for k in range(n):
             pt = D_xy_sample[k]
             pt_shapely = ShapelyPoint(pt[0], pt[1])
+
             for j, P in enumerate(self.areas):
                 if P.covers(pt_shapely):
                     U[k, j] = 1.0
-                    break 
+                    break
+
         return ot.Matrix(U)
 
     def sample_candidats(self, N):
@@ -142,66 +163,68 @@ class SGCP_GibbsSampler:
         """
         xmin, xmax = self.X_bounds
         ymin, ymax = self.Y_bounds
-        
+
         marginal_x = ot.Uniform(xmin, xmax)
         marginal_y = ot.Uniform(ymin, ymax)
         distribution = ot.ComposedDistribution([marginal_x, marginal_y])
-        
-        return distribution.getSample(int(N))
+        sample = distribution.getSample(int(N))
+
+        return sample
     
 
-    # =========================================
-    # ------ Posteriors conditionnelles -------
-    # =========================================
+    # =================================================================================
+    # -------------------------- Posteriors conditionnelles ---------------------------
+    # =================================================================================
+
     def update_mu_tilde(self, Z, Pi_S):
         """
         
         """
         xmin, xmax = self.X_bounds
         ymin, ymax = self.Y_bounds
-        
+
         N_0 = sum(1 for z in Z if z == 0.0)
         N_Pi = Pi_S.getSize()
-        a_post = self.a_mu + N_0 + N_Pi
-        b_post = self.b_mu + self.T * (xmax - xmin) * (ymax - ymin)
-        mu_tilde = ot.Gamma(a_post, b_post, 0.0).getRealization()[0]
-        
+
+        shape = self.a_mu + N_0 + N_Pi
+        rate = self.b_mu + self.T * (xmax - xmin) * (ymax - ymin)
+
+        mu_tilde = ot.Gamma(shape, rate, 0.0).getRealization()[0]
+
         return float(mu_tilde)
-    
+
     def update_epsilons(self, f_Df, K_ff, U):
         """
-        
+
         """
         n = K_ff.getDimension()
 
         K_cov_reg = ot.CovarianceMatrix(K_ff)
         for i in range(n):
-            K_cov_reg[i, i] += float(self.jitter)    # Régularisation
+            K_cov_reg[i, i] += self.jitter        # Régularisation
         K_inv = K_cov_reg.inverse()
 
         U_mat = ot.Matrix(U)
         U_T = U_mat.transpose()
 
-        A_mat = U_T * K_inv * U_mat + ot.IdentityMatrix(self.J)    # A = U^T K^{-1} U + I
-        A_array = np.array(A_mat)
-        A_array = 0.5 * (A_array + A_array.T)    # Symétrisation, passage par numpy peut être pas nécessaire
-        A_array += float(self.jitter) * np.eye(self.J)
-        A_cov = ot.CovarianceMatrix(A_array.tolist())
-        Sigma_sym = A_cov.inverse()
-        Sigma = ot.CovarianceMatrix(np.array(Sigma_sym).tolist())
-        
-        B = U_T * (K_inv * f_Df) 
-        mu = Sigma * B
-        
-        epsilons = ot.Normal(mu, Sigma).getRealization()
-        
-        return epsilons
+        A_mat = U_T * K_inv * U_mat + self.Sigma_eps_inv        # A = U^T K^{-1} U + Sigam_eps
+        A_np = np.array(A_mat)
+        A_np = 0.5 * (A_np + A_np.T)            # Symétrisation, passage par numpy peut être pas nécessaire
+        A_np += self.jitter * np.eye(self.J)
+        A_cov = ot.CovarianceMatrix(A_np.tolist())
+        Sigma_post_sym = A_cov.inverse()
+        Sigma_post = ot.CovarianceMatrix(np.array(Sigma_post_sym).tolist())
+
+        B = U_T * (K_inv * f_Df)
+        mu = Sigma_post * B
+
+        return ot.Normal(mu, Sigma_post).getRealization()
 
     def update_f(self, x, y, eps, Z, omega_D0, Pi_S):
         """
         
         """
-        idx = [i for i in range(len(Z)) if Z[i] == 0.0]    # Indices des points D_0
+        idx = [i for i in range(len(Z)) if Z[i] == 0.0]         # Indices des points D_0
         N_0 = len(idx)
 
         if N_0 == 0:
@@ -239,18 +262,18 @@ class SGCP_GibbsSampler:
             D_f[N_0 + i, 1] = PiS[i, 1]
 
         # 4) U et m_f = U * eps
-        U = self.compute_U_from_areas(D_f)     
-        eps_mat = ot.Matrix([[float(eps[j])] for j in range(self.J)])    
-        m_f_mat = U * eps_mat    
+        U = self.compute_U_from_areas(D_f)
+        eps_mat = ot.Matrix([[float(eps[j])] for j in range(self.J)])
+        m_f_mat = U * eps_mat
         m_f = ot.Point([float(m_f_mat[i, 0]) for i in range(N_f)])
 
         # 5) K_ff
         K_ff = self.compute_kernel(D_f)
         for i in range(N_f):
-            K_ff[i, i] += float(self.jitter)    # Régularisation
+            K_ff[i, i] += self.jitter
         K_inv = K_ff.inverse()
 
-        # 6) Omega 
+        # 6) Omega
         omega_diag = ot.Point(N_f)
         for i in range(N_0):
             omega_diag[i] = omega_D_0[i]
@@ -271,7 +294,7 @@ class SGCP_GibbsSampler:
         # 8) Sigma_f et mu_f
         A_mat = Omega + K_inv
         A_array = np.array(A_mat)
-        A_array = 0.5 * (A_array + A_array.T)    # Symétrisation, passage par numpy peut être pas nécessaire
+        A_array = 0.5 * (A_array + A_array.T)
         A_array += float(self.jitter) * np.eye(N_f)
         A = ot.CovarianceMatrix(A_array.tolist())
         Sigma_f_sym = A.inverse()
@@ -281,9 +304,9 @@ class SGCP_GibbsSampler:
         mu_f = Sigma_f * temp
 
         f_new = ot.Normal(mu_f, Sigma_f).getRealization()
-        
+
         return f_new, D_f, U, K_ff, m_f
-    
+
     def sample_Pi_S(self, mu_tilde, X_data, Y_data, f_data, eps):
         """
         
@@ -304,7 +327,7 @@ class SGCP_GibbsSampler:
         XY_cand = self.sample_candidats(N_cand)
         XY_data = ot.Sample([[X_data[i], Y_data[i]] for i in range(N)])
 
-        # 2) GP conditionnel avec calcul moyennes et calcul kernels (cf écriture Merlin) 
+        # 2) GP conditionnel avec calcul moyennes et calcul kernels (cf écriture Merlin)
         U_data_mat = self.compute_U_from_areas(XY_data)
         U_cand_mat = self.compute_U_from_areas(XY_cand)
         eps_col = ot.Matrix([[float(eps[j])] for j in range(self.J)])
@@ -316,7 +339,7 @@ class SGCP_GibbsSampler:
         K_dd, K_star_d, K_star_star = self.compute_kernel(XY_data, XY_cand)
         K_dd_reg = ot.CovarianceMatrix(K_dd)
         for i in range(N):
-            K_dd_reg[i, i] += float(self.jitter)    # Régularisation
+            K_dd_reg[i, i] += self.jitter             # Régularisation
         K_inv = K_dd_reg.inverse()
 
         delta = f_data - m_data
@@ -324,10 +347,10 @@ class SGCP_GibbsSampler:
 
         Sigma_star_mat = K_star_star - K_star_d * (K_inv * K_star_d.transpose())
         Sigma_array = np.array(Sigma_star_mat)
-        Sigma_array = 0.5 * (Sigma_array + Sigma_array.T)    # Symétrisation, passage par numpy peut être pas nécessaire
-        Sigma_array += float(self.jitter) * np.eye(N_cand)    # Régularisation
+        Sigma_array = 0.5 * (Sigma_array + Sigma_array.T)          # Symétrisation, passage par numpy peut être pas nécessaire
+        Sigma_array += self.jitter * np.eye(N_cand)          # Régularisation
         Sigma_star = ot.CovarianceMatrix(Sigma_array.tolist())
-        
+
         f_star = ot.Normal(mu_star, Sigma_star).getRealization()
 
         # 3) Phase de Thinning
@@ -355,82 +378,83 @@ class SGCP_GibbsSampler:
 
         return Pi_S
 
+    # =====================================================================================
+    # ----------------------------------- Run du Gibbs ------------------------------------
+    # =====================================================================================
 
-    # =========================================
-    # ------------- Run du Gibbs --------------
-    # =========================================
     def run(self, t, x, y, eps_init, mu_init, n_iter=1000, verbose=True, verbose_every=100):
-        """
-        
-        """
         N = len(t)
 
-        # Seulelent évènements de fond : ETAS = 0
+        # Seulement évènements de fond : ETAS = 0
         Z = ot.Point([0.0] * N)
-        
+
         # Initialisations
         eps = ot.Point(eps_init)
-        mu_tilde = float(mu_init)
+        mu_tilde = mu_init
         XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
         U_data = self.compute_U_from_areas(XY_data)
-        f_data = ot.Point(U_data * eps)      # f_data initialisé à m_f
-        
+        f_data = ot.Point(U_data * eps)
+
         # Stockage
         mu_chain = np.zeros(n_iter)
         eps_chain = np.zeros((n_iter, self.J))
-        nPi_chain = np.zeros(n_iter, dtype=int)
-        fdata_chain = np.zeros((n_iter, N)) 
-        
+        nPi_chain = np.zeros(n_iter)
+        fdata_chain = np.zeros((n_iter, N))
+
         if verbose:
-            print("="*100)
-            print("-"*30 + f" Démarrage Gibbs: {n_iter} itérations, N={N} " + "-"*30)
-            print("="*100 + "\n")
-        
+            print("\n" + "=" * 100)
+            print(
+                "-" * 29
+                + f" Démarrage Gibbs: {n_iter} itérations, N={N} "
+                + "-" * 29
+            )
+            print("=" * 100 + "\n")
+
         for it in range(n_iter):
             try:
                 # 1) omega_D0 | ...
                 omega_D0 = ot.Point(random_polyagamma(1.0, f_data))
-                
+
                 # 2) Pi_S | ...
                 Pi_S = self.sample_Pi_S(mu_tilde, x, y, f_data, eps)
 
                 # 3) f_Df | ...
-                f_Df, D_f_xy, U_Df, K_ff, m_f = self.update_f(x, y, eps, Z, omega_D0, Pi_S)
+                f_Df, D_f_xy, U_Df, K_ff, m_f = self.update_f(
+                    x, y, eps, Z, omega_D0, Pi_S
+                )
                 f_data = ot.Point([f_Df[i] for i in range(N)])
-                
+
                 # 4) eps | ...
                 eps = self.update_epsilons(f_Df, K_ff, U_Df)
 
                 # 5) mu_tilde | ...
                 mu_tilde = self.update_mu_tilde(Z, Pi_S)
-                
+
                 # Affichage
                 if verbose and (it % verbose_every == 0 or it == n_iter - 1):
                     eps_arr = np.array(eps)
                     n_pi = Pi_S.getSize()
-                    
                     print(
                         f"[Gibbs iteration {it}] "
-                        f"mu = {mu_tilde:4f} | "
+                        f"mu_tilde = {mu_tilde:.4f} | "
                         f"|Pi| = {n_pi} | "
                         f"eps = {eps_arr} "
                     )
-                
-                # Stockage
+
                 mu_chain[it] = mu_tilde
                 eps_chain[it, :] = np.array(eps)
                 nPi_chain[it] = Pi_S.getSize()
                 fdata_chain[it, :] = np.array(f_data)
-                    
+
             except Exception as e:
                 print(f"\nErreur iteration {it} : {e}")
                 raise
-        
+
         if verbose:
-            print("\n" + "="*100)
-            print("-"*41 + " Gibbs terminé !! " + "-"*41)
-            print("="*100)
-        
+            print("\n" + "=" * 100)
+            print("-" * 41 + " Gibbs terminé !! " + "-" * 41)
+            print("=" * 100 + "\n")
+
         return {
             "mu_tilde": mu_chain,
             "eps": eps_chain,
@@ -439,14 +463,17 @@ class SGCP_GibbsSampler:
             "last_state": {
                 "mu_tilde": mu_tilde,
                 "eps": np.array(eps),
-                "nu": list(self.nu)
+                "nu": list(self.nu),
+                "delta": self.delta,
             },
+            "Sigma_eps": self.Sigma_eps,
+            "centroids": self.centroids_xy,
         }
     
-
     # =====================================================================================
     # ---------------------------- Analyse postérieure ------------------------------------
     # =====================================================================================
+
     def posterior_summary(self, results, burn_in=0.3):
         """
         
@@ -457,7 +484,7 @@ class SGCP_GibbsSampler:
         burn = int(len(mutilde_chain) * burn_in)
 
         return {
-            "mutilde_hat": float(mutilde_chain[burn:].mean()),
+            "mutilde_hat": mutilde_chain[burn:].mean(),
             "eps_hat": eps_chain[burn:].mean(axis=0),
             "f_data_hat": f_chain[burn:].mean(axis=0)
         }
@@ -485,7 +512,7 @@ class SGCP_GibbsSampler:
         
         K_dd_reg = ot.CovarianceMatrix(K_dd)
         for i in range(N):
-            K_dd_reg[i, i] += float(self.jitter)    # Régularisation
+            K_dd_reg[i, i] += self.jitter    # Régularisation
         K_inv = K_dd_reg.inverse()
 
         # Moyenne postérieure : mu_post = m_grid + K_gd * K_dd^{-1} * (f_data - m_data)
@@ -494,9 +521,9 @@ class SGCP_GibbsSampler:
 
         # Covariance postérieure : Sigma_post = K_gg - K_gd * K_dd^{-1} * K_dg
         Sigma_post_mat = ot.Matrix(K_gg) - K_gd * (K_inv * K_gd.transpose())
-        Sigma_post_np = np.array(Sigma_post_mat, dtype=float)
+        Sigma_post_np = np.array(Sigma_post_mat)
         Sigma_post_np = 0.5 * (Sigma_post_np + Sigma_post_np.T)   # Symétrisation, passage par numpy peut être pas nécessaire
-        Sigma_post_np += float(self.jitter) * np.eye(M)     # Régularisation
+        Sigma_post_np += self.jitter * np.eye(M)     # Régularisation
         Sigma_post = ot.CovarianceMatrix(Sigma_post_np.tolist())
         
         return mu_post, Sigma_post
@@ -533,14 +560,7 @@ class SGCP_GibbsSampler:
         fig, axes = plt.subplots(1, 2, figsize=(13, 6))
         # Subplot 1 : Données
         ax = axes[0]
-        sc = ax.scatter(
-            x,
-            y,
-            c=t,
-            s=18,
-            alpha=0.7,
-            edgecolors="black",
-        )
+        sc = ax.scatter(x, y, c=t, s=12, alpha=0.7, edgecolors="black")
         ax.set_title("Données observées (couleur = temps)")
         ax.set_xlim(self.X_bounds)
         ax.set_ylim(self.Y_bounds)
@@ -656,14 +676,14 @@ class SGCP_GibbsSampler:
         plt.tight_layout()
         plt.show()
 
-    def plot_ess_arviz(self, results, burn_in=0.3, kind="evolution", figsize=None):
+    def plot_ess_arviz(self, results, burn_in=0.3, kind="local", figsize=None):
         """
         
         """
         mutilde_chain = np.asarray(results["mu_tilde"])
         eps_chain = np.asarray(results["eps"])
         n_iter = len(mutilde_chain)
-        burn = int(float(burn_in) * n_iter)
+        burn = int(burn_in * n_iter)
         mutilde_post = mutilde_chain[burn:]
         eps_post = eps_chain[burn:, :]
 
@@ -674,7 +694,7 @@ class SGCP_GibbsSampler:
         idata = az.from_dict(posterior=posterior)
         ess = az.ess(idata)
         ess_dict = {
-            var: float(ess[var].values) for var in ess.data_vars
+            var: ess[var].values for var in ess.data_vars
         }
 
         # Plot ESS
@@ -684,6 +704,52 @@ class SGCP_GibbsSampler:
         plt.show()
 
         return ess_dict
+
+    def plot_rhat_arviz(self, results_list, burn_in=0.3, figsize=(12, 4), rhat_bad=1.05):
+        """
+
+        """
+
+        M = len(results_list)
+        res = results_list[0]
+        L = len(res["mu_tilde"])
+        burn = int(burn_in * L)
+        draws = L - burn
+        mu_arr = np.zeros((M, draws))
+        eps_arr = np.zeros((M, draws, self.J))
+        for m, res in enumerate(results_list):
+            mu = np.asarray(res["mu_tilde"])
+            eps = np.asarray(res["eps"])
+            mu_arr[m, :] = mu[burn:]
+            eps_arr[m, :, :] = eps[burn:, :]
+
+        idata = az.from_dict(
+            posterior={"mu_tilde": mu_arr, "eps": eps_arr},
+            coords={"eps_dim": np.arange(self.J)},
+            dims={"eps": ["eps_dim"]}
+        )
+
+        r_hat = az.rhat(idata)
+        rhat_mu = r_hat["mu_tilde"].values
+        rhat_eps = np.asarray(r_hat["eps"].values) 
+
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+        ax.scatter([0], [rhat_mu], s=50, label=r"$\tilde{\mu}$")
+        ax.scatter(np.arange(1, self.J + 1), rhat_eps, s=50, label=r"$\epsilon_j$")
+        ax.axhline(1.0, linestyle="--", color="green", linewidth=1.0)
+        ax.axhline(rhat_bad, linestyle="--", color="red", linewidth=1.0)
+        ax.set_xticks(np.arange(0, self.J + 1))
+        ax.set_xticklabels([r"$\tilde{\mu}$"] + [rf"$\epsilon_{j}$" for j in range(self.J)])
+        ax.set_ylabel(r"$\widehat{R}$")
+        ax.set_title(rf"Gelman–Rubin $\widehat R$ sur {M} chains")
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+        return {"mu_tilde": rhat_mu, "eps": rhat_eps}
 
 
 
