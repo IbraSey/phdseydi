@@ -72,6 +72,25 @@ class SGCP_GibbsSampler:
         z_array = np.array(z)
         return ot.Point(1.0 / (1.0 + np.exp(-z_array)))
     
+    @staticmethod
+    def _acf(x, max_lag):
+        """
+        
+        """
+        x = np.asarray(x)
+        x = x - x.mean()
+        n = len(x)
+
+        var = np.dot(x, x) / n
+        if var == 0.0:
+            return np.zeros(max_lag + 1)
+
+        acf_vals = np.empty(max_lag + 1)
+        for k in range(max_lag + 1):
+            acf_vals[k] = np.dot(x[: n - k], x[k:]) / (n * var)
+
+        return acf_vals
+    
     #@staticmethod
     def compute_Sigma_eps(self):
         """
@@ -548,7 +567,7 @@ class SGCP_GibbsSampler:
 
         M = mesh.getVertices().getSize()
         if M > 10000:            # Critère pour éviter maillage trop grand (question de compléxité)
-            raise ValueError(f"Maillage trop grand: {M} points.")
+            raise ValueError(f"Mailage trop grand: {M} points.")
 
         mu_post_grid, Sigma_post_grid = self.posterior_gp(XY_data, f_data_hat, mesh, eps_hat)
         f_hat = mu_post_grid        # Estimateur de la moyenne a posteriori
