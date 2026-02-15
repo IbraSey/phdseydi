@@ -126,7 +126,7 @@ class NormalCholesky(ot.PythonRandomVector):
         return output
 
 
-def py_link_function_f(x, Nmax, D, m, covarianceModel):
+def py_link_function_f(x, Nmax, D, U, covarianceModel):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -136,16 +136,18 @@ def py_link_function_f(x, Nmax, D, m, covarianceModel):
     ----------
     x : array / list
         Current MCMC chain state
-        Size : 4*Nmax - 2*N + 1
+        Size : 4*Nmax - 2*N + 1 + J
     Nmax : int
         Max of Ntot (augmented Poisson process size)
     D : (N,2)
         Observed Poisson process
-    m : Open TURNS function
-        GP trend
+    U : Open TURNS function
+        zone indicator functions
+        given a point (x,y), outputs J 0-1 indicators,
+        summing to 1
     covarianceModel : Open TURNS covariance model
         GP cov model
-
+    
     Returns
     -------
     param : list
@@ -153,10 +155,13 @@ def py_link_function_f(x, Nmax, D, m, covarianceModel):
         in the order required by NormalCholesky class
         Size : Nmax*(Nmax+1)+1
     """
-    Ntot = int(x[-1])
+    # Extract cuurent state of conditioning variables
     N=len(D)
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
-    # PiMax = np.vstack([ Pi, np.zeros((Nmax-Ntot,2)) ])
+    Omega = np.array(x)[Nmax:Nmax+Ntot]    
+    Ntot = int(x[-J-1])
+    Eps = np.array(x)[-J:].reshape(-1,1)
+    # total (augmented) data
     Dtot = ot.Sample(Ntot, 2)
     Dtot[:N] = D
     Dtot[N:] = Pi
@@ -167,18 +172,21 @@ def py_link_function_f(x, Nmax, D, m, covarianceModel):
     L = K.computeCholesky()
     Linv = L.inverse()
     Kinv = Linv.transpose()*Linv
-    # compute unscaled mean
-    mean = ot.Sample(m(Dtot))
-    mean = Kinv * mean
-    mean = mean + u
-    # add omega to precision matrix diagonal
-    Diag = np.array(Kinv.getDiagonal())[:,0] + np.array(x)[Nmax:Nmax+Ntot]
+    # add Omega to precision matrix diagonal
+    Diag = np.array(Kinv.getDiagonal())[:,0] + Omega
     Diag = Diag.tolist()
     Kinv.setDiagonal( Diag )
     # invert 
     L = ot.CovarianceMatrix(Kinv).computeCholesky()
     Linv = L.inverse()
     V = Linv.transpose()*Linv
+    # prior to posterior total mean 
+    m_Dtot = np.linalg.dot( np.array(U(Dtot)), Eps )
+    # mean = np.linalg.dot( Kinv * mean ) + u
+    # mean = np.linalg.dot( V, mean )
+    mean = ot.Sample(m_Dtot)
+    mean = Kinv * mean
+    mean = mean + u
     mean = V*mean
     # extract parameters in correct order (coherent with getParameter() method of RV_f)
     parameter = [0]*( Nmax*(Nmax+1)+1 )
@@ -198,7 +206,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
     Given current states of GP values at observed and latent points Pi (and the latter)
     Generates an updated set of latent points and associated GP Values
     """
-    def __init__( self, ftot, Pi, Ntot, D, m, covarianceModel, Poisson, myUniform):
+    def __init__( self, ftot, Pi, Ntot, Eps, D, U, covarianceModel, Poisson, myUniform):
         """
         Parameters
         ----------
@@ -211,10 +219,14 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Ntot: int
             current total size of observed and latent process
             Ntot=N+NPi
+        Eps : (J,1)
+            current value of zones regressors
         D : (N,2)
             Observed Poisson process
-        m : Open TURNS function
-            GP trend
+        U : Open TURNS function
+            zone indicator functions
+            given a point (x,y), outputs J 0-1 indicators,
+            summing to 1
         covarianceModel : Open TURNS covariance model
             GP cov model
         Poisson : Open TURNS distribution
@@ -245,9 +257,10 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.ftot = np.array(ftot).reshape(-1,1)
         self.Pi = np.array(Pi).reshape(-1,2)
         self.Ntot = int(Ntot)
+        self.Eps = Eps
         self.Nmax = Nmax
         self.D = D
-        self.m = m
+        self.U = U
         self.covarianceModel = covarianceModel
         self.Poisson = Poisson
         self.myUniform = myUniform
@@ -262,8 +275,9 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
                 - ftot (Nmax,)
                 - Pi (Nmax-N,2)
                 - Ntot (1,)
+                - Eps (J,)
             in this order
-            Size: 3*Nmax-2*N+1
+            Size: 3*Nmax-2*N+J+1
 
         Returns
         -------
@@ -273,14 +287,16 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Nmax=int(self.Nmax)
         self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
         self.Pi = np.array(parameter[Nmax:-1]).reshape(-1,2)
-        self.Ntot = int(parameter[-1])
+        self.Ntot = int(parameter[-J-1])
+        self.Eps = np.array(parameter[-J:]).reshape(-1,1)
     
     def getParameter(self):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+1)
-        parameter[-1] = Ntot
+        parameter = np.zeros(3*Nmax-2*N+J+1)
+        parameter[-J-1] = Ntot
+        parameter[-J:] = Eps
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
         return parameter.tolist()
@@ -300,6 +316,8 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         N = Nmax-len(self.Pi)
         inputSample = np.vstack((self.D, self.Pi[:Ntot-N]))
         outputSample = self.ftot[:Ntot]
+        # remove zones effect
+        outputSample -= np.linalg.dot( np.array(self.U(inputSample)), self.Eps )    
         # Step 1: Fit GP regression model to Sample
         fitter = otexp.GaussianProcessFitter(inputSample, outputSample, self.covarianceModel, ot.Basis(0))
         fitter.setOptimizeParameters(False)
@@ -355,6 +373,8 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         f_new[:NPi_new] = f_star[accept]
         Pi_new = np.zeros((Nmax - N, 2))
         Pi_new[:NPi_new] = XY_star[accept.ravel()]
+        # add zones effect
+        f_new = np.linalg.dot( np.array(self.U(Pi_new[:NPi_new])), self.Eps )
         return np.concatenate([f_new.ravel(), Pi_new.ravel(), [Ntot_new]])
         
     def SimulateSigmaGP( self, XY_new ):
@@ -406,13 +426,13 @@ def py_link_function_Pi(x, Nmax, N):
         Mean + Cholesky precision matrix
         in the order required by 
         the PoissonGaussianProcess class
-        Size : 3*Nmax-2*N+1)
+        Size : 3*Nmax-2*N+J+1)
     """
-    Ntot = int(x[-1])
     ftot = np.array(x)[:Nmax]
-    NPi = Ntot - N
-    Pi = np.array(x)[2*Nmax:-1].reshape(-1,2)
-    return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot]])
+    Pi = np.array(x)[2*Nmax:-J-1].reshape(-1,2)
+    Ntot = int(x[-J-1])
+    Eps = np.array(x)[-J:].reshape(-1,1)
+    return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot], Eps])
    
 
 
@@ -487,8 +507,70 @@ def py_link_function_w(x, Nmax):
         the PolyaGammaProcess class
         Size : Nmax+1
     """
-    return np.hstack(( np.array(x)[:Nmax], [x[-1]] ))
+    return np.hstack(( np.array(x)[:Nmax], [x[-J-1]] ))
 
+###############################
+# Latent zones effects update # 
+###############################
+
+def py_link_function_Eps(x, Nmax, D, U, PrecEps):
+    """
+    Given the current state of the MCMC chain,
+    output parameters of the conditional density of
+    Eps, as required by the NormalCholesky class
+
+    Parameters
+    ----------
+    x : array / list
+        Current MCMC chain state
+        Size : 4*Nmax - 2*N + 1 + J
+    Nmax : int
+        Max of Ntot (augmented Poisson process size)
+    D : (N,2)
+        Observed Poisson process
+    U : Open TURNS function
+        zone indicator functions
+        given a point (x,y), outputs J 0-1 indicators,
+        summing to 1
+    PrecEps : (J,J) 
+        Eps prior precision matrix
+    
+    Returns
+    -------
+    param : list
+        Mean + Cholesky precision matrix + Ntot value
+        in the order required by NormalCholesky class
+        Size : Nmax*(Nmax+1)+1
+    """
+    # Extract cuurent state of conditioning variables
+    N=len(D)
+    ftot = np.array(x)[:Nmax]
+    Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
+    Ntot = int(x[-J-1])
+    # total (augmented) data
+    Dtot = ot.Sample(Ntot, 2)
+    Dtot[:N] = D
+    Dtot[N:] = Pi
+    # precision matrix
+    K = covarianceModel.computeCrossCovariance(Dtot,Dtot)
+    K = ot.CovarianceMatrix(K)
+    L = K.computeCholesky()
+    Linv = L.inverse()
+    Kinv = Linv.transpose()*Linv   
+    Utot = np.array(U(Dtot))
+    Q = np.linalg.dot( Utot.T, Kinv)
+    Q = np.linalg.dot( Q, Utot ) + PrecEps
+    # invert 
+    L = ot.CovarianceMatrix(Q).computeCholesky()
+    Linv = L.inverse()
+    V = Linv.transpose()*Linv
+    mean = V * ftot
+    # extract parameters in correct order (coherent with getParameter() method of RV_f)
+    parameter = [0]*( J*(J+1)+1 )
+    parameter[:J] = np.array(mean).ravel()
+    parameter[J:-1] = np.array(Linv).ravel()
+    parameter[:-1] = J
+    return parameter
 
 
 if __name__ == "__main__":
