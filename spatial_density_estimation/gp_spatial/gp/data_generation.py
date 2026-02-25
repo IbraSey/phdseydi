@@ -24,22 +24,26 @@ ot.RandomGenerator.SetSeed(42)
 # =================================================================================================
 # ------------------------------------- GÉNÉRATION DE DONNÉES -------------------------------------
 # =================================================================================================
+def sigma(z):
+    z_array = np.array(z)
+    return ot.Point(1.0 / (1.0 + np.exp(-z_array)))
 
-def generate_data(
+def generate_data_bis(
     X_bounds=(0.0, 2.0),
     Y_bounds=(0.0, 2.0),
     T=10.0,
     n_cols=3,
     n_rows=1,
     mus=6.0,
-    rng_seed=0,
-    shuffle=True,
+    f=None,             # Liste de fonctions (une par zone) ou une seule fonction (même schéma qu'avec mus)
+    rng_seed=0
 ):
     """
-    
+
     """
     if rng_seed is not None:
         ot.RandomGenerator.SetSeed(rng_seed)
+        np.random.seed(rng_seed) 
     
     xmin, xmax = X_bounds
     ymin, ymax = Y_bounds
@@ -47,14 +51,19 @@ def generate_data(
     dy = (ymax - ymin) / n_rows
     J = n_rows * n_cols
     
-    if np.isscalar(mus):
-        mus_vec = ot.Point([float(mus)] * J)
+    if np.isscalar(mus) :
+        mus_vec = ot.Point([mus] * J)
     else:
-        mus_vec = ot.Point(mus) if not isinstance(mus, ot.Point) else mus
-    
-    if len(mus_vec) != J:
+        mus_vec = ot.Point(mus) 
+
+    if len(mus_vec) != J :
         raise ValueError(f"mus doit avoir {J} éléments, pour l'instant mus a {len(mus_vec)} éléments")
-    
+
+    if not isinstance(f, list):
+        funcs = [f] * J       # La même fonction pour tout le monde
+    else:
+        funcs = f
+
     zones = []
     for r in range(n_rows):
         y0 = ymin + r * dy
@@ -65,35 +74,47 @@ def generate_data(
             zones.append(box(x0, y0, x1, y1))
     
     all_samples = []
-    for zone, mu in zip(zones, mus_vec):
-        bounds = zone.bounds       # (min_x, min_y, max_x, max_y)
-        mean = mu * T * zone.area
-        n = int(ot.Poisson(mean).getRealization()[0])
+    for i, (zone, mu) in enumerate(zip(zones, mus_vec)) :
+        bounds = zone.bounds     # (min_x, min_y, max_x, max_y)
+        mean_candidates = mu * T * zone.area
+        n_candidates = int(ot.Poisson(mean_candidates).getRealization()[0])
+        func = funcs[i]
         
-        dist = ot.ComposedDistribution([
-            ot.Uniform(bounds[0], bounds[2]), 
-            ot.Uniform(bounds[1], bounds[3]), 
-            ot.Uniform(0, T)
-        ])
-        all_samples.append(dist.getSample(n))
-    
+        if n_candidates > 0:        # Attention, il peuyt y avoir des zones sans candidats 
+            cand_x = np.random.uniform(bounds[0], bounds[2], n_candidates)
+            cand_y = np.random.uniform(bounds[1], bounds[3], n_candidates)
+            cand_t = np.random.uniform(0, T, n_candidates)
+            
+            #intensities = sigma(func(cand_x, cand_y))
+            intensities = func(cand_x, cand_y)
+            probs = intensities / mu
+            u_decision = np.random.uniform(0, 1, n_candidates)
+            mask_accepted = u_decision < probs
+            
+            if np.any(mask_accepted):       # Attention, il peuyt y avoir des zones sans points 
+                accepted_points = np.column_stack((
+                    cand_x[mask_accepted], 
+                    cand_y[mask_accepted], 
+                    cand_t[mask_accepted]
+                ))
+                all_samples.append(accepted_points)
+
     if not all_samples:
         X = ot.Sample(0, 3)
     else:
-        X_array = np.vstack([np.array(s) for s in all_samples])
-        if shuffle:
-            np.random.shuffle(X_array)
+        X_array = np.vstack(all_samples)
+        #np.random.shuffle(X_array)
         X = ot.Sample(X_array.tolist())
     
     print("="*35)
     print("-"*5 + " JEU DE DONNÉES SIMULÉES " + "-"*5)
-    print(f"\nNombre d'événements : {X.getSize()}")
-    print(f"Nombre de zones régulières : {len(zones)}")
-    print(f"Intensités : {mus_vec}")
-    #print(f"Premiers événements :\n{X[:5]}")
+    print(f"\nNombre d'événements retenus : {X.getSize()}")
+    print(f"Nombre de zones : {len(zones)}")
+    print(f"Bornes d'intensité : {mus_vec}")
+    print(f"Premiers événements :\n{X[:5]}")
     print("="*35)
     
-    return X, zones, X_bounds, Y_bounds, T, mus_vec
+    return X, zones, X_bounds, Y_bounds, T
 
 
 # %%

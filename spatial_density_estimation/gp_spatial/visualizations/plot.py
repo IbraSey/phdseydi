@@ -201,7 +201,59 @@ def plot_poisson_zones_data(X, zones, mus_vec, X_bounds, Y_bounds,
 
 
 # %%
+def plot_poisson_zones_data_bis(X, zones, X_bounds, Y_bounds, 
+                             title="Réalisations du processus spatial", 
+                             show_time_hist=False):
+    """
 
+    """
+    X_array = np.asarray(X, dtype=float)
+    N = X_array.shape[0] if X_array.size > 0 else 0
+    
+    fig, ax =  plt.subplots(figsize=(10, 6), sharex=True, sharey=True)
+    
+    for zone in zones:
+        xmin, ymin, xmax, ymax = zone.bounds
+        rect = Rectangle( (xmin, ymin), xmax - xmin, ymax - ymin, fill=False,   # fill=False pour ne pas mettre de couleur
+            edgecolor="black", linewidth=0.8, linestyle="--", alpha=0.5)       
+        ax.add_patch(rect)
+
+    if N > 0:
+        ax.scatter(
+            X_array[:, 0], 
+            X_array[:, 1],
+            s=15, 
+            c="red", 
+            marker='o', 
+            alpha=0.6, 
+            label="Événements"
+        )
+
+    # ----------------
+    # Mise en forme
+    # ----------------
+    ax.set_xlim(X_bounds)
+    ax.set_ylim(Y_bounds)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_aspect("equal")
+    ax.set_title(f"{title} (Nombre d'événements : {N})")
+    ax.legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.show()
+
+    # ============================
+    # Histogramme temporel
+    # ============================
+    if show_time_hist and N > 0:
+        fig2, ax2 = plt.subplots(figsize=(10, 3))
+        ax2.hist(X_array[:, 2], bins=30, color='gray', edgecolor='black', alpha=0.7)
+        ax2.set_xlabel("Temps (t)")
+        ax2.set_ylabel("Nombre d'événements")
+        ax2.set_title("Distribution temporelle")
+        plt.tight_layout()
+        plt.show()
 
 
 
