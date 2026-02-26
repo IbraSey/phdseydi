@@ -263,6 +263,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.covarianceModel = covarianceModel
         self.Poisson = Poisson
         self.myUniform = myUniform
+        self.J = len(Eps)
     
     def setParameter(self, parameter):
         """
@@ -285,19 +286,19 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         """
         Nmax=int(self.Nmax)
         self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
-        self.Pi = np.array(parameter[Nmax:-J-1]).reshape(-1,2)
-        self.Ntot = int(parameter[-J-1])
-        self.Eps = np.array(parameter[-J:]).reshape(-1,1)
+        self.Pi = np.array(parameter[Nmax:-self.J-1]).reshape(-1,2)
+        self.Ntot = int(parameter[-self.J-1])
+        self.Eps = np.array(parameter[-self.J:]).reshape(-1,1)
     
     def getParameter(self):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+J+1)
+        parameter = np.zeros(3*Nmax-2*N+self.J+1)
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
-        parameter[-J-1] = Ntot
-        parameter[-J:] = self.Eps.ravel()
+        parameter[-self.J-1] = Ntot
+        parameter[-self.J:] = self.Eps.ravel()
         return parameter.tolist()
     
     def getGaussianProcessRegression(self):
@@ -405,7 +406,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             
 
 
-def py_link_function_Pi(x, Nmax, N):
+def py_link_function_Pi( x, Nmax, N ):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -548,6 +549,7 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
         Size : Nmax*(Nmax+1)+1
     """
     # Extract cuurent state of conditioning variables
+    J = PrecEps.getDimension()
     N=len(D)
     Ntot = int(x[-J-1])
     ftot = ot.Matrix(np.array(x)[:Ntot].reshape(-1,1))
@@ -599,7 +601,7 @@ if __name__ == "__main__":
     U_OT = ot.PythonFunction( 2, 2, U )
     Sigma_eps = ot.CovarianceMatrix( np.eye(2)*1E-2 ) 
     PrecEps = Sigma_eps.inverse()
-    J = 2
+    J = PrecEps.getDimension()
     
     # Add piecewise constant trend
     EpsTrue = np.array( ot.Normal( ot.Point(J), Sigma_eps ).getRealization() ).reshape(-1,1)
@@ -622,7 +624,7 @@ if __name__ == "__main__":
     Nmax = int(Poisson.computeQuantile(1-1e-20)[0])*2
     
     # Zoning covariables : two zones with a four-sided intersection point
-    J = 2 # number of zones
+    J = len(EpsTrue) # number of zones
 
 
     ###################
@@ -723,7 +725,7 @@ if __name__ == "__main__":
     RV_Eps.getRealization()
     RV_Eps.getParameter()
     
-    # Plot Real GP trajectory on meshgrid over search domain
+    # PLOT Real GP trajectory on meshgrid over search domain
     gridsize = 20
     xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
     XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
@@ -770,6 +772,12 @@ if __name__ == "__main__":
         w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], w_indices, ot_link_function_w )
         Eps_sampler = ot.RandomVectorMetropolisHastings( RV_Eps, randinits[i], Eps_indices, ot_link_function_Eps )
         Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, Eps_sampler])
+        # test samplers 
+        f_sampler.getSample(blockSize)
+        Pi_sampler.getSample(blockSize)
+        w_sampler.getSample(blockSize)
+        Eps_sampler.getSample(blockSize)
+        Gibbs_sampler.getSample(blockSize)
         t1=time.time()
         sample = np.zeros((0,4*Nmax-2*N+J+1))
         # Main loop
@@ -861,6 +869,7 @@ if __name__ == "__main__":
         
         plt.xlabel("Iterations")
         plt.ylabel(r"$\widehat R$")
+
     plt.tight_layout()
     plt.savefig("Gelman_Rubin.png")
     plt.close()
