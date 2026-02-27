@@ -27,6 +27,8 @@ np.random.seed(0) # Make results reproducible by freezing Numpy's random generat
 
 sigmoid = ot.SymbolicFunction(['z'], ['1/(1+exp(-z))'])
 
+sigmoid_inv = ot.SymbolicFunction(['q'], ['ln( q/(1-q) )'])
+
 
 ##################################
 # Latent Gaussian process update # 
@@ -157,6 +159,7 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     """
     # Extract cuurent state of conditioning variables
     N=len(D)
+    J = U.getOutputDimension()
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
@@ -194,11 +197,9 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     return parameter
 
 
-
 #################################################
 # Latent Poisson... and Gaussian process update # 
 #################################################
-
 
 class PoissonGaussianProcess(ot.PythonRandomVector):
     """
@@ -263,6 +264,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.covarianceModel = covarianceModel
         self.Poisson = Poisson
         self.myUniform = myUniform
+        self.J = len(Eps)
     
     def setParameter(self, parameter):
         """
@@ -285,19 +287,19 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         """
         Nmax=int(self.Nmax)
         self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
-        self.Pi = np.array(parameter[Nmax:-J-1]).reshape(-1,2)
-        self.Ntot = int(parameter[-J-1])
-        self.Eps = np.array(parameter[-J:]).reshape(-1,1)
+        self.Pi = np.array(parameter[Nmax:-self.J-1]).reshape(-1,2)
+        self.Ntot = int(parameter[-self.J-1])
+        self.Eps = np.array(parameter[-self.J:]).reshape(-1,1)
     
     def getParameter(self):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+J+1)
+        parameter = np.zeros(3*Nmax-2*N+self.J+1)
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
-        parameter[-J-1] = Ntot
-        parameter[-J:] = self.Eps.ravel()
+        parameter[-self.J-1] = Ntot
+        parameter[-self.J:] = self.Eps.ravel()
         return parameter.tolist()
     
     def getGaussianProcessRegression(self):
@@ -314,7 +316,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
         inputSample = np.vstack((self.D, self.Pi[:Ntot-N]))
-        outputSample = self.ftot[:Ntot]
+        outputSample = self.ftot[:Ntot].copy()
         # remove zones effect
         zone_effect = np.dot( np.array(self.U(inputSample)), self.Eps )    
         outputSample -= zone_effect
@@ -405,7 +407,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             
 
 
-def py_link_function_Pi(x, Nmax, N):
+def py_link_function_Pi( x, Nmax, N, J ):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -420,8 +422,8 @@ def py_link_function_Pi(x, Nmax, N):
         Size : 4*Nmax-2*N+1
     Nmax : int
         Max of Ntot (augmented Poisson process size)
-    N : int
-        Sample size
+    J : int
+        number of zones
 
     Returns
     -------
@@ -437,9 +439,6 @@ def py_link_function_Pi(x, Nmax, N):
     Eps = np.array(x)[-J:].reshape(-1,1)
     return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot], Eps.ravel()])
    
-
-
-
 #############################
 # Latent Polya-Gamma update # 
 #############################
@@ -489,8 +488,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         return w
 
 
-
-def py_link_function_w(x, Nmax):
+def py_link_function_w(x, Nmax, J):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional Polya
@@ -502,6 +500,7 @@ def py_link_function_w(x, Nmax):
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax-2*N+1
+    
 
     Returns
     -------
@@ -513,12 +512,11 @@ def py_link_function_w(x, Nmax):
     """
     return np.hstack(( np.array(x)[:Nmax], [x[-J-1]] ))
 
-
 ###############################
 # Latent zones effects update # 
 ###############################
 
-def py_link_function_Eps(x, Nmax, D, U, PrecEps):
+def py_link_function_Eps(x, Nmax, D, U, PrecEps, covarianceModel):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -539,6 +537,8 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
         summing to 1
     PrecEps : (J,J) 
         Eps prior precision matrix
+    covarianceModel : OpenTURNS covariance model
+        covariance kernel for the latent GP
     
     Returns
     -------
@@ -548,6 +548,7 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
         Size : Nmax*(Nmax+1)+1
     """
     # Extract cuurent state of conditioning variables
+    J = PrecEps.getDimension()
     N=len(D)
     Ntot = int(x[-J-1])
     ftot = ot.Matrix(np.array(x)[:Ntot].reshape(-1,1))
@@ -562,7 +563,7 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
     L = K.computeCholesky()
     Linv = L.inverse()
     # Kinv = Linv.transpose()*Linv   
-    Utot = U_OT(Dtot)    
+    Utot = U(Dtot)    
     LU = ot.Matrix( Linv * Utot ) 
     Q = LU.transpose() * LU + PrecEps
     # invert 
@@ -579,7 +580,6 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
 
 if __name__ == "__main__":
     
-
     ####################
     # Generative model #
     ####################
@@ -597,12 +597,12 @@ if __name__ == "__main__":
         return u
 
     U_OT = ot.PythonFunction( 2, 2, U )
-    Sigma_eps = ot.CovarianceMatrix( np.eye(2)*1E-2 ) 
+    Sigma_eps = ot.CovarianceMatrix( np.eye(2)*1E-1 ) 
     PrecEps = Sigma_eps.inverse()
-    J = 2
+    J = PrecEps.getDimension()
     
     # Add piecewise constant trend
-    EpsTrue = np.array( ot.Normal( ot.Point(J), Sigma_eps ).getRealization() ).reshape(-1,1)
+    EpsTrue = np.array( ot.Normal( ot.Point(J), Sigma_eps ).getRealization() ).reshape(-1,1)*100
     # Utot = np.array( U_OT( XY_star ) )
     # mTot = np.dot( Utot, EpsTrue )
 
@@ -621,8 +621,13 @@ if __name__ == "__main__":
     # Upper bound on size of augmented Poisson process
     Nmax = int(Poisson.computeQuantile(1-1e-20)[0])*2
     
+    # where to save results (figures)
+    savedir = os.path.join( os.environ['HOME'], "sigma_gp_results")
+    if not os.path.exists(savedir): os.mkdir( savedir )
+
+    
     # Zoning covariables : two zones with a four-sided intersection point
-    J = 2 # number of zones
+    J = len(EpsTrue) # number of zones
 
 
     ###################
@@ -639,15 +644,14 @@ if __name__ == "__main__":
     mTrend = ot.TrendTransform(m, mesh)
     Ftot = ot.GaussianProcess(mTrend, covarianceModel, mesh)
     
-    # Sigma GP process
+    # # Sigma GP process
     field_function = ot.PythonFieldFunction(mesh, 1, mesh, 1, sigmoid)
     process = ot.CompositeProcess(field_function, Ftot) 
-    
     field_f = process.getRealization()
      
     # Use thinning
-    p_accept = np.array( field_f.getValues() )
-    accepted = np.array( ot.Uniform(0, 1).getSample(N_star) ) <= p_accept 
+    p_accept = np.array( field_f.getValues() ).ravel()
+    accepted = np.array( ot.Uniform(0, 1).getSample(N_star) ).ravel() <= p_accept 
     accepted = accepted.ravel()
     N = accepted.sum()
     Ntot = len(accepted)
@@ -662,9 +666,10 @@ if __name__ == "__main__":
     
     # Assemble Augmented (Obs + Latent) Gaussian process
     # /!\ Zero-padded to reach Nmax length
-    fD = np.array(field_f)[accepted]
-    fPi = np.array(field_f)[accepted==False]
+    fD = np.array(sigmoid_inv(field_f))[accepted]
+    fPi = np.array(sigmoid_inv(field_f))[accepted==False]
     ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
+    
     
     #######################
     # TEST ON TOY DATASET #
@@ -672,10 +677,9 @@ if __name__ == "__main__":
 
     # Plot the data
     fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1], c=p_accept[accepted] *lambdaBar*T )
-    plt.colorbar()
+    plt.scatter( D[:,0], D[:,1], c="r", marker="+", s=100 )
     # plt.show()
-    plt.savefig("Data.png")
+    plt.savefig(os.path.join(savedir, "Data.png"))
     plt.close()
     
     ###################
@@ -684,31 +688,43 @@ if __name__ == "__main__":
     
     sampleSize=100#0
     blockSize=10#0 # Display convergence messages after every block of iterations with size: blockSize
-    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
-    
+    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic    
 
     f_indices = [i for i in range(Nmax)]
     # Augmented Gaussian Process update
     RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
     ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, U=U_OT, covarianceModel=covarianceModel))
 
-    
     # Latent Poisson and Gaussian Process update
     Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
     PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Eps=EpsTrue, D=D, U=U_OT, covarianceModel=covarianceModel, Poisson=Poisson, myUniform=myUniform )
     RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N))
-
+    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N, J=J))
     
     # Latent Polya Gamma Process update
     w_indices = [i for i in range(Nmax,2*Nmax)]
     RV_w = ot.RandomVector(PolyaGammaProcess(ftot=np.concatenate([np.array(field_f).ravel(), np.zeros(Nmax-Ntot)]), Ntot=Ntot))
-    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax))
+    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax, J=J))
     
     # Latent zone effects update
     Eps_indices = [i for i in range(4*Nmax-2*N+1,4*Nmax-2*N+J+1)]
     RV_Eps = ot.RandomVector(NormalCholesky(mu=np.zeros(J), Chol=np.eye(J), Ntot=J))
-    ot_link_function_Eps = ot.PythonFunction(4*Nmax-2*N+J+1, J*(J+1)+1, lambda x:py_link_function_Eps(x,Nmax=Nmax, D=D, U=U_OT, PrecEps=PrecEps))
+    ot_link_function_Eps = ot.PythonFunction(4*Nmax-2*N+J+1, J*(J+1)+1, lambda x:py_link_function_Eps(x,Nmax=Nmax, D=D, U=U_OT, PrecEps=PrecEps, covarianceModel=covarianceModel))
+    
+    # PLOT Real GP trajectory on meshgrid over search domain
+    gridsize = 20
+    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
+    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
+    Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
+    Z_True = np.array(Z_True).reshape(gridsize, gridsize) * lambdaBar * T
+    levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
+    fig = plt.figure()
+    plt.contourf(xx, yy, Z_True, levels)
+    plt.colorbar()
+    plt.scatter( D[:,0], D[:,1], c="r", marker="+", s=100 )
+    # plt.show()
+    plt.savefig(os.path.join(savedir, "True_GP_trend.png"))
+    plt.close()
     
     # TEST latent GP update
     RV_f.getRealization()
@@ -722,25 +738,7 @@ if __name__ == "__main__":
     # TEST latent Zone effects
     RV_Eps.getRealization()
     RV_Eps.getParameter()
-    
-    # Plot Real GP trajectory on meshgrid over search domain
-    gridsize = 20
-    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
-    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
-
-    Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
-    # Z_True = m( XY_new )
-        
-    Z_True = np.array(Z_True).reshape(gridsize, gridsize) * lambdaBar * T
-    levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
-    
-    fig = plt.figure()
-    plt.contourf(xx, yy, Z_True, levels)
-    plt.colorbar()
-    # plt.show()
-    plt.savefig('True_GP_trend.png')
-    plt.close()
-        
+            
     ###############
     # Launch MCMC #
     ###############
@@ -770,6 +768,12 @@ if __name__ == "__main__":
         w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], w_indices, ot_link_function_w )
         Eps_sampler = ot.RandomVectorMetropolisHastings( RV_Eps, randinits[i], Eps_indices, ot_link_function_Eps )
         Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, Eps_sampler])
+        # test samplers 
+        f_sampler.getSample(blockSize)
+        Pi_sampler.getSample(blockSize)
+        w_sampler.getSample(blockSize)
+        Eps_sampler.getSample(blockSize)
+        Gibbs_sampler.getSample(blockSize)
         t1=time.time()
         sample = np.zeros((0,4*Nmax-2*N+J+1))
         # Main loop
@@ -811,7 +815,7 @@ if __name__ == "__main__":
                 plt.xlabel("Iterations", fontsize=16)    
             plt.axhline(true_values[j], lw=2, c="k")
     plt.tight_layout()
-    plt.savefig("traceplots.png")
+    plt.savefig(os.path.join(savedir, "traceplots.png"))
     plt.close()
     
     # ACF (MCMC autocorrelation) plot 
@@ -824,7 +828,7 @@ if __name__ == "__main__":
                 plt.ylabel(names[j], fontsize=16)
                 plt.xlabel("Iterations", fontsize=16)  
     plt.tight_layout()
-    plt.savefig("ACF.png")
+    plt.savefig(os.path.join(savedir, "ACF.png"))
     plt.close()
     
     
@@ -861,8 +865,9 @@ if __name__ == "__main__":
         
         plt.xlabel("Iterations")
         plt.ylabel(r"$\widehat R$")
+
     plt.tight_layout()
-    plt.savefig("Gelman_Rubin.png")
+    plt.savefig(os.path.join(savedir, "Gelman_Rubin.png"))
     plt.close()
     
     # Pool chains
@@ -883,7 +888,7 @@ if __name__ == "__main__":
             print(st.mstats.mquantiles(X, p)[0])
     
     plt.tight_layout()
-    plt.savefig("Ntot_post_density.png")
+    plt.savefig(os.path.join(savedir, "Ntot_post_density.png"))
     plt.close()
     
     #######################################
@@ -908,15 +913,15 @@ if __name__ == "__main__":
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
     plt.title("Poisson intensity posterior mean vs Data")
-    plt.savefig("f_post_mean.png")
+    plt.savefig(os.path.join(savedir, "f_post_mean.png"))
     plt.close()
     
     fig = plt.figure()
     plt.contourf(xx, yy, Z_std, levels_std)
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
-    plt.title("Poisson intensiety Posterior std vs Data")
-    plt.savefig("f_post_std.png")
+    plt.title("Poisson intensity Posterior std vs Data")
+    plt.savefig(os.path.join(savedir, "f_post_std.png"))
     plt.close()
     
     
