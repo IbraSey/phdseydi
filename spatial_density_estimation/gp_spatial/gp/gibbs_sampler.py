@@ -694,7 +694,7 @@ class SGCP_GibbsSampler:
         
         return mu_post, Sigma_post
     
-
+    
     def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3, save_path=None):
         """
         

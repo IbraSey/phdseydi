@@ -20,11 +20,7 @@ ot.RandomGenerator.SetSeed(42)
 # ----------------------------------------- FONCTION PLOT FIELD -----------------------------------------
 # =======================================================================================================
 
-def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, add_colorbar=True, 
-               savefigure=False, title_savefig='figure_output.pdf'):
-    """
-
-    """
+def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, add_colorbar=True):
     mesh = field.getMesh()
 
     x = mesh.getVertices().getMarginal(0)
@@ -44,10 +40,10 @@ def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, ad
         fig, ax_local = plt.subplots(figsize=(6, 4))
     elif mode == "subplot":
         if ax is None:
-            raise ValueError("En mode 'subplot', fournir un axe via le paramètre ax.")
+            raise ValueError("En mode 'subplot', fournir un axe via le paramètre ax")
         fig, ax_local = ax.figure, ax
     else:
-        raise ValueError("mode doit être 'plot' ou 'subplot'.")
+        raise ValueError("mode doit être 'plot' ou 'subplot' !")
 
     contour = ax_local.contourf(X, Y, Z, levels=15, vmin=vmin, vmax=vmax)
     if add_colorbar:
@@ -55,197 +51,111 @@ def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, ad
     if title:
         ax_local.set_title(title)
 
-    if savefigure:
-        ROOT = Path(__file__).resolve().parent.parent
-        FIGURES_DIR = ROOT / "visualizations" / "figures"
-        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-        fig.savefig(FIGURES_DIR / title_savefig, dpi=300, bbox_inches="tight")
-
     return fig, ax_local, contour
 
 
+
+
+
 # %%
-# =======================================================================================================
-# ---------------------------------------- FONCTION PLOT DONNÉES ----------------------------------------
-# =======================================================================================================
+# ==========================================================================================================
+# ------------------------------------------- FONCTION PLOT DATA -------------------------------------------
+# ==========================================================================================================
 
-def plot_poisson_zones_data(X, zones, mus_vec, X_bounds, Y_bounds, 
-                            title_prefix="Processus de Poisson homogène par zones", cmap=plt.cm.viridis,
-                            show_time_hist=True, savefigure=False, title_savefig='figure_output.pdf'):
+def plot_poisson_zones_data(X, zones, X_bounds, Y_bounds, 
+                            mus_vec=None, 
+                            title="Réalisations du processus spatial", 
+                            show_time_hist=False, 
+                            savefigure=False, 
+                            title_savefig='figure_output.pdf',
+                            cmap=plt.cm.viridis):
     """
 
     """
+    # -----------------------------------------------------------
+    # 1. Préparation des données
+    # -----------------------------------------------------------
     X_array = np.asarray(X, dtype=float)
-    mus_vec = np.asarray(mus_vec, dtype=float)
-    N = X_array.shape[0]
+    N = X_array.shape[0] if X_array.size > 0 else 0
     J = len(zones)
-    mu_max = max(mus_vec)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 7), sharex=True, sharey=True)
+    
+    # Gestion des intensités pour la coloration (si donné)
+    has_mus = mus_vec is not None
+    if has_mus:
+        mus_np = np.asarray(mus_vec, dtype=float)
+        mu_max = np.max(mus_np) if len(mus_np) > 0 else 1.0
+    
+    # -----------------------------------------------------------
+    # 2. Création figure 
+    # -----------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharex=True, sharey=True)
     ax_points, ax_zones = axes
 
-    # --------------------
-    # Points (sans zones)
-    # --------------------
+    # --- Subplot 1 : Points seuls ---
     if N > 0:
         ax_points.scatter(
-            X_array[:, 0],
-            X_array[:, 1],
-            s=20,
-            c="red",
-            alpha=0.6,
-            edgecolors="darkred",
-            linewidth=0.5,
-            label="Événements",
-        )
-    ax_points.set_title("Événements (sans zones)", fontsize=12)
+            X_array[:, 0], X_array[:, 1], s=5, c="red", marker='o', alpha=0.6, 
+            edgecolors="darkred", linewidth=0.5, label="Événements")
+    ax_points.set_title("Événements (sans zones)", fontsize=11)
 
-    # --------------------
-    # Points (avec zones)
-    # --------------------
-    for zone, mu in zip(zones, mus_vec):
+    # --- Subplot 2 : Points + Zones ---
+    for i, zone in enumerate(zones):
         xmin, ymin, xmax, ymax = zone.bounds
+        
+        # Style du rectangle selon la présence de mus_vec
+        if has_mus:
+            mu_val = mus_np[i]
+            color = cmap(float(mu_val) / mu_max)
+            facecolor = color
+            alpha_rect = 0.35
+            
+            # Ajout du texte d'intensité
+            tx = xmin + 0.05 * (xmax - xmin)
+            ty = ymax - 0.05 * (ymax - ymin)
+            ax_zones.text(
+                tx, ty, rf"$\lambda={mu_val:.2f}$",
+                ha="left", va="top", fontsize=9, fontweight="bold",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+            )
+        else:
+            facecolor = "none" # Transparent si pas d'intensité
+            alpha_rect = 0.1
 
         rect = Rectangle(
-            (xmin, ymin),
-            xmax - xmin,
-            ymax - ymin,
-            facecolor=cmap(float(mu) / mu_max),
-            edgecolor="black",
-            linewidth=2,
-            alpha=0.35,
+            (xmin, ymin), xmax - xmin, ymax - ymin, 
+            facecolor=facecolor,
+            edgecolor="black", 
+            linewidth=1.0 if has_mus else 0.8, 
+            linestyle="-" if has_mus else "--", 
+            alpha=alpha_rect if has_mus else 0.5
         )
         ax_zones.add_patch(rect)
 
-        # Label en haut-gauche de la zone
-        tx = xmin + 0.05 * (xmax - xmin)
-        ty = ymax - 0.05 * (ymax - ymin)
-        ax_zones.text(
-            tx,
-            ty,
-            rf"$mean={float(mu):.2f}$",
-            ha="left",
-            va="top",
-            fontsize=10,
-            fontweight="bold",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
-        )
-
+    # Ré-affichage des points par dessus les zones
     if N > 0:
         ax_zones.scatter(
-            X_array[:, 0],
-            X_array[:, 1],
-            s=20,
-            c="red",
-            alpha=0.6,
-            edgecolors="darkred",
-            linewidth=0.5,
-            label="Événements",
+            X_array[:, 0], X_array[:, 1],
+            s=5, c="red", marker='o', alpha=0.6, 
+            edgecolors="darkred", linewidth=0.5, label="Événements"
         )
-    ax_zones.set_title("Événements (avec zones)", fontsize=12)
+    ax_zones.set_title("Événements (avec zones)", fontsize=11)
 
-    # ----------------
-    # Mise en forme
-    # ----------------
-    for ax in (ax_points, ax_zones):
+    # --- Mise en forme globale ---
+    for ax in axes:
         ax.set_xlim(X_bounds)
         ax.set_ylim(Y_bounds)
-        ax.set_xlabel("X", fontsize=12)
-        ax.set_ylabel("Y", fontsize=12)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
         ax.set_aspect("equal")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=10)
+        ax.grid(True, linestyle=":", alpha=0.6)
+        if N > 0: ax.legend(loc='upper right', fontsize=8)
 
-    fig.suptitle(
-        f"{title_prefix} : {N} événements sur {J} zones\n",
-        fontsize=14,
-        fontweight="bold"
-    )
-
+    fig.suptitle(f"{title} (N={N} événements, J={J} zone(s))", fontsize=13, fontweight="bold")
     plt.tight_layout()
-    plt.show()
-
-    if savefigure:
-        ROOT = Path(__file__).resolve().parent.parent
-        FIGURES_DIR = ROOT / "visualizations" / "figures"
-        FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-        fig.savefig(FIGURES_DIR / title_savefig, dpi=300, bbox_inches="tight")
-
-    # ============================
-    # Histogramme temporel
-    # ============================
-    if show_time_hist:
-        fig2, ax2 = plt.subplots(figsize=(12, 4))
-
-        if N > 0:
-            ax2.hist(
-                X_array[:, 2],
-                bins=30,
-                alpha=0.7,
-                edgecolor="black",
-            )
-
-        ax2.set_xlabel("Temps", fontsize=12)
-        ax2.set_ylabel("Nb d'événements", fontsize=12)
-        ax2.set_title("Distribution temporelle des events\n", fontsize=14)
-        ax2.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.show()
-
-        if savefigure :
-            ROOT = Path(__file__).resolve().parent.parent
-            FIGURES_DIR = ROOT / "visualizations" / "figures"
-            FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-            fig2.savefig(FIGURES_DIR / ("time_" + title_savefig), dpi=300, bbox_inches="tight")
-
-
-# %%
-def plot_poisson_zones_data_bis(X, zones, X_bounds, Y_bounds, 
-                             title="Réalisations du processus spatial", 
-                             show_time_hist=False):
-    """
-
-    """
-    X_array = np.asarray(X, dtype=float)
-    N = X_array.shape[0] if X_array.size > 0 else 0
     
-    fig, ax =  plt.subplots(figsize=(10, 6), sharex=True, sharey=True)
-    
-    for zone in zones:
-        xmin, ymin, xmax, ymax = zone.bounds
-        rect = Rectangle( (xmin, ymin), xmax - xmin, ymax - ymin, fill=False,   # fill=False pour ne pas mettre de couleur
-            edgecolor="black", linewidth=0.8, linestyle="--", alpha=0.5)       
-        ax.add_patch(rect)
-
-    if N > 0:
-        ax.scatter(
-            X_array[:, 0], 
-            X_array[:, 1],
-            s=15, 
-            c="red", 
-            marker='o', 
-            alpha=0.6, 
-            label="Événements"
-        )
-
-    # ----------------
-    # Mise en forme
-    # ----------------
-    ax.set_xlim(X_bounds)
-    ax.set_ylim(Y_bounds)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_aspect("equal")
-    ax.set_title(f"{title} (Nombre d'événements : {N})")
-    ax.legend(loc='upper right')
-    
-    plt.tight_layout()
-    plt.show()
-
-    # ============================
-    # Histogramme temporel
-    # ============================
+    # -----------------------------------------------------------
+    # 3. Histogramme Temporel
+    # -----------------------------------------------------------
     if show_time_hist and N > 0:
         fig2, ax2 = plt.subplots(figsize=(10, 3))
         ax2.hist(X_array[:, 2], bins=30, color='gray', edgecolor='black', alpha=0.7)
@@ -254,6 +164,23 @@ def plot_poisson_zones_data_bis(X, zones, X_bounds, Y_bounds,
         ax2.set_title("Distribution temporelle")
         plt.tight_layout()
         plt.show()
+
+    # -----------------------------------------------------------
+    # 4. Sauvegarde figure 
+    # -----------------------------------------------------------
+    if savefigure :
+            ROOT = Path(__file__).resolve().parent.parent
+            FIGURES_DIR = ROOT / "visualizations" / "figures"
+            FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+            fig2.savefig(FIGURES_DIR / ("time_" + title_savefig), dpi=200, bbox_inches="tight")
+
+
+
+
+
+# %%
+
+
 
 
 
