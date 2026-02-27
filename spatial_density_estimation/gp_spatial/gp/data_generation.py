@@ -28,19 +28,16 @@ def sigma(z):
     z_array = np.array(z)
     return ot.Point(1.0 / (1.0 + np.exp(-z_array)))
 
-def generate_data_bis(
+def generate_data(
     X_bounds=(0.0, 2.0),
     Y_bounds=(0.0, 2.0),
     T=10.0,
     n_cols=3,
     n_rows=1,
     mus=6.0,
-    f=None,             # Liste de fonctions (une par zone) ou une seule fonction (même schéma qu'avec mus)
+    f=None,             
     rng_seed=0
 ):
-    """
-
-    """
     if rng_seed is not None:
         ot.RandomGenerator.SetSeed(rng_seed)
         np.random.seed(rng_seed) 
@@ -56,11 +53,8 @@ def generate_data_bis(
     else:
         mus_vec = ot.Point(mus) 
 
-    if len(mus_vec) != J :
-        raise ValueError(f"mus doit avoir {J} éléments, pour l'instant mus a {len(mus_vec)} éléments")
-
     if not isinstance(f, list):
-        funcs = [f] * J       # La même fonction pour tout le monde
+        funcs = [f] * J       
     else:
         funcs = f
 
@@ -75,23 +69,24 @@ def generate_data_bis(
     
     all_samples = []
     for i, (zone, mu) in enumerate(zip(zones, mus_vec)) :
-        bounds = zone.bounds     # (min_x, min_y, max_x, max_y)
+        bounds = zone.bounds
         mean_candidates = mu * T * zone.area
         n_candidates = int(ot.Poisson(mean_candidates).getRealization()[0])
         func = funcs[i]
         
-        if n_candidates > 0:        # Attention, il peuyt y avoir des zones sans candidats 
+        if n_candidates > 0:
             cand_x = np.random.uniform(bounds[0], bounds[2], n_candidates)
             cand_y = np.random.uniform(bounds[1], bounds[3], n_candidates)
             cand_t = np.random.uniform(0, T, n_candidates)
             
-            #intensities = sigma(func(cand_x, cand_y))
-            intensities = func(cand_x, cand_y)
-            probs = intensities / mu
-            u_decision = np.random.uniform(0, 1, n_candidates)
-            mask_accepted = u_decision < probs
+            # Calcul des probas d'acceptation
+            intensities_pt = sigma(func(cand_x, cand_y))
+            probs = np.array(intensities_pt).flatten() 
             
-            if np.any(mask_accepted):       # Attention, il peuyt y avoir des zones sans points 
+            decision = np.random.uniform(0, 1, n_candidates)
+            mask_accepted = decision < probs
+            
+            if np.any(mask_accepted):
                 accepted_points = np.column_stack((
                     cand_x[mask_accepted], 
                     cand_y[mask_accepted], 
@@ -113,8 +108,9 @@ def generate_data_bis(
     print(f"Bornes d'intensité : {mus_vec}")
     print(f"Premiers événements :\n{X[:5]}")
     print("="*35)
-    
+
     return X, zones, X_bounds, Y_bounds, T
+
 
 
 # %%
