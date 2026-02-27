@@ -3,9 +3,7 @@
 # -------------------------------------------- IMPORTS --------------------------------------------
 # =================================================================================================
 from pathlib import Path
-import os, sys
-ROOT = Path.cwd().parent
-sys.path.insert(0, str(ROOT))
+import os
 import openturns as ot
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,7 +11,8 @@ import math
 from shapely.geometry import Polygon, Point
 from shapely.prepared import prep
 from matplotlib.colors import Normalize
-from visualizations.plot import plot_field
+# package-relative import
+from ..visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 
 

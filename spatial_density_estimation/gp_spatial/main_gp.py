@@ -3,9 +3,7 @@
 # -------------------------------------------- IMPORTS --------------------------------------------
 # =================================================================================================
 from pathlib import Path
-import os, sys
-ROOT = Path.cwd().parent
-sys.path.insert(0, str(ROOT))
+import os
 import openturns as ot
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -14,9 +12,10 @@ import math
 from polyagamma import random_polyagamma
 from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
-from visualizations.plot import plot_field, plot_poisson_zones_data
-from gp.gibbs_sampler import SGCP_GibbsSampler
-from gp.data_generation import generate_data
+# Use package-relative imports for local modules
+from .visualizations.plot import plot_field, plot_poisson_zones_data
+from .gp.gibbs_sampler import SGCP_GibbsSampler
+from .gp.data_generation import generate_data
 
 ot.RandomGenerator.SetSeed(42)
 
@@ -151,6 +150,9 @@ zones_prep = [prep(p) for p in polygons]
 Areas = [(zp, 0.0) for zp in zones_prep]
 
 
+
+
+
 sampler = SGCP_GibbsSampler(
     X_bounds=Xb, Y_bounds=Yb, T=T_sim, Areas=Areas, polygons=polygons,
     lambda_nu=lambda_nu, nu=nu_init, a_mu=10.0, b_mu=1.0, delta=delta,
@@ -158,76 +160,71 @@ sampler = SGCP_GibbsSampler(
 )
 
 eps_init = np.zeros(sampler.J).tolist()
-results = sampler.run(
-    t=t_pt, x=x_pt, y=y_pt,
-    eps_init=eps_init, mutilde_init=mutilde_init,
-    n_iter=n_iter, 
-    step_nu_init=step_nu_init,
-    verbose=verbose, verbose_every=verbose_every
-)
-
-print("\n" + "="*40)
-print(f"Taux d'acceptation MH pour \nu : {results['acceptance_nu']*100}%")
-print("="*40)
-
-# Analyse chaines
-sampler.plot_chains(results)
-sampler.plot_acf(
-    results,
-    burn_in=0.3,
-    max_lag=50
-)
-ess_vals = sampler.plot_ess_arviz(results, burn_in=0.3, figsize=None)
-print("ESS :")
-for k, v in ess_vals.items():
-    print(f"{k:8s} : {v:.1f}")
 
 
-# Posterior intensity plot
-out = sampler.plot_posterior_intensity(
-    x=np.asarray(x_pt, dtype=float),
-    y=np.asarray(y_pt, dtype=float),
-    t=np.asarray(t_pt, dtype=float),
-    results=results,
-    nx=80,
-    ny=80,
-    burn_in=burn_in
-)
+if __name__ == "__main__":
 
-post = sampler.posterior_summary(results, burn_in=burn_in)
-print("\n--- Posterior summary ---")
-print(f"mutilde_hat = {post['mutilde_hat']}")
-print(f"eps_hat     = {np.asarray(post['eps_hat'])}")
-print(f"mean mu_hat      = {out['mu_hat'].mean()}")
-print(f"mean squared_mu_hat      = {out['squared_mu_hat'].mean()}")
-print(f"mean nu_hat      = {post['nu_hat']}")
+    results = sampler.run(
+        t=t_pt, x=x_pt, y=y_pt,
+        eps_init=eps_init, mutilde_init=mutilde_init,
+        n_iter=n_iter, 
+        step_nu_init=step_nu_init,
+        verbose=verbose, verbose_every=verbose_every
+    )
 
-# Calcul biais et variance
-sq_e = (out['mu_hat'].mean())**2
-print(f"Biais pour le moddèle avec prior informatif : {out['mu_hat'].mean() - mus_gen}")
-print(f"Variance pour le moddèle avec prior informatif : {out['squared_mu_hat'].mean() - sq_e}")
+    print("\n" + "="*40)
+    print(f"Taux d'acceptation MH pour \nu : {results['acceptance_nu']*100}%")
+    print("="*40)
+
+    # Analyse chaines
+    sampler.plot_chains(results)
+    sampler.plot_acf(
+        results,
+        burn_in=0.3,
+        max_lag=50
+    )
+    ess_vals = sampler.plot_ess_arviz(results, burn_in=0.3, figsize=None)
+    print("ESS :")
+    for k, v in ess_vals.items():
+        print(f"{k:8s} : {v:.1f}")
 
 
+    # Posterior intensity plot
+    out = sampler.plot_posterior_intensity(
+        x=np.asarray(x_pt, dtype=float),
+        y=np.asarray(y_pt, dtype=float),
+        t=np.asarray(t_pt, dtype=float),
+        results=results,
+        nx=80,
+        ny=80,
+        burn_in=burn_in
+    )
 
+    post = sampler.posterior_summary(results, burn_in=burn_in)
+    print("\n--- Posterior summary ---")
+    print(f"mutilde_hat = {post['mutilde_hat']}")
+    print(f"eps_hat     = {np.asarray(post['eps_hat'])}")
+    print(f"mean mu_hat      = {out['mu_hat'].mean()}")
+    print(f"mean squared_mu_hat      = {out['squared_mu_hat'].mean()}")
+    print(f"mean nu_hat      = {post['nu_hat']}")
 
-
-# %%
+    # Calcul biais et variance
+    sq_e = (out['mu_hat'].mean())**2
+    print(f"Biais pour le moddèle avec prior informatif : {out['mu_hat'].mean() - mus_gen}")
+    print(f"Variance pour le moddèle avec prior informatif : {out['squared_mu_hat'].mean() - sq_e}")
 
 
 
 
 
-
-# %%
+    # %%
 
 
 
 
 
 
-
-
-# %%
+    # %%
 
 
 
@@ -236,8 +233,17 @@ print(f"Variance pour le moddèle avec prior informatif : {out['squared_mu_hat']
 
 
 
+    # %%
 
-# %%
+
+
+
+
+
+
+
+
+    # %%
 
 
 
