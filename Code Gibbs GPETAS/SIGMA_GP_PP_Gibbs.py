@@ -159,6 +159,7 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     """
     # Extract cuurent state of conditioning variables
     N=len(D)
+    J = U.getOutputDimension()
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
@@ -315,7 +316,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
         inputSample = np.vstack((self.D, self.Pi[:Ntot-N]))
-        outputSample = self.ftot[:Ntot]
+        outputSample = self.ftot[:Ntot].copy()
         # remove zones effect
         zone_effect = np.dot( np.array(self.U(inputSample)), self.Eps )    
         outputSample -= zone_effect
@@ -406,7 +407,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             
 
 
-def py_link_function_Pi( x, Nmax, N ):
+def py_link_function_Pi( x, Nmax, N, J ):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -421,8 +422,8 @@ def py_link_function_Pi( x, Nmax, N ):
         Size : 4*Nmax-2*N+1
     Nmax : int
         Max of Ntot (augmented Poisson process size)
-    N : int
-        Sample size
+    J : int
+        number of zones
 
     Returns
     -------
@@ -487,7 +488,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         return w
 
 
-def py_link_function_w(x, Nmax):
+def py_link_function_w(x, Nmax, J):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional Polya
@@ -499,6 +500,7 @@ def py_link_function_w(x, Nmax):
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax-2*N+1
+    
 
     Returns
     -------
@@ -514,7 +516,7 @@ def py_link_function_w(x, Nmax):
 # Latent zones effects update # 
 ###############################
 
-def py_link_function_Eps(x, Nmax, D, U, PrecEps):
+def py_link_function_Eps(x, Nmax, D, U, PrecEps, covarianceModel):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -535,6 +537,8 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
         summing to 1
     PrecEps : (J,J) 
         Eps prior precision matrix
+    covarianceModel : OpenTURNS covariance model
+        covariance kernel for the latent GP
     
     Returns
     -------
@@ -559,7 +563,7 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
     L = K.computeCholesky()
     Linv = L.inverse()
     # Kinv = Linv.transpose()*Linv   
-    Utot = U_OT(Dtot)    
+    Utot = U(Dtot)    
     LU = ot.Matrix( Linv * Utot ) 
     Q = LU.transpose() * LU + PrecEps
     # invert 
@@ -673,7 +677,7 @@ if __name__ == "__main__":
 
     # Plot the data
     fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1], c="r", marker="+" )
+    plt.scatter( D[:,0], D[:,1], c="r", marker="+", s=100 )
     # plt.show()
     plt.savefig(os.path.join(savedir, "Data.png"))
     plt.close()
@@ -684,50 +688,44 @@ if __name__ == "__main__":
     
     sampleSize=100#0
     blockSize=10#0 # Display convergence messages after every block of iterations with size: blockSize
-    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
-    
+    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic    
 
     f_indices = [i for i in range(Nmax)]
     # Augmented Gaussian Process update
     RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
     ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, U=U_OT, covarianceModel=covarianceModel))
 
-    
     # Latent Poisson and Gaussian Process update
     Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
     PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Eps=EpsTrue, D=D, U=U_OT, covarianceModel=covarianceModel, Poisson=Poisson, myUniform=myUniform )
     RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N))
-
+    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N, J=J))
     
     # Latent Polya Gamma Process update
     w_indices = [i for i in range(Nmax,2*Nmax)]
     RV_w = ot.RandomVector(PolyaGammaProcess(ftot=np.concatenate([np.array(field_f).ravel(), np.zeros(Nmax-Ntot)]), Ntot=Ntot))
-    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax))
+    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax, J=J))
     
     # Latent zone effects update
     Eps_indices = [i for i in range(4*Nmax-2*N+1,4*Nmax-2*N+J+1)]
     RV_Eps = ot.RandomVector(NormalCholesky(mu=np.zeros(J), Chol=np.eye(J), Ntot=J))
-    ot_link_function_Eps = ot.PythonFunction(4*Nmax-2*N+J+1, J*(J+1)+1, lambda x:py_link_function_Eps(x,Nmax=Nmax, D=D, U=U_OT, PrecEps=PrecEps))
+    ot_link_function_Eps = ot.PythonFunction(4*Nmax-2*N+J+1, J*(J+1)+1, lambda x:py_link_function_Eps(x,Nmax=Nmax, D=D, U=U_OT, PrecEps=PrecEps, covarianceModel=covarianceModel))
     
     # PLOT Real GP trajectory on meshgrid over search domain
     gridsize = 20
     xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
     XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
-
     Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
-    # Z_True = m( XY_new )
-        
     Z_True = np.array(Z_True).reshape(gridsize, gridsize) * lambdaBar * T
     levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
-    
     fig = plt.figure()
     plt.contourf(xx, yy, Z_True, levels)
     plt.colorbar()
-    plt.scatter( D[:,0], D[:,1], c="r", marker="+" )
+    plt.scatter( D[:,0], D[:,1], c="r", marker="+", s=100 )
     # plt.show()
     plt.savefig(os.path.join(savedir, "True_GP_trend.png"))
     plt.close()
+    
     # TEST latent GP update
     RV_f.getRealization()
     RV_f.getParameter()
