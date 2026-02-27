@@ -3,9 +3,7 @@
 # -------------------------------------------- IMPORTS --------------------------------------------
 # =================================================================================================
 from pathlib import Path
-import os, sys
-ROOT = Path.cwd().parent
-sys.path.insert(0, str(ROOT))
+import os
 import openturns as ot
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
@@ -15,7 +13,8 @@ from polyagamma import random_polyagamma
 from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
 import arviz as az
-from visualizations.plot import plot_field
+# Use package-relative import for sibling `visualizations` package
+from ..visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 
 
