@@ -197,7 +197,8 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     # precision matrix
     K = covarianceModel.computeCrossCovariance(Dtot,Dtot)
     K = ot.CovarianceMatrix(K)
-    L = safe_compute_cholesky(K)
+    # L = safe_compute_cholesky(K)
+    L = K.computeCholesky()
     Linv = L.inverse()
     Kinv = Linv.transpose()*Linv
     # add Omega to precision matrix diagonal
@@ -205,7 +206,8 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     Diag = Diag.tolist()
     Kinv.setDiagonal( Diag )
     # invert 
-    L = safe_compute_cholesky(Kinv)
+    # L = safe_compute_cholesky(Kinv)
+    L = ot.CovarianceMatrix(Kinv).computeCholesky()
     Linv = L.inverse()
     V = Linv.transpose()*Linv
     # prior to posterior total mean 
@@ -659,6 +661,7 @@ if __name__ == "__main__":
     
     lambdaBarTrue = 10
     T = 50
+    T0 = 0.1*T # virtual prior time perior
     
     def U(xy):
         u = [0, 0]
@@ -682,20 +685,18 @@ if __name__ == "__main__":
         return mTot
     
     # GP model specification
-    amplitude = 1.5/6
+    amplitude = 1.5
     covarianceModel = ot.SquaredExponential([0.5, 0.5], [amplitude])
     m = ot.PythonFunction(2, 1, trend)
     
     # Homogeneous augmented Poisson process Size
     PoissonScale =  T
-    
-    # Prior parameters for lambdaBar update
-    a = 1.
-    b = 0.1
-    
+        
     # Upper bound on size of augmented Poisson process
     Poisson = ot.Poisson(PoissonScale*lambdaBarTrue)
     Nmax = int(Poisson.computeQuantile(1-1e-20)[0])*3
+    # large quantile to avoid truncation bias, multiplied by 2 for safety margin 
+    # (may cause a crash if not large  enough)
     
     # where to save results (figures)
     savedir = os.path.join( os.environ['HOME'], "sigma_gp_results")
@@ -747,7 +748,10 @@ if __name__ == "__main__":
     fPi = np.array(sigmoid_inv(field_f))[accepted==False]
     ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
     
-    
+    # Prior parameters for lambdaBar update
+    a = 2.*N
+    b = 1.*T
+
     #######################
     # TEST ON TOY DATASET #
     #######################
@@ -838,6 +842,7 @@ if __name__ == "__main__":
         Ntot_init = 0
         while Ntot_init < N:
             lambdaBar_init = ot.Gamma(a, b, 0).getRealization()[0]
+            # lambdaBar_init = lambdaBarTrue
             Ntot_init = int(ot.Poisson(lambdaBar_init * T).getRealization()[0])
         randinit[-2-J] = Ntot_init
         randinit[-1-J] = lambdaBar_init
@@ -870,11 +875,12 @@ if __name__ == "__main__":
         lambdaBar_sampler = ot.RandomVectorMetropolisHastings( RV_lambdaBar, start_pt, ot.Indices([int(x) for x in lambdaBar_indices]), ot_link_function_lambdaBar )
         Eps_sampler = ot.RandomVectorMetropolisHastings( RV_Eps, start_pt, ot.Indices([int(x) for x in Eps_indices]), ot_link_function_Eps )
         Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, lambdaBar_sampler, Eps_sampler])
+        # Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, Eps_sampler])
         # test samplers (wrapped to surface Python exceptions)
         import traceback as _traceback
         for _s, _name in [(f_sampler, 'f_sampler'), (Pi_sampler, 'Pi_sampler'), (w_sampler, 'w_sampler'), (lambdaBar_sampler, 'lambdaBar_sampler'), (Eps_sampler, 'Eps_sampler')]:
             try:
-                _s.getSample(blockSize)
+                _s.getSample(1)
             except Exception:
                 print(f"Sampler {_name} raised an exception during getSample:")
                 _traceback.print_exc()
@@ -1006,7 +1012,7 @@ if __name__ == "__main__":
         # break
         # GP conditional on values at augmented Poisson process
         PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, N, J))
-        Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new ) * sample[i][-J-1] * PoissonScale
+        Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new ) * sample[i][-J-1] * T
     
     Z_mean = Z_new.mean(axis=0).reshape(gridsize, gridsize)
     levels_mean = np.linspace( Z_mean.min(), Z_mean.max(), gridsize )
