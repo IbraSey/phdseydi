@@ -126,7 +126,7 @@ class NormalCholesky(ot.PythonRandomVector):
         return output
 
 
-def py_link_function_f(x, Nmax, D, U, covarianceModel):
+def py_link_function_f(x, Nmax, D, covarianceModel):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -141,10 +141,6 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
         Max of Ntot (augmented Poisson process size)
     D : (N,2)
         Observed Poisson process
-    U : Open TURNS function
-        zone indicator functions
-        given a point (x,y), outputs J 0-1 indicators,
-        summing to 1
     covarianceModel : Open TURNS covariance model
         GP cov model
     
@@ -160,7 +156,7 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
-    Eps = np.array(x)[-J:].reshape(-1,1)
+    # Eps = np.array(x)[-J:].reshape(-1,1)
     # total (augmented) data
     Dtot = ot.Sample(Ntot, 2)
     Dtot[:N] = D
@@ -180,12 +176,13 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
     L = ot.CovarianceMatrix(Kinv).computeCholesky()
     Linv = L.inverse()
     V = Linv.transpose()*Linv
-    # prior to posterior total mean 
-    m_Dtot = np.dot( np.array(U(Dtot)), Eps )
-    mean = ot.Sample(m_Dtot)
-    mean = Kinv * mean
-    mean = mean + u
-    mean = V*mean
+    # # prior to posterior total mean 
+    # m_Dtot = np.dot( np.array(U(Dtot)), Eps )
+    # mean = ot.Sample(m_Dtot)
+    # mean = Kinv * mean
+    # mean = mean + u
+    # mean = V*mean
+    mean = V*u
     # extract parameters in correct order (coherent with getParameter() method of RV_f)
     parameter = [0]*( Nmax*(Nmax+1)+1 )
     parameter[:Ntot] = np.array(mean).ravel()
@@ -199,13 +196,14 @@ def py_link_function_f(x, Nmax, D, U, covarianceModel):
 # Latent Poisson... and Gaussian process update # 
 #################################################
 
+# Uniform_RV = ot.RandomVector(ot.Uniform())
 
 class PoissonGaussianProcess(ot.PythonRandomVector):
     """
     Given current states of GP values at observed and latent points Pi (and the latter)
     Generates an updated set of latent points and associated GP Values
     """
-    def __init__( self, ftot, Pi, Ntot, Eps, D, U, covarianceModel, Poisson, myUniform):
+    def __init__( self, ftot, Pi, Ntot, Lambda, D, U, covarianceModel, PoissonScale, Uniform):
         """
         Parameters
         ----------
@@ -218,8 +216,8 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Ntot: int
             current total size of observed and latent process
             Ntot=N+NPi
-        Eps : (J,1)
-            current value of zones regressors
+        Lambda : (J,1)
+            current value of zones effects
         D : (N,2)
             Observed Poisson process
         U : Open TURNS function
@@ -228,15 +226,14 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             summing to 1
         covarianceModel : Open TURNS covariance model
             GP cov model
-        Poisson : Open TURNS distribution
-            Poisson law of homogeneous process size
-        myUniform : Open TURNS distribution
-            Uniform law of homogeneous Poisson process
-
+        PoissonScale: Scale factor for homogeneous Poisson distribution
+            This is equal to observation period T times search domain area
+        Uniform : Open TURNS distribution
+            uniform distribution over the search domain
+        
         Notes
         -----
-        - above parameters are flattened and concatenated
-          in above order
+        - above parameters are flattened and concatenated in above order
         - parameter list size: 3*Nmax-2*N+1
         - Simulated variables dimension: 3*Nmax-3*N+1
           Difference with parameter list size is the former
@@ -247,7 +244,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Nmax = len(ftot)
         N = len(D)
         super(PoissonGaussianProcess, self).__init__(int(3*Nmax-3*N+1))
-        # not converting to int results in weird error message:
+        # not converting Nmax to int results in weird error message:
         # super(PoissonGaussianProcess, self).__init__(3*Nmax-3*N+1)
         # if Nmax < Ntot: 
         #     print("Inputs have incompatible sizes")
@@ -256,13 +253,13 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.ftot = np.array(ftot).reshape(-1,1)
         self.Pi = np.array(Pi).reshape(-1,2)
         self.Ntot = int(Ntot)
-        self.Eps = Eps
+        self.Lambda = Lambda
         self.Nmax = Nmax
         self.D = D
         self.U = U
         self.covarianceModel = covarianceModel
-        self.Poisson = Poisson
-        self.myUniform = myUniform
+        self.PoissonScale = PoissonScale
+        self.Uniform = Uniform
     
     def setParameter(self, parameter):
         """
@@ -274,7 +271,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
                 - ftot (Nmax,)
                 - Pi (Nmax-N,2)
                 - Ntot (1,)
-                - Eps (J,)
+                - Lambda (J,)
             in this order
             Size: 3*Nmax-2*N+J+1
 
@@ -287,7 +284,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
         self.Pi = np.array(parameter[Nmax:-J-1]).reshape(-1,2)
         self.Ntot = int(parameter[-J-1])
-        self.Eps = np.array(parameter[-J:]).reshape(-1,1)
+        self.Lambda = np.array(parameter[-J:]).reshape(-1,1)
     
     def getParameter(self):
         Nmax=int(self.Nmax)
@@ -297,7 +294,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
         parameter[-J-1] = Ntot
-        parameter[-J:] = self.Eps.ravel()
+        parameter[-J:] = self.Lambda.ravel()
         return parameter.tolist()
     
     def getGaussianProcessRegression(self):
@@ -315,9 +312,9 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         N = Nmax-len(self.Pi)
         inputSample = np.vstack((self.D, self.Pi[:Ntot-N]))
         outputSample = self.ftot[:Ntot]
-        # remove zones effect
-        zone_effect = np.dot( np.array(self.U(inputSample)), self.Eps )    
-        outputSample -= zone_effect
+        # # remove zones effect
+        # zone_effect = np.dot( np.array(self.U(inputSample)), self.Eps )    
+        # outputSample -= zone_effect
         # Step 1: Fit GP regression model to Sample
         fitter = otexp.GaussianProcessFitter(inputSample, outputSample, self.covarianceModel, ot.Basis(0))
         fitter.setOptimizeParameters(False)
@@ -344,7 +341,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             - New GP process values (size : Nmax-N)
             - New Poisson process values (shape : (Nmax-N,2))
             - New Ntot value (size: 1)
-            total size : 3*Nmax-3*N+1        
+            total size : 3*Nmax-3*N+1
         
         Notes:
             - There is no guaranty that New Ntot <= Nmax
@@ -354,14 +351,17 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         N = len(self.D)
         # Step 1: Update Gaussian process 
         gpr_result = self.getGaussianProcessRegression()        
-        # Step 2: Generate candidate points
-        N_star = int(self.Poisson.getRealization()[0]) # Poisson candidate number
-        XY_star = np.array( self.myUniform.getSample(N_star) )# Uniformly sampled candidates
+        # Step 2: Generate candidate points uniformly over search domain
+        LambdaMax = self.Lambda.max()
+        N_star = int(ot.Poisson(self.PoissonScale*LambdaMax).getRealization()[0]) # Poisson candidate number
+        XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
         # Step 3: predict GP at candidates
         process = otexp.ConditionedGaussianProcess(gpr_result, ot.Mesh(XY_star))
         f_star = np.array(process.getRealization())
         # Step 4: Thinning
-        p_accept = np.array( sigmoid(-f_star.reshape(-1,1)) )
+        U_star = np.array( self.U(XY_star) )
+        Lambda_star = np.dot( U_star, self.Lambda).reshape(-1,1)
+        p_accept = np.array( sigmoid(-f_star.reshape(-1,1)) * Lambda_star / LambdaMax )
         accept = np.array( ot.Uniform().getSample(N_star) ) <= p_accept 
         NPi_new = np.array(accept).sum()
         Ntot_new = N + NPi_new
@@ -372,10 +372,10 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         f_new = np.zeros(Nmax - N)
         f_new[:NPi_new] = f_star[accept]
         Pi_new = np.zeros((Nmax - N, 2))
-        Pi_new[:NPi_new] = XY_star[accept.ravel()]
-        # add zones effect
-        zone_effects = np.dot( np.array(self.U(Pi_new[:NPi_new])), self.Eps ).ravel()
-        f_new[:NPi_new] = f_new[:NPi_new] + zone_effects
+        Pi_new[:NPi_new] = np.array(XY_star)[accept.ravel()]
+        # # add zones effect
+        # zone_effects = np.dot( np.array(self.U(Pi_new[:NPi_new])), self.Eps ).ravel()
+        # f_new[:NPi_new] = f_new[:NPi_new] + zone_effects
         return np.concatenate([f_new.ravel(), Pi_new.ravel(), [Ntot_new]])
         
     def SimulateSigmaGP( self, XY_new ):
@@ -392,7 +392,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         -------
         f_simu : (size, N_new) array
             independent realizations of the conditioned GP
-            after logistic transform
+            after logistic transform and multiplying by zone effects
         """
         # Step 1: Update Gaussian process 
         gpr_result = self.getGaussianProcessRegression()        
@@ -400,11 +400,8 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         process = otexp.ConditionedGaussianProcess(gpr_result, ot.Mesh(XY_new))
         f_simu = np.array(process.getRealization()).reshape(-1,1)
         # Add zone effects
-        f_simu += np.dot( np.array(self.U(XY_new)), self.Eps )
-        return np.array(sigmoid(f_simu)).ravel()
+        return np.array(sigmoid(f_simu)).ravel() * np.dot( np.array(self.U(XY_new)), self.Lambda )[:,0]
             
-
-
 def py_link_function_Pi(x, Nmax, N):
     """
     Given the current state of the MCMC chain,
@@ -426,7 +423,6 @@ def py_link_function_Pi(x, Nmax, N):
     Returns
     -------
     param : list
-        Mean + Cholesky precision matrix
         in the order required by 
         the PoissonGaussianProcess class
         Size : 3*Nmax-2*N+J+1)
@@ -434,11 +430,8 @@ def py_link_function_Pi(x, Nmax, N):
     ftot = np.array(x)[:Nmax].reshape(-1,1)
     Pi = np.array(x)[2*Nmax:-J-1].reshape(-1,2)
     Ntot = int(x[-J-1])
-    Eps = np.array(x)[-J:].reshape(-1,1)
-    return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot], Eps.ravel()])
-   
-
-
+    Lambda = np.array(x)[-J:].reshape(-1,1)
+    return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot], Lambda.ravel()])
 
 #############################
 # Latent Polya-Gamma update # 
@@ -488,9 +481,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         w[:Ntot] = np.abs( random_polyagamma(z=np.array(self.ftot[:Ntot])[:,0]) )
         return w
 
-
-
-def py_link_function_w(x, Nmax):
+def py_link_function_w(x, Nmax, J=2):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional Polya
@@ -518,17 +509,18 @@ def py_link_function_w(x, Nmax):
 # Latent zones effects update # 
 ###############################
 
-def py_link_function_Eps(x, Nmax, D, U, PrecEps):
+
+def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
-    Eps, as required by the NormalCholesky class
+    Lambda, as required by the RV_Lambda class
 
     Parameters
     ----------
     x : array / list
         Current MCMC chain state
-        Size : 4*Nmax - 2*N + 1 + J
+        Size : 4*Nmax - 2*N + J + 1
     Nmax : int
         Max of Ntot (augmented Poisson process size)
     D : (N,2)
@@ -537,49 +529,39 @@ def py_link_function_Eps(x, Nmax, D, U, PrecEps):
         zone indicator functions
         given a point (x,y), outputs J 0-1 indicators,
         summing to 1
-    PrecEps : (J,J) 
-        Eps prior precision matrix
-    
+    PoissonScales: (J,)
+        list of J scale factors for Poisson distribution
+    a : (J,)
+        prior shape parameters for Gamma distribution of Lambdas
+    b : (J,)
+        prior rate parameters for Gamma distribution of Lambdas
+
     Returns
     -------
     param : list
-        Mean + Cholesky precision matrix + Ntot value
-        in the order required by NormalCholesky class
-        Size : Nmax*(Nmax+1)+1
+        posterior shape and rate parameters for Gamma distribution of Lambdas
+        in the order required by the RV_Lambdas class
+        Size : J*3
     """
-    # Extract cuurent state of conditioning variables
+    # Extract current state of conditioning variables
     N=len(D)
     Ntot = int(x[-J-1])
-    ftot = ot.Matrix(np.array(x)[:Ntot].reshape(-1,1))
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     # total (augmented) data
     Dtot = ot.Sample(Ntot, 2)
     Dtot[:N] = D
     Dtot[N:] = Pi
-    # precision matrix
-    K = covarianceModel.computeCrossCovariance(Dtot,Dtot)
-    K = ot.CovarianceMatrix(K)
-    L = K.computeCholesky()
-    Linv = L.inverse()
-    # Kinv = Linv.transpose()*Linv   
-    Utot = U_OT(Dtot)    
-    LU = ot.Matrix( Linv * Utot ) 
-    Q = LU.transpose() * LU + PrecEps
-    # invert 
-    M = ot.CovarianceMatrix(Q).computeCholesky()
-    Minv = M.inverse()
-    V = Minv.transpose() * Minv
-    mean = V * LU.transpose() * (Linv * ftot)
-    # extract parameters in correct order (coherent with getParameter() method of RV_f)
-    parameter = [0]*( J*(J+1)+1 )
-    parameter[:J] = np.array(mean).ravel()
-    parameter[J:-1] = np.array(Minv).ravel()
-    parameter[-1] = J
+    # Compute number of points in each zone
+    U_Dtot = np.array(U(Dtot))
+    Nk = U_Dtot.sum(axis=0).reshape(-1,1)
+    # extract parameters in correct order (coherent with getParameter() method of RV_Lambdas)
+    parameter = np.zeros( J*3 )
+    parameter[::3] = a + Nk.ravel() # shape parameters
+    parameter[1::3] = b + PoissonScales  # rate parameters
     return parameter
 
 if __name__ == "__main__":
     
-
     ####################
     # Generative model #
     ####################
@@ -587,7 +569,6 @@ if __name__ == "__main__":
     # Assuming square domain [0,1]*[0,1] (surface 1)
     # and null trend
     
-    lambdaBar = 10
     T = 50
     
     def U(xy):
@@ -597,41 +578,32 @@ if __name__ == "__main__":
         return u
 
     U_OT = ot.PythonFunction( 2, 2, U )
-    Sigma_eps = ot.CovarianceMatrix( np.eye(2)*1E-2 ) 
-    PrecEps = Sigma_eps.inverse()
     J = 2
+    PoissonScales = T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
+    LambdaTrue = np.array([[0.5],[1.5]]) # true zones effects   
     
-    # Add piecewise constant trend
-    EpsTrue = np.array( ot.Normal( ot.Point(J), Sigma_eps ).getRealization() ).reshape(-1,1)
-    # Utot = np.array( U_OT( XY_star ) )
-    # mTot = np.dot( Utot, EpsTrue )
-
-    def trend(X, eps=EpsTrue):
-        Utot = np.array( U_OT( X ) )
-        mTot = np.dot( Utot, eps )
-        return mTot
+    # prior on zone effects
+    a = PoissonScales * 1.
+    b = PoissonScales
     
     # GP model specification
     covarianceModel = ot.SquaredExponential([0.5, 0.5], [10.0])
-    m = ot.PythonFunction(2, 1, trend)
-    
-    # Homogeneous augmented Poisson process Size
-    Poisson = ot.Poisson(lambdaBar * T)
-    
+    m = ot.PythonFunction(2, 1, lambda x:[0])
+        
+    LambdaMax = LambdaTrue.max()
     # Upper bound on size of augmented Poisson process
-    Nmax = int(Poisson.computeQuantile(1-1e-20)[0])*2
-    
-    # Zoning covariables : two zones with a four-sided intersection point
-    J = 2 # number of zones
-
+    Nmax = int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-20)[0])*2 
+    # this is a very crude upper bound, but it allows to avoid crashes due to size issues during MCMC updates. 
+    # It can be set to a lower value to speed up computations, at the risk of crashes.    
 
     ###################
     # Data generation #
     ###################
     
-    # Simulate according to homogogeneous Poisson process
-    N_star = int(Poisson.getRealization()[0])
+    # Simulate according to homogogeneous Poisson process over search domain
+    N_star = int( ot.Poisson(LambdaMax*T).getRealization()[0] )
     myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
+    
     XY_star = myUniform.getSample(N_star)
     mesh = ot.Mesh(XY_star)
     
@@ -646,7 +618,8 @@ if __name__ == "__main__":
     field_f = process.getRealization()
      
     # Use thinning
-    p_accept = np.array( field_f.getValues() )
+    U_star = np.array( U_OT(XY_star) )
+    p_accept = np.array( field_f.getValues() ) * np.dot( U_star, LambdaTrue ) / LambdaMax
     accepted = np.array( ot.Uniform(0, 1).getSample(N_star) ) <= p_accept 
     accepted = accepted.ravel()
     N = accepted.sum()
@@ -672,7 +645,7 @@ if __name__ == "__main__":
 
     # Plot the data
     fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1], c=p_accept[accepted] *lambdaBar*T )
+    plt.scatter( D[:,0], D[:,1])
     plt.colorbar()
     # plt.show()
     plt.savefig("Data.png")
@@ -690,12 +663,12 @@ if __name__ == "__main__":
     f_indices = [i for i in range(Nmax)]
     # Augmented Gaussian Process update
     RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
-    ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, U=U_OT, covarianceModel=covarianceModel))
+    ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, covarianceModel=covarianceModel))
 
     
     # Latent Poisson and Gaussian Process update
     Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
-    PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Eps=EpsTrue, D=D, U=U_OT, covarianceModel=covarianceModel, Poisson=Poisson, myUniform=myUniform )
+    PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Lambda=LambdaTrue, D=D, U=U_OT, covarianceModel=covarianceModel, PoissonScale=T, Uniform=myUniform )
     RV_Pi = ot.RandomVector(PyRV_Pi)
     ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N))
 
@@ -703,13 +676,12 @@ if __name__ == "__main__":
     # Latent Polya Gamma Process update
     w_indices = [i for i in range(Nmax,2*Nmax)]
     RV_w = ot.RandomVector(PolyaGammaProcess(ftot=np.concatenate([np.array(field_f).ravel(), np.zeros(Nmax-Ntot)]), Ntot=Ntot))
-    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax))
+    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax, J=J))
     
     # Latent zone effects update
-    Eps_indices = [i for i in range(4*Nmax-2*N+1,4*Nmax-2*N+J+1)]
-    RV_Eps = ot.RandomVector(NormalCholesky(mu=np.zeros(J), Chol=np.eye(J), Ntot=J))
-    ot_link_function_Eps = ot.PythonFunction(4*Nmax-2*N+J+1, J*(J+1)+1, lambda x:py_link_function_Eps(x,Nmax=Nmax, D=D, U=U_OT, PrecEps=PrecEps))
-    
+    Lambda_indices = [i for i in range(4*Nmax-2*N+1,4*Nmax-2*N+J+1)]
+    RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*J))
+    ot_link_function_Lambda = ot.PythonFunction(4*Nmax-2*N+J+1, J*3, lambda x:py_link_function_Lambda(x,Nmax=Nmax, D=D, U=U_OT, PoissonScales=PoissonScales, a=a, b=b))
     # TEST latent GP update
     RV_f.getRealization()
     RV_f.getParameter()
@@ -720,8 +692,8 @@ if __name__ == "__main__":
     RV_w.getRealization()
     RV_w.getParameter()
     # TEST latent Zone effects
-    RV_Eps.getRealization()
-    RV_Eps.getParameter()
+    RV_Lambda.getRealization()
+    RV_Lambda.getParameter()
     
     # Plot Real GP trajectory on meshgrid over search domain
     gridsize = 20
@@ -731,7 +703,7 @@ if __name__ == "__main__":
     Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
     # Z_True = m( XY_new )
         
-    Z_True = np.array(Z_True).reshape(gridsize, gridsize) * lambdaBar * T
+    Z_True = np.array(Z_True).reshape(gridsize, gridsize) * T
     levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
     
     fig = plt.figure()
@@ -754,22 +726,22 @@ if __name__ == "__main__":
         randinit = np.zeros(4*Nmax-2*N+1+J)
         Ntot_init = 0
         while Ntot_init < N:
-            Ntot_init = int(ot.Poisson(lambdaBar * T).getRealization()[0])
+            Ntot_init = int(ot.Poisson(LambdaMax * T).getRealization()[0])
         randinit[-1-J] = Ntot_init
         NPi_init = int(Ntot_init - N)
         Pi_init = np.array(myUniform.getSample(NPi_init)).ravel()
         randinit[2*Nmax:2*Nmax+2*NPi_init] = Pi_init 
         randinit[Nmax:Nmax+Ntot_init] = random_polyagamma(size=Ntot_init)
         # check whether useful:
-        randinit[-J:] = np.array( ot.Normal( ot.Point(J), Sigma_eps ).getRealization() )
+        randinit[-J:] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(J)]
         randinits.append(randinit)
         # Assemble Gibbs sampler
         print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
         f_sampler = ot.RandomVectorMetropolisHastings( RV_f, randinits[i], f_indices, ot_link_function_f )
         Pi_sampler = ot.RandomVectorMetropolisHastings( RV_Pi, randinits[i], Pi_indices, ot_link_function_Pi ) 
         w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], w_indices, ot_link_function_w )
-        Eps_sampler = ot.RandomVectorMetropolisHastings( RV_Eps, randinits[i], Eps_indices, ot_link_function_Eps )
-        Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, Eps_sampler])
+        Lambda_sampler = ot.RandomVectorMetropolisHastings( RV_Lambda, randinits[i], Lambda_indices, ot_link_function_Lambda )
+        Gibbs_sampler = ot.Gibbs([f_sampler, Pi_sampler, w_sampler, Lambda_sampler])
         t1=time.time()
         sample = np.zeros((0,4*Nmax-2*N+J+1))
         # Main loop
@@ -795,8 +767,8 @@ if __name__ == "__main__":
     # plotDim = 1
     
     components = [j for j in range(paramDim-1-J,paramDim)] 
-    names = [r"$N_{tot}$"] + [r"$\epsilon_{%s}$"%j for j in range(1,J+1)]
-    true_values = [Ntot] + EpsTrue.ravel().tolist()
+    names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,J+1)]
+    true_values = [Ntot] + LambdaTrue.ravel().tolist()
     
     # MCMC convergence plot for Ntot
     fig = plt.figure( figsize=(5*J,5) )
@@ -897,10 +869,10 @@ if __name__ == "__main__":
         PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, N))
         Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new )
         
-    Z_mean = Z_new.mean(axis=0).reshape(gridsize, gridsize) * lambdaBar * T
+    Z_mean = Z_new.mean(axis=0).reshape(gridsize, gridsize) * T
     levels_mean = np.linspace( Z_mean.min(), Z_mean.max(), gridsize )
     
-    Z_std = Z_new.std(axis=0).reshape(gridsize, gridsize) * lambdaBar * T
+    Z_std = Z_new.std(axis=0).reshape(gridsize, gridsize) * T
     levels_std = np.linspace( Z_std.min(), Z_std.max(), gridsize)
     
     fig = plt.figure()
