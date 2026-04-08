@@ -326,8 +326,10 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         algo.run()
         gpr_result = algo.getResult()        
         # print(gpr_result)
+        # print(gpr_result)
         return gpr_result
     
+        # print(gpr_result)
     def getRealization(self):
         """
         Simulates one realization of the latent Poisson process
@@ -569,7 +571,7 @@ if __name__ == "__main__":
     # Assuming square domain [0,1]*[0,1] (surface 1)
     # and null trend
     
-    T = 50
+    T = 100
     
     def U(xy):
         u = [0, 0]
@@ -580,19 +582,19 @@ if __name__ == "__main__":
     U_OT = ot.PythonFunction( 2, 2, U )
     J = 2
     PoissonScales = T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
-    LambdaTrue = np.array([[0.5],[1.5]]) # true zones effects   
+    LambdaTrue = np.array([[0.2],[4.]]) # true zones effects   
     
     # prior on zone effects
     a = PoissonScales * 1.
     b = PoissonScales
     
     # GP model specification
-    covarianceModel = ot.SquaredExponential([0.5, 0.5], [10.0])
+    covarianceModel = ot.SquaredExponential([0.1, 0.1], [0.5])
     m = ot.PythonFunction(2, 1, lambda x:[0])
         
     LambdaMax = LambdaTrue.max()
     # Upper bound on size of augmented Poisson process
-    Nmax = int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-20)[0])*2 
+    Nmax = int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-6)[0])*2
     # this is a very crude upper bound, but it allows to avoid crashes due to size issues during MCMC updates. 
     # It can be set to a lower value to speed up computations, at the risk of crashes.    
 
@@ -655,8 +657,8 @@ if __name__ == "__main__":
     # MCMC parameters # 
     ###################
     
-    sampleSize=100#0
-    blockSize=10#0 # Display convergence messages after every block of iterations with size: blockSize
+    sampleSize=100
+    blockSize=10 # Display convergence messages after every block of iterations with size: blockSize
     ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
     
 
@@ -709,6 +711,7 @@ if __name__ == "__main__":
     fig = plt.figure()
     plt.contourf(xx, yy, Z_True, levels)
     plt.colorbar()
+    plt.scatter( D[:,0], D[:,1], c='r')
     # plt.show()
     plt.savefig('True_GP_trend.png')
     plt.close()
@@ -770,7 +773,7 @@ if __name__ == "__main__":
     names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,J+1)]
     true_values = [Ntot] + LambdaTrue.ravel().tolist()
     
-    # MCMC convergence plot for Ntot
+    # MCMC convergence plots
     fig = plt.figure( figsize=(5*J,5) )
     for i, X, c in zip( range(ninits), samples, colors ):
         # break
@@ -855,7 +858,7 @@ if __name__ == "__main__":
             print(st.mstats.mquantiles(X, p)[0])
     
     plt.tight_layout()
-    plt.savefig("Ntot_post_density.png")
+    plt.savefig("post_density.png")
     plt.close()
     
     #######################################
