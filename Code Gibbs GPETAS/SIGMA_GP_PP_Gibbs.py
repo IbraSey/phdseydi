@@ -27,6 +27,8 @@ np.random.seed(0) # Make results reproducible by freezing Numpy's random generat
 
 sigmoid = ot.SymbolicFunction(['z'], ['1/(1+exp(-z))'])
 
+sigmoid_inv = ot.SymbolicFunction(['q'], ['ln( q/(1-q) )'])
+
 
 ##################################
 # Latent Gaussian process update # 
@@ -153,6 +155,7 @@ def py_link_function_f(x, Nmax, D, covarianceModel):
     """
     # Extract cuurent state of conditioning variables
     N=len(D)
+    J = U.getOutputDimension()
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
@@ -189,7 +192,6 @@ def py_link_function_f(x, Nmax, D, covarianceModel):
     parameter[Nmax:Nmax+Ntot*Ntot] = np.array(Linv).ravel()
     parameter[-1] = Ntot
     return parameter
-
 
 
 #################################################
@@ -290,7 +292,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+J+1)
+        parameter = np.zeros(3*Nmax-2*N+self.J+1)
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
         parameter[-J-1] = Ntot
@@ -419,8 +421,8 @@ def py_link_function_Pi(x, Nmax, N):
         Size : 4*Nmax-2*N+1
     Nmax : int
         Max of Ntot (augmented Poisson process size)
-    N : int
-        Sample size
+    J : int
+        number of zones
 
     Returns
     -------
@@ -495,6 +497,7 @@ def py_link_function_w(x, Nmax, J=2):
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax-2*N+1
+    
 
     Returns
     -------
@@ -505,7 +508,6 @@ def py_link_function_w(x, Nmax, J=2):
         Size : Nmax+1
     """
     return np.hstack(( np.array(x)[:Nmax], [x[-J-1]] ))
-
 
 ###############################
 # Latent zones effects update # 
@@ -613,10 +615,9 @@ if __name__ == "__main__":
     mTrend = ot.TrendTransform(m, mesh)
     Ftot = ot.GaussianProcess(mTrend, covarianceModel, mesh)
     
-    # Sigma GP process
+    # # Sigma GP process
     field_function = ot.PythonFieldFunction(mesh, 1, mesh, 1, sigmoid)
     process = ot.CompositeProcess(field_function, Ftot) 
-    
     field_f = process.getRealization()
      
     # Use thinning
@@ -637,9 +638,10 @@ if __name__ == "__main__":
     
     # Assemble Augmented (Obs + Latent) Gaussian process
     # /!\ Zero-padded to reach Nmax length
-    fD = np.array(field_f)[accepted]
-    fPi = np.array(field_f)[accepted==False]
+    fD = np.array(sigmoid_inv(field_f))[accepted]
+    fPi = np.array(sigmoid_inv(field_f))[accepted==False]
     ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
+    
     
     #######################
     # TEST ON TOY DATASET #
@@ -650,7 +652,7 @@ if __name__ == "__main__":
     plt.scatter( D[:,0], D[:,1])
     plt.colorbar()
     # plt.show()
-    plt.savefig("Data.png")
+    plt.savefig(os.path.join(savedir, "Data.png"))
     plt.close()
     
     ###################
@@ -667,13 +669,11 @@ if __name__ == "__main__":
     RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
     ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, covarianceModel=covarianceModel))
 
-    
     # Latent Poisson and Gaussian Process update
     Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
     PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Lambda=LambdaTrue, D=D, U=U_OT, covarianceModel=covarianceModel, PoissonScale=T, Uniform=myUniform )
     RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N))
-
+    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N, J=J))
     
     # Latent Polya Gamma Process update
     w_indices = [i for i in range(Nmax,2*Nmax)]
@@ -786,7 +786,7 @@ if __name__ == "__main__":
                 plt.xlabel("Iterations", fontsize=16)    
             plt.axhline(true_values[j], lw=2, c="k")
     plt.tight_layout()
-    plt.savefig("traceplots.png")
+    plt.savefig(os.path.join(savedir, "traceplots.png"))
     plt.close()
     
     # ACF (MCMC autocorrelation) plot 
@@ -799,7 +799,7 @@ if __name__ == "__main__":
                 plt.ylabel(names[j], fontsize=16)
                 plt.xlabel("Iterations", fontsize=16)  
     plt.tight_layout()
-    plt.savefig("ACF.png")
+    plt.savefig(os.path.join(savedir, "ACF.png"))
     plt.close()
     
     
@@ -836,8 +836,9 @@ if __name__ == "__main__":
         
         plt.xlabel("Iterations")
         plt.ylabel(r"$\widehat R$")
+
     plt.tight_layout()
-    plt.savefig("Gelman_Rubin.png")
+    plt.savefig(os.path.join(savedir, "Gelman_Rubin.png"))
     plt.close()
     
     # Pool chains
@@ -883,15 +884,15 @@ if __name__ == "__main__":
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
     plt.title("Poisson intensity posterior mean vs Data")
-    plt.savefig("f_post_mean.png")
+    plt.savefig(os.path.join(savedir, "f_post_mean.png"))
     plt.close()
     
     fig = plt.figure()
     plt.contourf(xx, yy, Z_std, levels_std)
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
-    plt.title("Poisson intensiety Posterior std vs Data")
-    plt.savefig("f_post_std.png")
+    plt.title("Poisson intensity Posterior std vs Data")
+    plt.savefig(os.path.join(savedir, "f_post_std.png"))
     plt.close()
     
     

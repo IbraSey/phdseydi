@@ -218,6 +218,7 @@ print(f"Variance pour le moddèle avec prior informatif : {out['squared_mu_hat']
 
 
 
+
 # %%
 
 
