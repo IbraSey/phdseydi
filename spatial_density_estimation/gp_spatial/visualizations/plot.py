@@ -81,7 +81,7 @@ def plot_process_dashboard(sim_data, grids, cmap="viridis",
     divider_f = make_axes_locatable(ax_f)
     cax_f = divider_f.append_axes("right", size="5%", pad=0.08)
     fig.colorbar(im_f, cax=cax_f, label=r"$f^\star(x,y)$")
-    ax_f.set_title(r"Latent field $f^\star$")
+    ax_f.set_title(r"Latent field $f^\star$" + "\n")
 
     # ---------------------------------------------------------
     # EN HAUT À DROITE : Intensité vraie mu*
@@ -91,7 +91,7 @@ def plot_process_dashboard(sim_data, grids, cmap="viridis",
     divider_mu = make_axes_locatable(ax_mu)
     cax_mu = divider_mu.append_axes("right", size="5%", pad=0.08)
     fig.colorbar(im_mu, cax=cax_mu, label=r"$\mu^\star(x,y)$")
-    ax_mu.set_title(r"True intensity $\mu^\star = \tilde{\mu} \cdot \sigma(f^\star)$")
+    ax_mu.set_title(r"True intensity $\mu^\star = \tilde{\mu} \cdot \sigma(f^\star)$" + "\n")
 
     # ---------------------------------------------------------
     # EN BAS À GAUCHE : Événements seuls (Points)
@@ -99,10 +99,10 @@ def plot_process_dashboard(sim_data, grids, cmap="viridis",
     ax_pts = fig.add_subplot(gs[1, 0])
     if N > 0:
         ax_pts.scatter(X_array[:, 0], X_array[:, 1], s=4, c="crimson", alpha=0.7, lw=0.4, zorder=3)
-    ax_pts.set_title(f"Simulated events (N={N})")
-    divider_pts = make_axes_locatable(ax_pts)
-    #cax_pts = divider_pts.append_axes("right", size="5%", pad=0.08)
-    #cax_pts.set_visible(False)
+    ax_pts.set_title("\n" + f"Simulated events (N={N})" + "\n")
+    # divider_pts = make_axes_locatable(ax_pts)
+    # cax_pts = divider_pts.append_axes("right", size="5%", pad=0.08)
+    # cax_pts.set_visible(False)
 
     # ---------------------------------------------------------
     # EN BAS À DROITE : Données + Zones de fond
@@ -116,12 +116,12 @@ def plot_process_dashboard(sim_data, grids, cmap="viridis",
         ax_zon.plot(xs, ys, lw=0.8, zorder=2)
         ax_zon.text(zone.centroid.x, zone.centroid.y, rf"$\tilde\mu={mus_np[i]:.1f}$", ha="center", va="center", 
                      fontsize=9, fontweight="bold", bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
-    #if N > 0:
-    #    ax_zon.scatter(X_array[:, 0], X_array[:, 1], s=3, c="crimson", alpha=0.4, zorder=3)
-    #ax_zon.set_title("Areas", fontsize=11)
-    #divider_zon = make_axes_locatable(ax_zon)
-    #cax_zon = divider_zon.append_axes("right", size="5%", pad=0.08)
-    #fig.colorbar(im_mu, cax=cax_zon)
+    if N > 0:
+       ax_zon.scatter(X_array[:, 0], X_array[:, 1], s=3, c="crimson", alpha=0.4, zorder=3)
+    ax_zon.set_title("\n" + "Areas" + "\n", fontsize=11)
+    # divider_zon = make_axes_locatable(ax_zon)
+    # cax_zon = divider_zon.append_axes("right", size="5%", pad=0.08)
+    # fig.colorbar(im_mu, cax=cax_zon)
 
     # ----------------------------------
     # Mise en forme commune
@@ -201,7 +201,7 @@ def plot_voronoi_cells(
     ax.set_xlim(X_bounds)
     ax.set_ylim(Y_bounds)
     ax.set_aspect("equal")
-    ax.set_title(title, fontsize=12)
+    ax.set_title(title + "\n", fontsize=12)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.grid(alpha=0.3)

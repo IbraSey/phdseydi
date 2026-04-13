@@ -736,10 +736,10 @@ class iSGCP_GibbsSampler:
             print("-" * 41 + " Gibbs terminé !! " + "-" * 41)
             print("=" * 100 + "\n")
             print(f"eps acceptance rate : {np.round(acc_eps / n_iter * 100, 1)}%"
-                  f"(target ~57% -> {'increase' if acc_eps/n_iter > 0.57 else 'decrease'} mala_step)")
+                  f"( target ~57% -> {'increase' if acc_eps/n_iter > 0.57 else 'decrease'} mala_step)")
             if learn_nu:
                 print(f"nu acceptance rate : {np.round(acc_nu  / n_iter * 100, 1)}%"
-                      f"(target ~23% -> {'increase' if acc_nu/n_iter > 0.23 else 'decrease'} step_nu_init)")
+                      f" (target ~23% -> {'increase' if acc_nu/n_iter > 0.23 else 'decrease'} step_nu_init)")
 
         return {
             "eps"            : eps_chain,
@@ -798,7 +798,7 @@ class iSGCP_GibbsSampler:
 
     def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3,
                              cmap="viridis", savefigure=False, title_savefig="posterior",
-                             savefigure_Emu=False, title_savefig_Emu="Emu",
+                             savefigure_Emu=False, title_savefig_Emu="Emu", color_Emu="steelblue",
                              mu_star_func=None):
         """
         
@@ -853,10 +853,10 @@ class iSGCP_GibbsSampler:
             E_mu_bar = E_mu_post.mean()
 
             fig_err, ax_err = plt.subplots(figsize=(9, 3))
-            ax_err.plot(iters_post, E_mu_post, linewidth=0.8, color="steelblue")
+            ax_err.plot(iters_post, E_mu_post, linewidth=0.8, color=color_Emu)
             ax_err.set_xlabel("Iteration")
             ax_err.set_ylabel(r"$\mathcal{E}_\mu^{(t)}$")
-            ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$")
+            ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$\n")
             ax_err.grid(alpha=0.3)
             plt.tight_layout()
 
@@ -883,11 +883,12 @@ class iSGCP_GibbsSampler:
             mu_star_grid = mu_star_func(grid_xy[:, 0], grid_xy[:, 1])
 
             mu_star_sample = ot.Sample([[val] for val in mu_star_grid])
-            mu_star_field = ot.Field(mesh, mu_star_sample)
+            mu_star_field  = ot.Field(mesh, mu_star_sample)
 
-            diff = np.abs(mu_hat - mu_star_grid)
+            #diff = np.abs(mu_hat - mu_star_grid)
+            diff = np.abs(mu_hat - mu_star_grid) / (mu_star_grid + self.jitter)
             diff_sample = ot.Sample([[val] for val in diff])
-            diff_field = ot.Field(mesh, diff_sample)
+            diff_field  = ot.Field(mesh, diff_sample)
 
         # ---------- Figure ----------
         if mu_star_func is not None:
@@ -895,20 +896,21 @@ class iSGCP_GibbsSampler:
 
             ax = axes[0]
             plot_field(mu_star_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Vraie intensité $\mu^\star(s)$")
+            ax.set_title(r"Vraie intensité $\mu^\star(s)$\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$")
+            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$\n")
             # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[2]
             plot_field(diff_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"$|\hat{\mu}(s) - \mu^\star(s)|$")
+            #ax.set_title(r"$|\hat{\mu}(s) - \mu^\star(s)|$\n")
+            ax.set_title(r"Erreur relative $\frac{|\hat{\mu}(s) - \mu^\star(s)|}{\mu^\star(s)}$\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
@@ -917,15 +919,15 @@ class iSGCP_GibbsSampler:
 
             ax = axes[0]
             ax.scatter(x, y, c=t, s=12, alpha=0.7, edgecolors="black", cmap="plasma")
-            ax.set_title(f"Données observées (N={N})")
+            ax.set_title(f"Données observées (N={N})\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.set_aspect("equal", adjustable="box"); ax.grid(alpha=0.3)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            # ax.set_title(r"Intensité a posteriori $\hat{\mu}(s)$")
+            # ax.set_title(r"Intensité a posteriori $\hat{\mu}(s)$\n")
             # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$")
+            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
@@ -948,18 +950,19 @@ class iSGCP_GibbsSampler:
         plt.show()
 
         return {
-            "mu_hat"         : mu_hat,
-            "mu_star"        : mu_star_grid,
-            "diff"           : mu_hat - mu_star_grid if mu_star_grid is not None else None,
-            "squared_mu_hat" : squared_mu_hat,
-            "mu_field"       : mu_hat_field,
-            "mesh"           : mesh,
-            "mu_post_gp"     : mu_post_grid,
-            "Sigma_post_gp"  : Sigma_post_grid,
-            "eps_hat"        : eps_hat,
-            "f_data_hat"     : f_data_hat,
-            "E_mu_bar"       : E_mu_bar,
-            "E_mu_chain"     : E_mu_post,
+            "mu_hat"        : mu_hat,
+            "mu_star"       : mu_star_grid,
+            #"diff"          : diff if mu_star_grid is not None else None,
+            "diff"          : diff if mu_star_grid is not None else None,
+            "squared_mu_hat": squared_mu_hat,
+            "mu_field"      : mu_hat_field,
+            "mesh"          : mesh,
+            "mu_post_gp"    : mu_post_grid,
+            "Sigma_post_gp" : Sigma_post_grid,
+            "eps_hat"       : eps_hat,
+            "f_data_hat"    : f_data_hat,
+            "E_mu_bar"      : E_mu_bar,
+            "E_mu_chain"    : E_mu_post,
         }
     
     def plot_chains(self, results, figsize=(9, 5), savefigure=False):
