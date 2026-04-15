@@ -25,12 +25,25 @@ ot.RandomGenerator.SetSeed(42)
 # ------------------------------------------ FONCTIONS DE PLOT ------------------------------------------
 # =======================================================================================================
 
-def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, add_colorbar=True):
-    mesh = field.getMesh()
+def plot_field(
+    field,
+    mode="plot",
+    ax=None,
+    title=None,
+    vmin=None,
+    vmax=None,
+    cmap="viridis",
+    add_colorbar=True,
+    savefigure=True,
+    title_savefig="field_output.pdf",
+):
+    """
 
-    x = mesh.getVertices().getMarginal(0)
-    y = mesh.getVertices().getMarginal(1)
-    z = field.getValues()
+    """
+    mesh = field.getMesh()
+    x    = mesh.getVertices().getMarginal(0)
+    y    = mesh.getVertices().getMarginal(1)
+    z    = field.getValues()
 
     x_unique = np.unique(x)
     y_unique = np.unique(y)
@@ -45,16 +58,35 @@ def plot_field(field, mode="plot", ax=None, title=None, vmin=None, vmax=None, ad
         fig, ax_local = plt.subplots(figsize=(6, 4))
     elif mode == "subplot":
         if ax is None:
-            raise ValueError("En mode 'subplot', fournir un axe via le paramètre ax")
+            raise ValueError("En mode 'subplot', fournir un axe via le paramètre ax.")
         fig, ax_local = ax.figure, ax
     else:
-        raise ValueError("mode doit être 'plot' ou 'subplot' !")
+        raise ValueError("mode doit être 'plot' ou 'subplot'.")
 
-    contour = ax_local.contourf(X, Y, Z, levels=15, vmin=vmin, vmax=vmax)
+    contour = ax_local.contourf(X, Y, Z, levels=15, vmin=vmin, vmax=vmax, cmap=cmap)
+
     if add_colorbar:
         fig.colorbar(contour, ax=ax_local)
+
     if title:
         ax_local.set_title(title)
+
+    if savefigure:
+        if mode != "plot":
+            print("[plot_field] Sauvegarde ignorée : disponible uniquement en mode 'plot'.")
+        else:
+            try:
+                try:
+                    ROOT = Path(__file__).resolve().parent.parent
+                except NameError:
+                    ROOT = Path(".").resolve()
+                FIGURES_DIR = ROOT / "visualizations" / "figures"
+                FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+                fig.savefig(FIGURES_DIR / title_savefig,
+                            dpi=200, bbox_inches="tight")
+                print(f"Figure sauvegardée : {FIGURES_DIR / title_savefig}")
+            except Exception as e:
+                print(f"Erreur lors de la sauvegarde : {e}")
 
     return fig, ax_local, contour
 

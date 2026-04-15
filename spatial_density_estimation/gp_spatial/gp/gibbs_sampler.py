@@ -77,12 +77,18 @@ class iSGCP_GibbsSampler:
         x = np.asarray(x)
         x = x - x.mean()
         n = len(x)
+
+        max_lag = min(max_lag, n - 1)       # max_lag ne peut pas dépasser n-1
+        if max_lag < 0:
+            return np.array([1.0])
+
         var = np.dot(x, x) / n
         if var == 0.0:
             return np.zeros(max_lag + 1)
+
         acf_vals = np.empty(max_lag + 1)
         for k in range(max_lag + 1):
-            acf_vals[k] = np.dot(x[: n - k], x[k:]) / (n * var)
+            acf_vals[k] = np.dot(x[:n - k], x[k:]) / (n * var)
         return acf_vals
 
     def compute_Sigma_eps(self):
@@ -582,7 +588,7 @@ class iSGCP_GibbsSampler:
 
     def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
-        mu_star_func=None,grid_nx=30, grid_ny=30): 
+        mu_star_func=None,grid_nx=30, grid_ny=30, thin=1): 
 
         N = len(t)
         Z = ot.Point([0.0] * N)
@@ -627,11 +633,13 @@ class iSGCP_GibbsSampler:
             mu_star_grid = None
 
         # ---------- Stockage ----------
-        eps_chain = np.zeros((n_iter, self.J))
-        nPi_chain = np.zeros(n_iter, dtype=int)
-        fdata_chain = np.zeros((n_iter, N))
-        nu_chain  = np.zeros((n_iter, 2))
-        E_mu_chain = np.full(n_iter, np.nan)   
+        n_store = (n_iter + thin - 1) // thin
+        eps_chain = np.zeros((n_store, self.J))
+        nPi_chain = np.zeros(n_store, dtype=int)
+        fdata_chain = np.zeros((n_store, N))
+        nu_chain = np.zeros((n_store, 2))
+        E_mu_chain = np.full(n_iter, np.nan)      # Je garde toutes les it pour E_mu
+        store_idx = 0       # compteur de stockage
         acc_eps = 0
         acc_nu = 0
         history_log_nu = []         # used only when learn_nu=True
@@ -656,7 +664,7 @@ class iSGCP_GibbsSampler:
 
                 # Step 3 : f | omega_D0, pi_S ~ N(mu_post, Sigma_post) 
                 f_D0, f_Df, D_f_xy, K_ff = self.update_f(x, y, Z, omega_D0, Pi_S)
-                f_data = f_D0    # restriction à D_0 déjà faite dans update_f
+                # f_data = f_D0    # restriction à D_0 déjà faite dans update_f
 
                 # Extract f at observed locations D_0 (first N_0 entries of D_f)
                 idx_D0 = [i for i in range(N) if Z[i] == 0.0]
@@ -673,8 +681,7 @@ class iSGCP_GibbsSampler:
                 if learn_nu:
                     history_log_nu.append(np.log(np.array(self.nu)))
                     _, accepted_nu = self.update_nu(
-                        f_Df, D_f_xy, history_log_nu, it,
-                        step_nu_init=step_nu_init, t0=t0_nu
+                        f_Df, D_f_xy, history_log_nu, it, step_nu_init=step_nu_init, t0=t0_nu
                     )
                     acc_nu += int(accepted_nu)
 
@@ -722,10 +729,12 @@ class iSGCP_GibbsSampler:
                     E_mu_chain[it] = (domain_area / M_grid) * np.sum((mu_draw_g - mu_star_grid) ** 2)
 
                 # ---------- Stockage ----------
-                eps_chain[it, :] = eps_arr
-                nPi_chain[it] = Pi_S.getSize()
-                fdata_chain[it,:] = np.array(f_data)
-                nu_chain[it, :] = np.array(self.nu)
+                if it % thin == 0:
+                    eps_chain[store_idx, :] = eps_arr
+                    nPi_chain[store_idx] = Pi_S.getSize()
+                    fdata_chain[store_idx, :] = np.array(f_data)
+                    nu_chain[store_idx, :] = np.array(self.nu)
+                    store_idx += 1
 
             except Exception as e:
                 print(f"\nError at iteration {it} : {e}")
@@ -736,22 +745,24 @@ class iSGCP_GibbsSampler:
             print("-" * 41 + " Gibbs terminé !! " + "-" * 41)
             print("=" * 100 + "\n")
             print(f"eps acceptance rate : {np.round(acc_eps / n_iter * 100, 1)}%"
-                  f"( target ~57% -> {'increase' if acc_eps/n_iter > 0.57 else 'decrease'} mala_step)")
+                  f" (target ~57% -> {'increase' if acc_eps/n_iter > 0.57 else 'decrease'} mala_step)")
             if learn_nu:
                 print(f"nu acceptance rate : {np.round(acc_nu  / n_iter * 100, 1)}%"
                       f" (target ~23% -> {'increase' if acc_nu/n_iter > 0.23 else 'decrease'} step_nu_init)")
 
         return {
-            "eps"            : eps_chain,
-            "nPi"            : nPi_chain,
-            "f_data"         : fdata_chain,
-            "nu"             : nu_chain,
-            "E_mu"           : E_mu_chain,   # NaN si mu_star_func=None
+            "eps"            : eps_chain[:store_idx],
+            "nPi"            : nPi_chain[:store_idx],
+            "f_data"         : fdata_chain[:store_idx],
+            "nu"             : nu_chain[:store_idx],
+            "E_mu"           : E_mu_chain,
             "acceptance_eps" : acc_eps / n_iter,
             "acceptance_nu"  : acc_nu / n_iter if learn_nu else None,
             "last_state"     : {"eps": eps_arr, "nu": list(self.nu), "delta": list(self.delta)},
             "Sigma_eps"      : self.Sigma_eps,
             "centroids"      : self.centroids_xy,
+            "thin"           : thin,
+            "n_iter"         : n_iter,
         }
     
 
@@ -795,14 +806,24 @@ class iSGCP_GibbsSampler:
         Sigma_post = ot.CovarianceMatrix(Sigma_arr.tolist())
 
         return mu_post, Sigma_post
+    
+
+
+
+
+
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+    ######################################### CHECKPOINT VERIF #########################################
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
 
     def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3,
                              cmap="viridis", savefigure=False, title_savefig="posterior",
                              savefigure_Emu=False, title_savefig_Emu="Emu", color_Emu="steelblue",
                              mu_star_func=None):
-        """
-        
-        """
         post_sum = self.posterior_summary(results, burn_in)
         eps_hat = post_sum["eps_hat"]
         f_data_hat = post_sum["f_data_hat"]
@@ -818,7 +839,7 @@ class iSGCP_GibbsSampler:
         mesher = ot.IntervalMesher([nx - 1, ny - 1])
         mesh = mesher.build(interval)
         M = mesh.getVertices().getSize()
-        if M > 15000:
+        if M > 22500:
             raise ValueError(f"Mesh too large : {M} points")
 
         mu_post_grid, Sigma_post_grid = self.posterior_gp(
@@ -856,7 +877,7 @@ class iSGCP_GibbsSampler:
             ax_err.plot(iters_post, E_mu_post, linewidth=0.8, color=color_Emu)
             ax_err.set_xlabel("Iteration")
             ax_err.set_ylabel(r"$\mathcal{E}_\mu^{(t)}$")
-            ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$\n")
+            ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$" + "\n")
             ax_err.grid(alpha=0.3)
             plt.tight_layout()
 
@@ -883,7 +904,7 @@ class iSGCP_GibbsSampler:
             mu_star_grid = mu_star_func(grid_xy[:, 0], grid_xy[:, 1])
 
             mu_star_sample = ot.Sample([[val] for val in mu_star_grid])
-            mu_star_field  = ot.Field(mesh, mu_star_sample)
+            mu_star_field = ot.Field(mesh, mu_star_sample)
 
             #diff = np.abs(mu_hat - mu_star_grid)
             diff = np.abs(mu_hat - mu_star_grid) / (mu_star_grid + self.jitter)
@@ -896,21 +917,21 @@ class iSGCP_GibbsSampler:
 
             ax = axes[0]
             plot_field(mu_star_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Vraie intensité $\mu^\star(s)$\n")
+            ax.set_title(r"Vraie intensité $\mu^\star(s)$" + "\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$\n")
+            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
             # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[2]
             plot_field(diff_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            #ax.set_title(r"$|\hat{\mu}(s) - \mu^\star(s)|$\n")
-            ax.set_title(r"Erreur relative $\frac{|\hat{\mu}(s) - \mu^\star(s)|}{\mu^\star(s)}$\n")
+            #ax.set_title(r"$|\hat{\mu}(s) - \mu^\star(s)|$")
+            ax.set_title(r"Erreur relative $\frac{|\hat{\mu}(s) - \mu^\star(s)|}{\mu^\star(s)}$" + "\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
@@ -919,15 +940,15 @@ class iSGCP_GibbsSampler:
 
             ax = axes[0]
             ax.scatter(x, y, c=t, s=12, alpha=0.7, edgecolors="black", cmap="plasma")
-            ax.set_title(f"Données observées (N={N})\n")
+            ax.set_title(f"Données observées (N={N})" + "\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.set_aspect("equal", adjustable="box"); ax.grid(alpha=0.3)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            # ax.set_title(r"Intensité a posteriori $\hat{\mu}(s)$\n")
+            # ax.set_title(r"Intensité a posteriori $\hat{\mu}(s)$" + "\n")
             # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$\n")
+            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
             ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
@@ -950,33 +971,53 @@ class iSGCP_GibbsSampler:
         plt.show()
 
         return {
-            "mu_hat"        : mu_hat,
-            "mu_star"       : mu_star_grid,
-            #"diff"          : diff if mu_star_grid is not None else None,
-            "diff"          : diff if mu_star_grid is not None else None,
-            "squared_mu_hat": squared_mu_hat,
-            "mu_field"      : mu_hat_field,
-            "mesh"          : mesh,
-            "mu_post_gp"    : mu_post_grid,
-            "Sigma_post_gp" : Sigma_post_grid,
-            "eps_hat"       : eps_hat,
-            "f_data_hat"    : f_data_hat,
-            "E_mu_bar"      : E_mu_bar,
-            "E_mu_chain"    : E_mu_post,
+            "mu_hat"         : mu_hat,
+            "mu_star"        : mu_star_grid,
+            #"diff"           : np.abs(mu_hat - mu_star_grid) if mu_star_grid is not None else None,
+            "diff"           : diff if mu_star_grid is not None else None,
+            "squared_mu_hat" : squared_mu_hat,
+            "mu_field"       : mu_hat_field,
+            "mesh"           : mesh,
+            "mu_post_gp"     : mu_post_grid,
+            "Sigma_post_gp"  : Sigma_post_grid,
+            "eps_hat"        : eps_hat,
+            "f_data_hat"     : f_data_hat,
+            "E_mu_bar"       : E_mu_bar,
+            "E_mu_chain"     : E_mu_post,
         }
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+    ########################################## FIN CHECKPOINT ##########################################
+    ####################################################################################################
+    ####################################################################################################
+    ####################################################################################################
+
+
+
+
+
+
+
+
+
     
-    def plot_chains(self, results, figsize=(9, 5), savefigure=False):
+    def plot_chains(self, results, figsize=(9, 5), savefigure=False, title_savefig="traces_eps"):
         eps_chain = np.asarray(results["eps"])
         nu_chain = np.asarray(results["nu"])
-        n_iter = eps_chain.shape[0]
-        iters = np.arange(n_iter)
+        thin = results.get("thin", 1)
+        n_iter = results.get("n_iter", eps_chain.shape[0])
+        n_store = eps_chain.shape[0]
+
+        # Axe x en vraies itérations
+        iters = np.arange(n_store) * thin
 
         J = eps_chain.shape[1]
         fig, axes = plt.subplots(J, 2, figsize=(figsize[0], 3 * J), squeeze=False)
         for j in range(J):
             axes[j, 0].plot(iters, eps_chain[:, j], linewidth=1)
             axes[j, 0].set_title(rf"Trace $\epsilon_{j}$")
-            axes[j, 0].set_xlabel("Iteration")
+            axes[j, 0].set_xlabel(f"Iteration (thin={thin})")
             axes[j, 0].grid(alpha=0.3)
             axes[j, 1].hist(eps_chain[:, j], bins=30, density=True,
                             edgecolor="black", alpha=0.7)
@@ -991,21 +1032,20 @@ class iSGCP_GibbsSampler:
                     ROOT = Path(".").resolve()
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-                save_path = FIGURES_DIR / Path("traces_eps").with_suffix(".pdf")
+                save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
                 fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
                 print(f"Figure sauvegardée : {save_path}")
             except Exception as e:
                 print(f"Erreur lors de la sauvegarde : {e}")
         plt.show()
 
-        # Trace de nu si appris
         if results["acceptance_nu"] is not None:
             fig, axes = plt.subplots(2, 2, figsize=(figsize[0], 6), squeeze=False)
             labels = [r"$v^2$", r"$\ell$"]
             for k in range(2):
                 axes[k, 0].plot(iters, nu_chain[:, k], linewidth=1)
                 axes[k, 0].set_title(rf"Trace {labels[k]}")
-                axes[k, 0].set_xlabel("Iteration")
+                axes[k, 0].set_xlabel(f"Iteration (thin={thin})")
                 axes[k, 0].grid(alpha=0.3)
                 axes[k, 1].hist(nu_chain[:, k], bins=30, density=True,
                                 edgecolor="black", alpha=0.7)
@@ -1026,25 +1066,31 @@ class iSGCP_GibbsSampler:
                 except Exception as e:
                     print(f"Erreur lors de la sauvegarde : {e}")
             plt.show()
-    
-    def plot_acf(self, results, burn_in=0.3, max_lag=50, figsize=(8, 6), savefigure=False):
-        """
-        
-        """
+
+
+    def plot_acf(self, results, burn_in=0.3, max_lag=50, figsize=(8, 6), savefigure=False, title_savefig="trace_acf"):
         eps_chain = np.asarray(results["eps"])
         nu_chain = np.asarray(results["nu"])
-        n_iter = eps_chain.shape[0]
-        burn = int(burn_in * n_iter)
+        thin = results.get("thin", 1)
+        n_store = eps_chain.shape[0]
+        burn = int(burn_in * n_store)
+
+        # Garde : max_lag ne peut pas dépasser le nombre d'échantillons post burn-in - 1
+        n_post = n_store - burn
+        max_lag = min(max_lag, n_post - 1)
+        if max_lag < 1:
+            print(f"[plot_acf] Pas assez d'échantillons post burn-in ({n_post}) pour calculer l'ACF.")
+            return
+
         lags = np.arange(max_lag + 1)
 
         plots = []
         for j in range(eps_chain.shape[1]):
             plots.append((rf"$\epsilon_{j}$", eps_chain[burn:, j]))
 
-        # Add nu traces only if they were learned (i.e. they vary)
         if results["acceptance_nu"] is not None:
             plots.append((r"$v^2$", nu_chain[burn:, 0]))
-            plots.append((r"$\ell$",  nu_chain[burn:, 1]))
+            plots.append((r"$\ell$", nu_chain[burn:, 1]))
 
         n_plots = len(plots)
         fig, axes = plt.subplots(n_plots, 1, figsize=(figsize[0], 3.0 * n_plots))
@@ -1053,13 +1099,14 @@ class iSGCP_GibbsSampler:
 
         for ax, (param, chain) in zip(axes, plots):
             acf_vals = self._acf(chain, max_lag)
-            ax.plot(lags, acf_vals)
+            ax.plot(lags[:len(acf_vals)], acf_vals)
             ax.axhline(0.0, color="black", linewidth=0.8)
             ax.set_xlim(0, max_lag)
             ax.set_ylim(-1.0, 1.0)
-            ax.set_title(f"ACF — {param}")
+            ax.set_title(f"ACF — {param} (thin={thin})")
             ax.set_xlabel("Lag")
             ax.grid(alpha=0.3)
+
         plt.tight_layout()
         if savefigure:
             try:
@@ -1069,7 +1116,7 @@ class iSGCP_GibbsSampler:
                     ROOT = Path(".").resolve()
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-                save_path = FIGURES_DIR / Path("trace_acf").with_suffix(".pdf")
+                save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
                 fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
                 print(f"Figure sauvegardée : {save_path}")
             except Exception as e:
@@ -1190,13 +1237,10 @@ class iSGCP_GibbsSampler:
     #     out = {"eps": rhat_eps}
 
     #     return out
-
+    
     def compute_diagnostics_multichain(self, results_list, burn_in=0.3):
-        """
-        
-        """
         M = len(results_list)
-        L = results_list[0]["eps"].shape[0]
+        L = results_list[0]["eps"].shape[0]   # n_store (après thinning)
         burn = int(burn_in * L)
         draws = L - burn
 
@@ -1209,11 +1253,10 @@ class iSGCP_GibbsSampler:
         dims = {"eps": ["eps_dim"]}
 
         idata = az.from_dict(posterior=posterior, coords=coords, dims=dims)
-        
         r_hat = az.rhat(idata)["eps"].values
         ess_bulk = az.ess(idata, method="bulk")["eps"].values
         ess_tail = az.ess(idata, method="tail")["eps"].values
-        
+
         return r_hat, ess_bulk, ess_tail
 
 
