@@ -26,6 +26,8 @@ np.random.seed(0) # Make results reproducible by freezing Numpy's random generat
 
 sigmoid = ot.SymbolicFunction(['z'], ['1/(1+exp(-z))'])
 
+sigmoid_inv = ot.SymbolicFunction(['q'], ['ln( q/(1-q) )'])
+
 
 ##%
 
@@ -157,6 +159,7 @@ def py_link_function_f(x, Nmax, D, covarianceModel):
     """
     # Extract cuurent state of conditioning variables
     N=len(D)
+    J = U.getOutputDimension()
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
@@ -291,7 +294,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
         N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+J+1)
+        parameter = np.zeros(3*Nmax-2*N+self.J+1)
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
         parameter[-J-1] = Ntot
@@ -420,8 +423,8 @@ def py_link_function_Pi(x, Nmax, N):
         Size : 4*Nmax-2*N+1
     Nmax : int
         Max of Ntot (augmented Poisson process size)
-    N : int
-        Sample size
+    J : int
+        number of zones
 
     Returns
     -------
@@ -498,6 +501,7 @@ def py_link_function_w(x, Nmax, J=2):
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax-2*N+1
+    
 
     Returns
     -------
