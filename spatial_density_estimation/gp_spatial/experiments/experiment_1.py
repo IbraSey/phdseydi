@@ -4,25 +4,25 @@ Experiment 1 — iSGCP spatial intensity estimation
 Settings A, B, C
 """
 
-# =============================================================================
+# ========
 # Imports
-# =============================================================================
+# ========
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import openturns as ot
-# import matplotlib.pyplot as plt
-# import arviz as az
+import matplotlib.pyplot as plt
+import arviz as az
 from joblib import Parallel, delayed
 from functools import partial
-# from pathlib import Path
-# from scipy.special import expit
+from pathlib import Path
+from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 from shapely.prepared import prep
-# from sklearn.gaussian_process import GaussianProcessRegressor
-# from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-# from polyagamma import random_polyagamma
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from polyagamma import random_polyagamma
 
 from gp.gibbs_sampler import iSGCP_GibbsSampler
 from gp.data_generation import generate_voronoi_cells, simulate_process
@@ -30,9 +30,9 @@ from visualizations.plot import plot_voronoi_cells, plot_process_dashboard
 
 
 #%%
-# =============================================================================
+# ===================
 # Paramètres globaux
-# =============================================================================
+# ===================
 X_BOUNDS = (0.0, 2.0)
 Y_BOUNDS = (0.0, 2.0)
 N_GERMS = 6
@@ -60,9 +60,9 @@ XB, YB = (0.0, 2.0), (0.0, 2.0)
 N_CHAINS = 5
 
 
-# =============================================================================
+# ====================
 # Fonctions latentes
-# =============================================================================
+# ====================
 def f_star_A(x, y):
     weights = [1.5, -1.5, 3.0, -3.0]
     sigma2 = 0.3
@@ -79,7 +79,6 @@ def f_star_A(x, y):
         w * np.array(d.computePDF(sample)).flatten()
         for w, d in zip(weights, dists)
     )
-
 
 def f_star_B(x, y):
     centers = np.array([
@@ -104,7 +103,6 @@ def f_star_B(x, y):
 
     return f_vals.reshape(np.shape(x))
 
-
 def f_star_C(x, y):
     C_step = 3.0
     x0, y0 = 1.0, 1.0
@@ -127,10 +125,12 @@ def f_star_C(x, y):
     return (step + ridge).reshape(np.shape(x))
 
 
-# =============================================================================
+# =====================
 # Helpers picklables
-# =============================================================================
+# =====================
 def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
+    from scipy.special import expit          # import local — picklable
+
     x_flat = np.atleast_1d(x).flatten()
     y_flat = np.atleast_1d(y).flatten()
     mu_tilde = np.zeros(len(x_flat))
@@ -200,9 +200,9 @@ def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
     return results_k, list(sampler_k.nu)
 
 
-# =============================================================================
+# ===========================
 # Affichage des diagnostics
-# =============================================================================
+# ===========================
 def print_diagnostics(r_hat, ess_bulk, ess_tail, J, n_chains):
     print("\n" + "=" * 50)
     print(f"Diagnostics multi-chaînes ({n_chains} chaînes)")
@@ -225,17 +225,17 @@ def print_diagnostics(r_hat, ess_bulk, ess_tail, J, n_chains):
     print("=" * 50)
 
 
-# =============================================================================
+# =================================
 # Fonction principale par setting
-# =============================================================================
+# =================================
 def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
     print(f"\n{'#'*70}")
     print(f"  SETTING {setting_name}")
     print(f"{'#'*70}\n")
 
-    # ------------------------------------------------------------------
+    # ------------------------------------
     # Génération du pavage et des données
-    # ------------------------------------------------------------------
+    # ------------------------------------
     cells, germs = generate_voronoi_cells(
         n_germs=N_GERMS,
         X_bounds=X_BOUNDS,
@@ -281,9 +281,9 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
         f_func=f_star_func,
     )
 
-    # ------------------------------------------------------------------
+    # -----------------------------------
     # Lancement des chaînes en parallèle
-    # ------------------------------------------------------------------
+    # -----------------------------------
     print(f"Lancement de {N_CHAINS} chaînes en parallèle")
 
     chain_outputs = Parallel(n_jobs=-1, prefer="processes")(
@@ -304,9 +304,9 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
 
     print(f"\n{N_CHAINS} chaînes terminées")
 
-    # ------------------------------------------------------------------
+    # --------------------
     # Analyse postérieure
-    # ------------------------------------------------------------------
+    # --------------------
     zones_prep_main = [prep(p) for p in zones_raw_list]
     Areas_main = [(zp, 0.0) for zp in zones_prep_main]
 
@@ -347,9 +347,9 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
         )
         all_outputs.append(out_k)
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------
     # Diagnostics chaîne finale + multi-chaînes
-    # ------------------------------------------------------------------
+    # ------------------------------------------
     sampler_k.plot_chains(
         results_k,
         savefigure=savefigure,
@@ -363,17 +363,17 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
         title_savefig=f"exp1_acf_setting{setting_name}",
     )
 
-    sampler_k.plot_rhat_arviz(
-        all_results,
-        burn_in=BURN_IN,
-        savefigure=savefigure,
-        title_savefig=f"exp1_rhat_setting{setting_name}",
-    )
+    # sampler_k.plot_rhat_arviz(
+    #     all_results,
+    #     burn_in=BURN_IN,
+    #     savefigure=savefigure,
+    #     title_savefig=f"exp1_rhat_setting{setting_name}",
+    # )
 
-    r_hat, ess_bulk, ess_tail = sampler_k.compute_diagnostics_multichain(
-        all_results, burn_in=BURN_IN
-    )
-    print_diagnostics(r_hat, ess_bulk, ess_tail, sampler_k.J, N_CHAINS)
+    # r_hat, ess_bulk, ess_tail = sampler_k.compute_diagnostics_multichain(
+    #     all_results, burn_in=BURN_IN
+    # )
+    # print_diagnostics(r_hat, ess_bulk, ess_tail, sampler_k.J, N_CHAINS)
 
     return all_results, all_outputs, all_nu_finals
 
@@ -410,22 +410,7 @@ if __name__ == "__main__":
         grid_res=300,
     )
 
-    print("\nExperiment 1 terminé.")
-
-
-
-
-
-
-
-
-
-
-#%%
-
-
-
-
+    print("\nExperiment 1 terminé !")
 
 
 
