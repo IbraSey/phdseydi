@@ -132,7 +132,7 @@ class NormalCholesky(ot.PythonRandomVector):
         return output
 
 
-def py_link_function_f(x, Nmax, D, covarianceModel):
+def py_link_function_f(x, Nmax, D, covarianceModel, J):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -149,6 +149,8 @@ def py_link_function_f(x, Nmax, D, covarianceModel):
         Observed Poisson process
     covarianceModel : Open TURNS covariance model
         GP cov model
+    J : int
+        Number of zone covariables
     
     Returns
     -------
@@ -159,7 +161,6 @@ def py_link_function_f(x, Nmax, D, covarianceModel):
     """
     # Extract cuurent state of conditioning variables
     N=len(D)
-    J = U.getOutputDimension()
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     Omega = np.array(x)[Nmax:Nmax+Ntot]    
@@ -258,6 +259,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         self.Pi = np.array(Pi).reshape(-1,2)
         self.Ntot = int(Ntot)
         self.Lambda = Lambda
+        self.J = len(self.Lambda)
         self.Nmax = Nmax
         self.D = D
         self.U = U
@@ -286,9 +288,9 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         """
         Nmax=int(self.Nmax)
         self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
-        self.Pi = np.array(parameter[Nmax:-J-1]).reshape(-1,2)
-        self.Ntot = int(parameter[-J-1])
-        self.Lambda = np.array(parameter[-J:]).reshape(-1,1)
+        self.Pi = np.array(parameter[Nmax:-self.J-1]).reshape(-1,2)
+        self.Ntot = int(parameter[-self.J-1])
+        self.Lambda = np.array(parameter[-self.J:]).reshape(-1,1)
     
     def getParameter(self):
         Nmax=int(self.Nmax)
@@ -297,8 +299,8 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         parameter = np.zeros(3*Nmax-2*N+self.J+1)
         parameter[:Ntot] = self.ftot[:Ntot].ravel()
         parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
-        parameter[-J-1] = Ntot
-        parameter[-J:] = self.Lambda.ravel()
+        parameter[-self.J-1] = Ntot
+        parameter[-self.J:] = self.Lambda.ravel()
         return parameter.tolist()
     
     def getGaussianProcessRegression(self):
@@ -408,7 +410,7 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         # Add zone effects
         return np.array(sigmoid(f_simu)).ravel() * np.dot( np.array(self.U(XY_new)), self.Lambda )[:,0]
             
-def py_link_function_Pi(x, Nmax, N):
+def py_link_function_Pi(x, Nmax, J):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -555,6 +557,7 @@ def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
     """
     # Extract current state of conditioning variables
     N=len(D)
+    J = len(a)
     Ntot = int(x[-J-1])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     # total (augmented) data
@@ -581,7 +584,7 @@ def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
 # Assuming square domain [0,1]*[0,1] (surface 1)
 # and null trend
 
-T = 500
+T = 50
 
 def U(xy):
     u = [0, 0]
@@ -673,15 +676,15 @@ plt.savefig("Data.png")
 # MCMC parameters # 
 ###################
 
-sampleSize=100
-blockSize=10 # Display convergence messages after every block of iterations with size: blockSize
+sampleSize=1000
+blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
 ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
 
 
 f_indices = [i for i in range(Nmax)]
 # Augmented Gaussian Process update
 RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
-ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, covarianceModel=covarianceModel))
+ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, covarianceModel=covarianceModel, J=J))
 
 
 
@@ -689,7 +692,7 @@ ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1)
 Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
 PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Lambda=LambdaTrue, D=D, U=U_OT, covarianceModel=covarianceModel, PoissonScale=T, Uniform=myUniform )
 RV_Pi = ot.RandomVector(PyRV_Pi)
-ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,N=N))
+ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,J=J))
 
 
 # Latent Polya Gamma Process update
@@ -904,7 +907,7 @@ Z_new = np.zeros((len(sample), len(XY_new)))
 for i in range(len(sample)):
     # break
     # GP conditional on values at augmented Poisson process
-    PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, N))
+    PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, J))
     Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new )
     
 Z_mean = Z_new.mean(axis=0).reshape(gridsize, gridsize) * T
@@ -942,3 +945,5 @@ plt.savefig("f_post_std.png")
 
 
 
+
+# %%

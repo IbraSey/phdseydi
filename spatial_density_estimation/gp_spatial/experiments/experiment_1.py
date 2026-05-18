@@ -12,17 +12,17 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import openturns as ot
-# import matplotlib.pyplot as plt
-# import arviz as az
+import matplotlib.pyplot as plt
+import arviz as az
 from joblib import Parallel, delayed
 from functools import partial
-# from pathlib import Path
-# from scipy.special import expit
+from pathlib import Path
+from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 from shapely.prepared import prep
-# from sklearn.gaussian_process import GaussianProcessRegressor
-# from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-# from polyagamma import random_polyagamma
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+from polyagamma import random_polyagamma
 
 from gp.gibbs_sampler import iSGCP_GibbsSampler
 from gp.data_generation import generate_voronoi_cells, simulate_process
