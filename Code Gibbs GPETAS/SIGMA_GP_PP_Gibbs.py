@@ -20,6 +20,7 @@ import time
 import scipy.stats as st
 import statsmodels.tsa.stattools as stattools
 from polyagamma import random_polyagamma
+from sparseGP import sparseGP
 
 ot.RandomGenerator.SetSeed(0) # Make results reproducible by freezing Open TURNS's random generator's seed
 np.random.seed(0) # Make results reproducible by freezing Numpy's random generator's seed
@@ -31,6 +32,22 @@ sigmoid_inv = ot.SymbolicFunction(['q'], ['ln( q/(1-q) )'])
 
 ##%
 
+######################################
+# Computing indices for Gibbs blocks # 
+######################################
+
+class GibbsIndices:    
+    def __init__(self, m, Nmax, N, J):
+        self.m = m
+        self.Nmax = Nmax
+        self.N = N
+        self.J = J
+        self.epsilon_indices = list(range(m))
+        self.Omega_indices = list(range(m, m + Nmax))
+        self.Pi_indices = list(range(m + Nmax, m + 3*Nmax - 2*N))
+        self.Ntot_indices = list(range(m + 3*Nmax - 2*N, m + 3*Nmax - 2*N + 1))
+        self.lambda_indices = list(range(m + 3*Nmax - 2*N + 1, m + 3*Nmax - 2*N + 1 + J))
+        self.parameter_size = m + 3*Nmax - 2*N + 1 + J
 
 ##################################
 # Latent Gaussian process update # 
@@ -131,141 +148,169 @@ class NormalCholesky(ot.PythonRandomVector):
         # output[indices] = np.array(self.Chol[indices][:,indices]*Z + self.mu[indices]).ravel()
         return output
 
-
-def py_link_function_f(x, Nmax, D, covarianceModel, J):
+def py_link_function_epsilon(x, sparse_gp, gibbs_indices):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
-    the GP, as required by the NormalCholesky class
+    the truncated GP, as required by the NormalCholesky class
 
     Parameters
     ----------
     x : array / list
         Current MCMC chain state
-        Size : 4*Nmax - 2*N + 1 + J
-    Nmax : int
-        Max of Ntot (augmented Poisson process size)
-    D : (N,2)
-        Observed Poisson process
-    covarianceModel : Open TURNS covariance model
-        GP cov model
-    J : int
-        Number of zone covariables
-    
+    sparse_gp : sparseGP
+        class providing sparse GP design matrix
+    gibbs_indices : GibbsIndices
+        provides parameter indices within Markov chain
+        
     Returns
     -------
     param : list
         Mean + Cholesky precision matrix + Ntot value
         in the order required by NormalCholesky class
-        Size : Nmax*(Nmax+1)+1
+        Size : m*(m+1)+1
+        with m the sparse GP truncation order 
     """
-    # Extract cuurent state of conditioning variables
-    N=len(D)
-    Ntot = int(x[-J-1])
-    Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
-    Omega = np.array(x)[Nmax:Nmax+Ntot]    
-    # Eps = np.array(x)[-J:].reshape(-1,1)
+    # Extract current state of conditioning variables
+    N = gibbs_indices.N
+    Ntot = int(x[gibbs_indices.Ntot_indices])
+    Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
+    Omega = np.array(x[gibbs_indices.Omega_indices[:Ntot]]).reshape(-1,1)
     # total (augmented) data
     Dtot = ot.Sample(Ntot, 2)
     Dtot[:N] = D
     Dtot[N:] = Pi
     u = ot.Sample(np.array([[0.5]]*N + [[-0.5]]*(Ntot-N)))
+    M = np.vstack( sparse_gp.design_D, sparse_gp.designPi( Pi ) )
     # precision matrix
-    K = covarianceModel.computeCrossCovariance(Dtot,Dtot)
-    K = ot.CovarianceMatrix(K)
-    L = K.computeCholesky()
-    Linv = L.inverse()
-    Kinv = Linv.transpose()*Linv
-    # add Omega to precision matrix diagonal
-    Diag = np.array(Kinv.getDiagonal())[:,0] + Omega
-    Diag = Diag.tolist()
-    Kinv.setDiagonal( Diag )
+    Q = np.eye(sparse_gp.m) + np.dot( M.T, Omega*M )
     # invert 
-    L = ot.CovarianceMatrix(Kinv).computeCholesky()
+    L = ot.CovarianceMatrix(Q).computeCholesky()
     Linv = L.inverse()
     V = Linv.transpose()*Linv
-    # # prior to posterior total mean 
-    mean = V*u
-    # extract parameters in correct order (coherent with getParameter() method of RV_f)
-    parameter = [0]*( Nmax*(Nmax+1)+1 )
-    parameter[:Ntot] = np.array(mean).ravel()
-    parameter[Nmax:Nmax+Ntot*Ntot] = np.array(Linv).ravel()
-    parameter[-1] = Ntot
+    # # posterior mean 
+    mean = V*ot.Matrix(M.T)*u
+    # extract parameters in correct order (coherent with getParameter() method of RV_epsilon)
+    parameter = [0]*( m*(m+1)+1 )
+    parameter[:m] = np.array(mean).ravel()
+    parameter[m:m*(m+1)] = np.array(Linv).ravel()
+    parameter[-1] = m
     return parameter
 
+def buildFD(sparse_gp, gibbs_indices):
+    """Bulid sparse GP evaluation function at D
+    
+    Args:
+        sparse_gp (sparseGP): Fourier decomposition of GP 
+    
+    gibbs_indices : GibbsIndices
+        provides parameter indices within Markov chain
+    """
+    
+    def pyFD(x):
+        """evaluate sparse GP at static points
+
+        Args:
+            x (list): concatenates epsilon and D
+
+        Returns:
+            list: sparse GP evaluated at D
+        """
+        m = sparse_gp.m
+        N = gibbs_indices.N
+        Nmax = gibbs_indices.Nmax
+        epsilon = np.array(x[:m]).reshape(-1,1)
+        return np.dot(sparse_gp.design_D, epsilon).ravel()
+    
+    return ot.PythonFunction( m+2*N, N, pyFD )
+
+
+def buildFPi(sparse_gp, gibbs_indices):
+    """Build sparse GP evaluation function at Pi
+    Args:
+        sparse_gp (sparseGP): Fourier decomposition of GP 
+        gibbs_indices (GibbsIndices)
+    """
+    
+    def pyFPi(x):
+        """evaluate sparse GP at latent points
+
+        Args:
+            epsilon
+            x (list): Pi of size NPi
+            NPi most be < Nmax - N
+
+        Returns:
+            list: sparse GP evaluated at Pi
+        """
+        m = sparse_gp.m
+        N = gibbs_index.N
+        Nmax = gibbs_index.Nmax
+        epsilon = np.array(x[:m]).reshape(-1,1)
+        NPi = int(x[-1])
+        Pi = np.array(x[m:m+2*NPi]).reshape(-1,2)        
+        M = sparse_gp.designPi( Pi )
+        f_Pi = np.zeros(Nmax)
+        f_Pi[:NPi] = np.dot(M, epsilon).ravel()
+        return f_Pi 
+    
+    return ot.PythonFunction( m+2*Nmax+1, Nmax, pyFPi )
 
 
 ##%
 
-#################################################
-# Latent Poisson... and Gaussian process update # 
-#################################################
+#########################
+# Latent Poisson update # 
+#########################
 
 # Uniform_RV = ot.RandomVector(ot.Uniform())
 
-class PoissonGaussianProcess(ot.PythonRandomVector):
+class PoissonProcess(ot.PythonRandomVector):
     """
-    Given current states of GP values at observed and latent points Pi (and the latter)
-    Generates an updated set of latent points and associated GP Values
+    Given current states of epsilon
+    Generates an updated set of latent points 
     """
-    def __init__( self, ftot, Pi, Ntot, Lambda, D, U, covarianceModel, PoissonScale, Uniform):
+    def __init__( self, epsilon, Lambda, U, covarianceModel, PoissonScale, Uniform, sparse_gp):
         """
         Parameters
         ----------
-        ftot : vector
-            current GP values at observed and latent points. 
-            Size: Nmax
-        Pi : array
-            Current latent points. 
-            shape: (Nmax-N,2)
-        Ntot: int
-            current total size of observed and latent process
-            Ntot=N+NPi
+        epsilon : vector
+            sparse GP coefficients 
+            Size: m
         Lambda : (J,1)
             current value of zones effects
-        D : (N,2)
-            Observed Poisson process
         U : Open TURNS function
             zone indicator functions
             given a point (x,y), outputs J 0-1 indicators,
             summing to 1
-        covarianceModel : Open TURNS covariance model
-            GP cov model
         PoissonScale: Scale factor for homogeneous Poisson distribution
             This is equal to observation period T times search domain area
-        Uniform : Open TURNS distribution
+        Uniform : OpenTURNS distribution
             uniform distribution over the search domain
+        fPi : OpenTURNS function
+            inputs epsilon, Pi and Ntot, outputs fPi
+        sparse_gp : (sparseGP)
+            sparse GP design matrix calculation
         
         Notes
         -----
-        - above parameters are flattened and concatenated in above order
-        - parameter list size: 3*Nmax-2*N+1
-        - Simulated variables dimension: 3*Nmax-3*N+1
-          Difference with parameter list size is the former
-          doesn't account for D (size N)
+        - epsilon and Lambda are flattened and concatenated in above order
+        - parameter list size: m + J
+        - Simulated variables dimension: 2*(Nmax-N)+1 (Pi + Ntot)
         - Nmax must be >= Ntot (or else a ValueError is raised)
-        - if Nmax > Ntot, realizations are zero-padded
+        - when Nmax > Ntot, realizations are zero-padded
         """
-        Nmax = len(ftot)
-        N = len(D)
-        super(PoissonGaussianProcess, self).__init__(int(3*Nmax-3*N+1))
-        # not converting Nmax to int results in weird error message:
-        # super(PoissonGaussianProcess, self).__init__(3*Nmax-3*N+1)
-        # if Nmax < Ntot: 
-        #     print("Inputs have incompatible sizes")
-        #     raise ValueError
+        Nmax = gibbs_indices.Nmax
+        N = gibbs_indices.N
+        super(PoissonProcess, self).__init__(int(2*(Nmax-N))+1)
         # Internal parameters (numpy arrays)
-        self.ftot = np.array(ftot).reshape(-1,1)
-        self.Pi = np.array(Pi).reshape(-1,2)
-        self.Ntot = int(Ntot)
+        self.epsilon = np.array(epsilon).reshape(-1,1)
         self.Lambda = Lambda
-        self.J = len(self.Lambda)
-        self.Nmax = Nmax
-        self.D = D
         self.U = U
-        self.covarianceModel = covarianceModel
         self.PoissonScale = PoissonScale
         self.Uniform = Uniform
+        self.sparse_gp = sparse_gp
+        self.fPi = fPi
     
     def setParameter(self, parameter):
         """
@@ -274,98 +319,55 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
         ----------
         parameter : list
             concatenates current values of :
-                - ftot (Nmax,)
-                - Pi (Nmax-N,2)
-                - Ntot (1,)
+                - epsilon (m,)
                 - Lambda (J,)
             in this order
-            Size: 3*Nmax-2*N+J+1
+            Size: m+J
 
         Returns
         -------
         Sets internal parameters (numpy arrays)
 
         """
-        Nmax=int(self.Nmax)
-        self.ftot = np.array(parameter[:Nmax]).reshape(-1,1)
-        self.Pi = np.array(parameter[Nmax:-self.J-1]).reshape(-1,2)
-        self.Ntot = int(parameter[-self.J-1])
-        self.Lambda = np.array(parameter[-self.J:]).reshape(-1,1)
+        self.epsilon = np.array(parameter[:self.m])
+        self.Lambda = np.array(parameter[-self.J:])
     
     def getParameter(self):
         Nmax=int(self.Nmax)
         Ntot=int(self.Ntot)
-        N = Nmax-len(self.Pi)
-        parameter = np.zeros(3*Nmax-2*N+self.J+1)
-        parameter[:Ntot] = self.ftot[:Ntot].ravel()
-        parameter[Nmax:Nmax+2*(Ntot-N)] = self.Pi[:Ntot-N].ravel()
-        parameter[-self.J-1] = Ntot
+        m = self.gibbs_indices.m
+        parameter = np.zeros(m + self.gibbs_indices.J)
+        parameter[:m] = self.epsilon.ravel()
         parameter[-self.J:] = self.Lambda.ravel()
         return parameter.tolist()
-    
-    def getGaussianProcessRegression(self):
-        """
-        Update Gaussian process with augmented (observed and latent) values
-
-        Returns
-        -------
-        gpr_result: GaussianProcessFitter result
-
-        """
-        # Step 0: Extract GP training sample
-        Nmax=int(self.Nmax)
-        Ntot=int(self.Ntot)
-        N = Nmax-len(self.Pi)
-        inputSample = np.vstack((self.D, self.Pi[:Ntot-N]))
-        outputSample = self.ftot[:Ntot]
-        # # remove zones effect
-        # zone_effect = np.dot( np.array(self.U(inputSample)), self.Eps )    
-        # outputSample -= zone_effect
-        # Step 1: Fit GP regression model to Sample
-        fitter = otexp.GaussianProcessFitter(inputSample, outputSample, self.covarianceModel, ot.Basis(0))
-        fitter.setOptimizeParameters(False)
-        fitter.run()
-        fitter_result = fitter.getResult()
-        # print(fitter_result)
-        # Step 2: Deduce GP law conditional on Sample
-        algo = otexp.GaussianProcessRegression(fitter_result)
-        algo.run()
-        gpr_result = algo.getResult()        
-        # print(gpr_result)
-        # print(gpr_result)
-        return gpr_result
-    
+        
         # print(gpr_result)
     def getRealization(self):
         """
         Simulates one realization of the latent Poisson process
-        and the associated GP
 
         Returns
         -------
         list
             simulated variables are flattened 
             and concatenated in the following order:
-            - New GP process values (size : Nmax-N)
-            - New Poisson process values (shape : (Nmax-N,2))
+            - New Poisson process values (shape : 2*(Nmax-N))
             - New Ntot value (size: 1)
-            total size : 3*Nmax-3*N+1
+            total size : 2*Nmax-2*N+1
         
         Notes:
             - There is no guaranty that New Ntot <= Nmax
             - New Ntot > Nmax may cause a crash
         """
-        Nmax=int(self.Nmax)
-        N = len(self.D)
-        # Step 1: Update Gaussian process 
-        gpr_result = self.getGaussianProcessRegression()        
+        Nmax=int(self.gibbs_indices.Nmax)
+        N = self.gibbs_indices.N
         # Step 2: Generate candidate points uniformly over search domain
         LambdaMax = self.Lambda.max()
         N_star = int(ot.Poisson(self.PoissonScale*LambdaMax).getRealization()[0]) # Poisson candidate number
         XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
         # Step 3: predict GP at candidates
-        process = otexp.ConditionedGaussianProcess(gpr_result, ot.Mesh(XY_star))
-        f_star = np.array(process.getRealization())
+        M = sparse_gp.designNew(XY_star)
+        f_star = np.dot( M, epsilon )
         # Step 4: Thinning
         U_star = np.array( self.U(XY_star) )
         Lambda_star = np.dot( U_star, self.Lambda).reshape(-1,1)
@@ -377,69 +379,36 @@ class PoissonGaussianProcess(ot.PythonRandomVector):
             print("Maximum size %s exceeded by simulated data size %s"%(Nmax, Ntot_new))
             raise ValueError
         # Assemble final output
-        f_new = np.zeros(Nmax - N)
-        f_new[:NPi_new] = f_star[accept]
-        Pi_new = np.zeros((Nmax - N, 2))
-        Pi_new[:NPi_new] = np.array(XY_star)[accept.ravel()]
-        # # add zones effect
-        # zone_effects = np.dot( np.array(self.U(Pi_new[:NPi_new])), self.Eps ).ravel()
-        # f_new[:NPi_new] = f_new[:NPi_new] + zone_effects
-        return np.concatenate([f_new.ravel(), Pi_new.ravel(), [Ntot_new]])
-        
-    def SimulateSigmaGP( self, XY_new ):
-        """
-        Simulate from conditional Logistic Gaussian Process 
-        given current values
+        results = np.zeros(2*Nmax-2*N+1)
+        results[-1] = Ntot_new
+        results[:2*(Ntot_new-N)] = np.array(XY_star)[accept.ravel()]
+        return results
 
-        Parameters
-        ----------
-        XY_new : (N_new, 2) array
-            Points 
-
-        Returns
-        -------
-        f_simu : (size, N_new) array
-            independent realizations of the conditioned GP
-            after logistic transform and multiplying by zone effects
-        """
-        # Step 1: Update Gaussian process 
-        gpr_result = self.getGaussianProcessRegression()        
-        # Step 3: predict GP at new points
-        process = otexp.ConditionedGaussianProcess(gpr_result, ot.Mesh(XY_new))
-        f_simu = np.array(process.getRealization()).reshape(-1,1)
-        # Add zone effects
-        return np.array(sigmoid(f_simu)).ravel() * np.dot( np.array(self.U(XY_new)), self.Lambda )[:,0]
-            
-def py_link_function_Pi(x, Nmax, J):
+def py_link_function_Pi(x, gibbs_indices):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
-    the Latent Poisson process, and the associated 
-    GP process, as required by the 
-    PoissonGaussianProcess class.
+    the Latent Poisson process, as required by the 
+    PoissonProcess class.
 
     Parameters
     ----------
     x : array / list
         Current MCMC chain state
-        Size : 4*Nmax-2*N+1
-    Nmax : int
-        Max of Ntot (augmented Poisson process size)
-    J : int
-        number of zones
-
+    gibbs_indices : GibbsIndices
+        provides parameter indices within Markov chain
+    
     Returns
     -------
     param : list
         in the order required by 
         the PoissonGaussianProcess class
-        Size : 3*Nmax-2*N+J+1)
+        Size : m+J)
     """
-    ftot = np.array(x)[:Nmax].reshape(-1,1)
-    Pi = np.array(x)[2*Nmax:-J-1].reshape(-1,2)
-    Ntot = int(x[-J-1])
-    Lambda = np.array(x)[-J:].reshape(-1,1)
-    return np.concatenate([ftot.ravel(), Pi.ravel(), [Ntot], Lambda.ravel()])
+    m = gibbs_indices.m
+    epsilon = np.array(x)[:m]
+    Lambda = np.array(x)[-J:]
+    return np.concatenate([epsilon, Lambda])
 
 ##%
 
@@ -449,33 +418,44 @@ def py_link_function_Pi(x, Nmax, J):
 
 class PolyaGammaProcess(ot.PythonRandomVector):
     """
-    Given current states of GP values 
+    Given current states of MCMC chain 
     Generates an updated set of Polya-Gamma values
     """
-    def __init__( self, ftot, Ntot ):
+    def __init__( self, epsilon, Pi, Ntot, gibbs_indices, fD, fPi ):
         """
         Parameters
         ----------
-        ftot : vector
-            current GP values at observed and latent points. 
-            Size: Nmax
+        epsilon : vector
+            sparse GP coefficients 
+            Size: m
+        Pi : (Nmax, 2) array
+            latent PP
         Ntot : int
             current value of total data size
+        gibbs_indices : GibbsIndices
+            provides parameter indices within Markov chain
+        fD : Memoize function
+            evaluate sparse GP over dataset
+        fPi : Memoize function
+            evaluate sparse GP over latent points
         """
-        Nmax=len(np.array(ftot).ravel())
-        super(PolyaGammaProcess, self).__init__(Nmax)
-        self.ftot = np.array(ftot).reshape(-1,1)   
-        self.Ntot = int(Ntot)
-        self.Nmax = Nmax
+        super(PolyaGammaProcess, self).__init__(gibbs_indices.Nmax)
+        self.epsilon = epsilon   
+        self.Pi = Pi
+        self.Ntot = Ntot
+        self.gibbs_indices = gibbs_indices
+        self.fD = fD,
+        self.fPi = fPi
         
     def setParameter(self, parameter):
-        self.ftot = np.array(parameter[:-1]).reshape(-1,1)
-        self.Ntot = int(parameter[-1])
+        self.epsilon = np.array(parameter[:m]).reshape(-1,1)
+        self.Pi = np.array(parameter[m:m+2*(Nmax-N)+1]).reshape(-1,1)
+        self.Ntot = parameter[:1]
     
     def getParameter(self):
-        return np.concatenate([self.ftot.ravel(), [int(self.Ntot)]])
+        return np.concatenate([self.epsilon.ravel(), self.Pi, self.Ntot])
     
-    def getRealization(self):
+    def getRealization(self, gibbs_indices):
         """
         Simulates one realization of the latent Polya-Gamma process
 
@@ -484,14 +464,19 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         list
             New Polya-Gamma process values
             Size : Nmax
+        gibbs_indices : GibbsIndices
+            provides parameter indices within Markov chain
         """     
-        Nmax=int(self.Nmax)
+        Nmax=self.gibbs_indices .Nmax
         Ntot=int(self.Ntot)
         w = np.zeros(Nmax)
-        w[:Ntot] = np.abs( random_polyagamma(z=np.array(self.ftot[:Ntot])[:,0]) )
+        ftot = np.zeros(Nmax)
+        self.ftot[:N] = self.fD( epsilon )
+        self.ftot[N:] = self.fPi( np.hstack(( self.epsilon, self.Pi.ravel(), [Ntot] )) )        
+        w[:Ntot] = np.abs( random_polyagamma(z=np.array(ftot)[:,0]) )
         return w
 
-def py_link_function_w(x, Nmax, J=2):
+def py_link_function_w(x, gibbs_indices):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional Polya
@@ -502,8 +487,6 @@ def py_link_function_w(x, Nmax, J=2):
     ----------
     x : array / list
         Current MCMC chain state
-        Size : 4*Nmax-2*N+1
-    
 
     Returns
     -------
@@ -513,7 +496,9 @@ def py_link_function_w(x, Nmax, J=2):
         the PolyaGammaProcess class
         Size : Nmax+1
     """
-    return np.hstack(( np.array(x)[:Nmax], [x[-J-1]] ))
+    epsilon = np.array(x)[:gibbs_indices.m]
+    Pi = np.array(x)[gibbs_indices.Pi_indices]
+    return np.hstack([ epsilon, Pi, [x[-1]] ])
 
 ##%
 
@@ -522,7 +507,7 @@ def py_link_function_w(x, Nmax, J=2):
 ###############################
 
 
-def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
+def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -533,8 +518,6 @@ def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax - 2*N + J + 1
-    Nmax : int
-        Max of Ntot (augmented Poisson process size)
     D : (N,2)
         Observed Poisson process
     U : Open TURNS function
@@ -547,6 +530,8 @@ def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
         prior shape parameters for Gamma distribution of Lambdas
     b : (J,)
         prior rate parameters for Gamma distribution of Lambdas
+    gibbs_indices : GibbsIndices
+        provides parameter indices within Markov chain
 
     Returns
     -------
@@ -556,9 +541,9 @@ def py_link_function_Lambda(x, Nmax, D, U, PoissonScales, a, b):
         Size : J*3
     """
     # Extract current state of conditioning variables
-    N=len(D)
-    J = len(a)
-    Ntot = int(x[-J-1])
+    N = gibbs_indices.N
+    J = gibbs_indices.J
+    Ntot = int(x[gibbs_indices.Ntot_indices])
     Pi = np.array(x)[2*Nmax:2*Nmax+2*(Ntot-N)].reshape(-1,2)
     # total (augmented) data
     Dtot = ot.Sample(Ntot, 2)
