@@ -74,7 +74,7 @@ class sparseGP:
         """sparseGP pointwise evaluation
 
         Args:
-            x : (m+2,) concatenation of m regression coefficients and 2D point coords
+            x : 2D point or Sample of 2D points
         
         Returns:
             (1,): regression mean at query point
