@@ -197,6 +197,26 @@ def py_link_function_epsilon(x, sparse_gp, gibbs_indices):
     parameter[-1] = m
     return parameter
 
+
+def buildEvalF(sparse_gp):
+    """Bulid sparse GP evaluation function
+    
+    Args:
+        sparse_gp (sparseGP): Fourier decomposition of GP     
+    """
+    def pyEvalF(x)
+        """evaluate sparse GP at given point
+
+        Args:
+            x (list): concatenates epsilon and 2D input
+
+        Returns:
+            list: sparse GP evaluated at 2D input
+        """
+        m = sparse_gp.m
+        epsilon = np.array(x[:m]).reshape(-1,1)
+        return np.dot(sparse_gp.design_D, epsilon).ravel()
+
 def buildFD(sparse_gp, gibbs_indices):
     """Bulid sparse GP evaluation function at D
     
@@ -223,7 +243,6 @@ def buildFD(sparse_gp, gibbs_indices):
         return np.dot(sparse_gp.design_D, epsilon).ravel()
     
     return ot.PythonFunction( m+2*N, N, pyFD )
-
 
 def buildFPi(sparse_gp, gibbs_indices):
     """Build sparse GP evaluation function at Pi
