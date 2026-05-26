@@ -47,7 +47,7 @@ class GibbsIndices:
         self.Pi_indices = list(range(m + Nmax, m + 3*Nmax - 2*N))
         self.Ntot_indices = list(range(m + 3*Nmax - 2*N, m + 3*Nmax - 2*N + 1))
         self.lambda_indices = list(range(m + 3*Nmax - 2*N + 1, m + 3*Nmax - 2*N + 1 + J))
-        self.parameter_size = m + 3*Nmax - 2*N + 1 + J
+        self.chain_dim = m + 3*Nmax - 2*N + 1 + J
 
 ###################################
 # Basic Gaussian simulation class # 
@@ -154,7 +154,7 @@ class NormalCholesky(ot.PythonRandomVector):
 ##################################
 
 
-def py_link_function_epsilon(x, sparse_gp, gibbs_indices, regressorD):
+def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -225,7 +225,7 @@ class PoissonProcess(ot.PythonRandomVector):
     Given current states of epsilon
     Generates an updated set of latent points 
     """
-    def __init__( self, epsilon, Lambda, U, covarianceModel, PoissonScale, Uniform, sparse_gp, gibbs_indices):
+    def __init__( self, epsilon, Lambda, U, PoissonScale, Uniform, sparse_gp, gibbs_indices):
         """
         Parameters
         ----------
@@ -244,6 +244,8 @@ class PoissonProcess(ot.PythonRandomVector):
             uniform distribution over the search domain
         sparse_gp : (sparseGP)
             sparse GP design matrix calculation
+        gibbs_indices : GibbsIndices
+            provides parameter indices within Markov chain
         
         Notes
         -----
@@ -269,7 +271,6 @@ class PoissonProcess(ot.PythonRandomVector):
         self.Uniform = Uniform
         self.sparse_gp = sparse_gp
         self.gibbs_indices = gibbs_indices
-        
     
     def setParameter(self, parameter):
         """
@@ -362,7 +363,7 @@ def py_link_function_Pi(x, gibbs_indices):
     -------
     param : list
         in the order required by 
-        the PoissonGaussianProcess class
+        the PoissonProcess class
         Size : m+J)
     """
     epsilon = np.array(x)[:gibbs_indices.m]
@@ -551,7 +552,8 @@ if if __name__ == "__main__":
     b = PoissonScales
 
     # GP model specification
-    covarianceModel = ot.SquaredExponential([0.1, 0.1], [0.5])
+    l1, l2, nu = 0.1, 0.1, 0.5**2
+    covarianceModel = ot.SquaredExponential([l1, l2], [np.sqrt(nu)])
     m = ot.PythonFunction(2, 1, lambda x:[0])
         
     LambdaMax = LambdaTrue.max()
@@ -629,30 +631,31 @@ if if __name__ == "__main__":
     blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
     ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
 
-
-    f_indices = [i for i in range(Nmax)]
+    
+    c1, c2, S1, S2 = 0.5, 0.5, 0.5, 0.5
+    
+    hypers = l1, l2, c1, c2, S1, S2, nu
+    sparse_gp = sparseGP(hypers)
+    regressorD = sparse_gp.regressorOT(D)
+    
+    gibbs_indices = GibbsIndices(sparse_gp.m, Nmax, N, J)
+    
     # Augmented Gaussian Process update
-    RV_f = ot.RandomVector(NormalCholesky(mu=np.zeros(Nmax), Chol=np.diag([1]*N+[0]*(Nmax-N)), Ntot=Ntot))
-    ot_link_function_f = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(Nmax*(Nmax+1)+1), lambda x:py_link_function_f(x,Nmax=Nmax, D=D, covarianceModel=covarianceModel, J=J))
-
-
+    RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
+    ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, sparse_gp.m*(sparse_gp.m+1)+1, lambda x:py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD))
 
     # Latent Poisson and Gaussian Process update
-    Pi_indices = [i for i in range(N,Nmax)]+[i for i in range(2*Nmax,4*Nmax-2*N+1)]
-    PyRV_Pi = PoissonGaussianProcess(ftot=ftot, Pi=Dtot[N:], Ntot=Ntot, Lambda=LambdaTrue, D=D, U=U_OT, covarianceModel=covarianceModel, PoissonScale=T, Uniform=myUniform )
+    PyRV_Pi = PoissonProcess(epsilon=np.zeros(sparse_gp.m), Lambda=LambdaTrue, U=U_OT, covarianceModel=covarianceModel, PoissonScale=T, Uniform=myUniform, sparse_gp=sparse_gp, gibbs_indices=gibbs_indices )
     RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(int(4*Nmax-2*N+J+1), int(3*Nmax-2*N+J+1), lambda x:py_link_function_Pi(x,Nmax=Nmax,J=J))
-
+    ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, sparse_gp.m+J, lambda x:py_link_function_Pi(x,gibbs_indices))
 
     # Latent Polya Gamma Process update
-    w_indices = [i for i in range(Nmax,2*Nmax)]
-    RV_w = ot.RandomVector(PolyaGammaProcess(ftot=np.concatenate([np.array(field_f).ravel(), np.zeros(Nmax-Ntot)]), Ntot=Ntot))
-    ot_link_function_w = ot.PythonFunction(4*Nmax-2*N+J+1, Nmax+1, lambda k:py_link_function_w(k,Nmax=Nmax, J=J))
+    RV_w = ot.RandomVector(PolyaGammaProcess(epsilon=np.zeros(sparse_gp.m), np.zeros(Nmax-N)]), Ntot=Ntot, gibbs_indices=gibbs_indices, sparse_gp=sparse_gp, regressorD=regressorD))
+    ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, Nmax+1, lambda x:py_link_function_w(x, gibbs_indices=gibbs_indices))
 
     # Latent zone effects update
-    Lambda_indices = [i for i in range(4*Nmax-2*N+1,4*Nmax-2*N+J+1)]
     RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*J))
-    ot_link_function_Lambda = ot.PythonFunction(4*Nmax-2*N+J+1, J*3, lambda x:py_link_function_Lambda(x,Nmax=Nmax, D=D, U=U_OT, PoissonScales=PoissonScales, a=a, b=b))
+    ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(x, D=D, U=U_OT, PoissonScales=PoissonScales, a=a, b=b, gibbs_indices=gibbs_indices))
     # TEST latent GP update
     RV_f.getRealization()
     RV_f.getParameter()
@@ -666,12 +669,15 @@ if if __name__ == "__main__":
     RV_Lambda.getRealization()
     RV_Lambda.getParameter()
 
-    # Plot Real GP trajectory on meshgrid over search domain
+    # Plot Real sparse GP trajectory on meshgrid over search domain
     gridsize = 20
     xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
     XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
 
-    Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
+    # Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
+    M_new = sparse_gp.regressorOT( XY_new )
+    eps_new = np.array( ot.Normal().getSample(sparse_gp.m) ).reshape(-1,1)
+    Z_True = np.dot( M_new, eps_new )
     # Z_True = m( XY_new )
         
     Z_True = np.array(Z_True).reshape(gridsize, gridsize) * T
