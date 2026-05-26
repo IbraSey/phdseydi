@@ -1,4 +1,4 @@
-##%
+#%%
 
 import numpy as np
 import openturns as ot
@@ -84,14 +84,13 @@ class sparseGP:
         M = self.regressorMemo(pt)
         return np.linalg(M, M, beta)
     
-            
-
 
 if __name__ == "self":
     
     import matplotlib.pyplot as plt
     
-    ##%
+    #%%
+
     
     #############################################
     #############################################
@@ -176,3 +175,5 @@ if __name__ == "self":
     plt.show()
     
     
+
+# %%
