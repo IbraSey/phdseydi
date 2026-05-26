@@ -87,9 +87,9 @@ class sparseGP:
 
 if __name__ == "self":
     
+    #%%
     import matplotlib.pyplot as plt
     
-    #%%
 
     
     #############################################
