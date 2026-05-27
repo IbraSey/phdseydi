@@ -57,6 +57,7 @@ class sparseGP:
         self.evaluateOT = ot.MemoizeFunction( ot.PythonFunction( self.m+2, 1, self.evaluatePy ) )
             
     def regressorPy(self, x):
+
         """ sparseGP regressor value,
         evaluated at point x 
         
@@ -66,9 +67,20 @@ class sparseGP:
         Returns:
             (1, m): regressor
         """
-        Phi_x = phi(x[0]-c1, self.S[0], self.L1) * phi(x[1]-c2, self.S[1], self.L2)
+        Phi_x = phi(x[0]-self.c1, self.S[0], self.L1) * phi(x[1]-self.c2, self.S[1], self.L2)
         return (Phi_x * self.sqrt_Delta)[0]
     
+    def estimate(self, X, Y):
+        """OLS estimate of regression model
+
+        Args:
+            X (N,2): train inputs
+            Y (N,1): train outputs
+        """
+        M = np.array( self.regressorOT(X) )
+        OLS = np.dot( np.linalg.inv( np.dot( M.T, M ) ), np.dot( M.T, np.array(Y).reshape(-1,1) ))
+        return OLS
+        
     
     def evaluatePy(self, x):
         """sparseGP pointwise evaluation
@@ -81,11 +93,12 @@ class sparseGP:
         """
         beta = np.array(x[:self.m]).reshape(-1,1)
         pt = x[-2:]
-        M = self.regressorMemo(pt)
+        M = self.regressorOT(pt)
         return np.linalg(M, M, beta)
     
+#%%
 
-if __name__ == "self":
+if __name__ == "self":        
     
     #%%
     import matplotlib.pyplot as plt
@@ -98,7 +111,7 @@ if __name__ == "self":
     #############################################
     #############################################
         
-    hypers = [0.5, 5, 0, 0, 5, 5, 1.]
+    hypers = [5, 0.1, 0.5, 0.5, 1, 1, 1.]
     l1, l2, c1, c2, S1, S2, nu = hypers
     
     my_sGP = sparseGP( hypers )
@@ -110,16 +123,17 @@ if __name__ == "self":
     
     kernel = ot.SquaredExponential([l1,l2], [np.sqrt(nu)])
     
-    def sparse_kernel(x):
+    def sparse_kernel(x, m = my_sGP.m):
         """compute covariance kernel approximation
 
         Args:
             x : 2D point or sample of 2D points
-        """
-        m = my_sGP.m
-        return( ot.Matrix( my_sGP.regressorOT(x) ) * (ot.Matrix( m, 1, [1]*m ) ) )
+        """        
+        if m > my_sGP.m:
+            raise ValueError(f"m must be smaller then {my_sGP.m}")
+        return( ot.Matrix( my_sGP.regressorOT(x)[:,:m] ) * (ot.Matrix( m, 1, [1]*m ) ) )
         
-    
+    ()
     x = np.linspace( -1, +1, 50 ) * my_sGP.L1
     y = np.linspace( -1, +1, 50 ) * my_sGP.L2
     
@@ -128,9 +142,10 @@ if __name__ == "self":
     
     # exact kernel 
     K = np.array([ kernel( DOE[i] ) for i in range(len(DOE)) ]).ravel()
-    sK = np.array( sparse_kernel( DOE ) )
+    # approached kernel
+    sK = np.array( sparse_kernel( DOE, m=m ) )
     
-    plt.figure(figsize=(2*L1, 4*L2))
+    plt.figure(figsize=(4*L1, 12*L2))
     
     plt.subplot(121)
     
@@ -155,19 +170,19 @@ if __name__ == "self":
     GP = ot.GaussianProcess( kernel, mesh )
     GP_sample = np.array( GP.getSample( N ) )[:,:,0]
     
-    M = ot.Matrix( my_sGP.regressorOT(DOE) )
+    M = ot.Matrix( my_sGP.regressorOT(DOE) )[:,:m]
     Beta = ot.Matrix( ot.Normal(N).getSample(m) )
     
     sGP_sample = np.array(M*Beta).T
     
-    plt.figure(figsize=(N*10, 10))
+    plt.figure(figsize=(10, 10*N))
     
     for j in range(N):
-        plt.subplot(2, N, 1+j)
+        plt.subplot(N, 2, 2*j+1)
         plt.contourf( X, Y, GP_sample[j].reshape(X.shape), levels=10 )
         if j == 0: plt.ylabel("Exact GP", fontsize=16)
         
-        plt.subplot(2, N, N+1+j)
+        plt.subplot(N, 2, 2*j+2)
         plt.contourf( X, Y, sGP_sample[j].reshape(X.shape), levels=10 )
         if j == 0: plt.ylabel("Sparse GP", fontsize=16)
     
