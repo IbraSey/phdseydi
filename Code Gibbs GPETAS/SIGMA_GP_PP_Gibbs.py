@@ -525,6 +525,30 @@ def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
     return parameter
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #%%
 
 if __name__ == "__main__":
@@ -548,21 +572,21 @@ if __name__ == "__main__":
 
     U_OT = ot.PythonFunction( 2, 2, U )
     J = 2
-    PoissonScales = T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
+    PoissonScales = 0.5 * T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
     LambdaTrue = np.array([[0.2],[4.]]) # true zones effects   
 
     # prior on zone effects
-    a = PoissonScales * 1.
-    b = PoissonScales
+    a = PoissonScales 
+    b = PoissonScales 
 
     # GP model specification
-    l1, l2, nu = 0.1, 0.1, 0.5**2
+    l1, l2, nu = 0.1, 0.5, 0.5**2
     covarianceModel = ot.SquaredExponential([l1, l2], [np.sqrt(nu)])
     m = ot.PythonFunction(2, 1, lambda x:[0])
         
     LambdaMax = LambdaTrue.max()
     # Upper bound on size of augmented Poisson process
-    Nmax = int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-6)[0])*2
+    Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
     # this is a very crude upper bound, but it allows to avoid crashes due to size issues during MCMC updates. 
     # It can be set to a lower value to speed up computations, at the risk of crashes.    
 
@@ -631,7 +655,7 @@ if __name__ == "__main__":
     # MCMC parameters # 
     ###################
 
-    sampleSize=1000
+    sampleSize=334
     blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
     ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
     
@@ -862,11 +886,13 @@ if __name__ == "__main__":
     #%%
 
 
-    #######################################
-    # Predict GP throughout search domain #
-    #######################################
+    ###############################################################
+    # Predict SIGMA-GP with zone effects throughout search domain #
+    ###############################################################
 
-    Z_new = np.zeros((len(sample), len(XY_new)))    
+    Z_new = np.zeros((len(sample), len(XY_new))) 
+    U_new = np.array(U_OT(XY_new))
+    intensity_new = np.zeros((len(sample), len(XY_new))) 
     M = np.array(sparse_gp.regressorOT( XY_new ))
     for i in range(len(sample)):
         # break
@@ -878,27 +904,31 @@ if __name__ == "__main__":
         Z_new[i] = np.dot( M, epsilon_i ).ravel()
         # PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, J))
         # Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new )
+        # sigmoid transformation
+        sigm_i = np.array(sigmoid(ot.Sample(Z_new[i].reshape(-1,1)))).ravel()
+        Lambda_i = (sample_i[gibbs_indices.lambda_indices] * U_new).sum(axis=1)
+        intensity_new[i] = sigm_i * Lambda_i
         
-    Z_mean = Z_new.mean(axis=0).reshape(gridsize, gridsize) * T
-    levels_mean = np.linspace( Z_mean.min(), Z_mean.max(), gridsize )
+    intensity_mean = intensity_new.mean(axis=0).reshape(gridsize, gridsize) * T
+    levels_mean = np.linspace( intensity_mean.min(), intensity_mean.max(), gridsize )
 
-    Z_std = Z_new.std(axis=0).reshape(gridsize, gridsize) * T
-    levels_std = np.linspace( Z_std.min(), Z_std.max(), gridsize)
+    intensity_std = intensity_new.std(axis=0).reshape(gridsize, gridsize) * T
+    levels_std = np.linspace( intensity_std.min(), intensity_std.max(), gridsize)
 
     fig = plt.figure()
-    plt.contourf(xx, yy, Z_mean, levels_mean)
+    plt.contourf(xx, yy, intensity_mean, levels_mean)
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
     plt.title("Poisson intensity posterior mean vs Data")
-    plt.savefig("f_post_mean.png")
+    plt.savefig("intensity_post_mean.png")
     #plt.close()
 
     fig = plt.figure()
-    plt.contourf(xx, yy, Z_std, levels_std)
+    plt.contourf(xx, yy, intensity_std, levels_std)
     plt.colorbar()
     plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
-    plt.title("Poisson intensiety Posterior std vs Data")
-    plt.savefig("f_post_std.png")
+    plt.title("Poisson intensity Posterior std vs Data")
+    plt.savefig("intensity_post_std.png")
     #plt.close()
 
 
@@ -915,3 +945,6 @@ if __name__ == "__main__":
 
 
 
+
+# %%
+qq

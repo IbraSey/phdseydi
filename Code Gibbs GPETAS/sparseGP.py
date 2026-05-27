@@ -96,6 +96,7 @@ class sparseGP:
         M = self.regressorOT(pt)
         return np.linalg(M, M, beta)
     
+#%%
 
 if __name__ == "self":        
     
@@ -110,7 +111,7 @@ if __name__ == "self":
     #############################################
     #############################################
         
-    hypers = [0.5, 5, 0, 0, 5, 5, 1.]
+    hypers = [5, 0.1, 0.5, 0.5, 1, 1, 1.]
     l1, l2, c1, c2, S1, S2, nu = hypers
     
     my_sGP = sparseGP( hypers )
@@ -144,7 +145,7 @@ if __name__ == "self":
     # approached kernel
     sK = np.array( sparse_kernel( DOE, m=m ) )
     
-    plt.figure(figsize=(2*L1, 4*L2))
+    plt.figure(figsize=(4*L1, 12*L2))
     
     plt.subplot(121)
     
@@ -174,14 +175,14 @@ if __name__ == "self":
     
     sGP_sample = np.array(M*Beta).T
     
-    plt.figure(figsize=(N*10, 10))
+    plt.figure(figsize=(10, 10*N))
     
     for j in range(N):
-        plt.subplot(2, N, 1+j)
+        plt.subplot(N, 2, 2*j+1)
         plt.contourf( X, Y, GP_sample[j].reshape(X.shape), levels=10 )
         if j == 0: plt.ylabel("Exact GP", fontsize=16)
         
-        plt.subplot(2, N, N+1+j)
+        plt.subplot(N, 2, 2*j+2)
         plt.contourf( X, Y, sGP_sample[j].reshape(X.shape), levels=10 )
         if j == 0: plt.ylabel("Sparse GP", fontsize=16)
     
