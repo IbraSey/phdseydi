@@ -98,6 +98,15 @@ class sparseGP:
     
 #%%
 
+
+
+
+
+
+
+
+
+
 if __name__ == "self":        
     
     #%%
@@ -115,7 +124,7 @@ if __name__ == "self":
     l1, l2, c1, c2, S1, S2, nu = hypers
     
     my_sGP = sparseGP( hypers )
-    L1, L2, m = my_sGP.L1, my_sGP.L2, my_sGP.m
+    L1, L2, m = my_sGP.L1, my_sGP.L2, int(0.9*my_sGP.m)
     
     ###############################################
     # Compare exact and sparse covariance kernels #

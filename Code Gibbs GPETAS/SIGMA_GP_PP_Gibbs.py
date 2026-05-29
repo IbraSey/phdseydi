@@ -21,6 +21,7 @@ import scipy.stats as st
 import statsmodels.tsa.stattools as stattools
 from polyagamma import random_polyagamma
 from sparseGP import sparseGP
+import shapely 
 
 ot.RandomGenerator.SetSeed(0) # Make results reproducible by freezing Open TURNS's random generator's seed
 np.random.seed(0) # Make results reproducible by freezing Numpy's random generator's seed
@@ -145,6 +146,74 @@ class NormalCholesky(ot.PythonRandomVector):
         # output[indices] = np.array(self.Chol[indices][:,indices]*Z + self.mu[indices]).ravel()
         return output
 
+########################################################################
+# Use-Case Class, collecting all necessary inputs for SGPPI case study # 
+########################################################################
+
+class SGPPIUseCase():
+    """Use-Case Class, collecting all necessary inputs for SGPPI case study
+    """
+    def __init__(self, zones, D, PoissonScales, a, b, Nmax, GPscaleFactor, nu ):
+        """Specifying data and priors for 2D SGPP model
+
+        Args:
+            zones (list): list of J shapely.Polygons
+            D (N,2): dataset (seismic catalog)
+            PoissonScales (J,): 
+                list of J scale factors for Poisson distribution
+            a (J,): prior gamma shapes
+            b (J,): prior gamma rates
+            Nmax (int): Max allowed space to represent latent PP
+            GPscaleFactor (float): used to determine correlation length
+            proportionally to domain radius
+            nu (float): marginal GP variance
+            
+        Notes
+            - Nmax must be >= Ntot (Size of latent PP) or an exception is raised
+            - /!\ realizations are zero-padded to reach size Nmax
+        
+        """
+        self.zones = zones
+        self.PoissonScales = PoissonScales
+        self.a = a
+        self.b = b
+        self.D = D
+        self.J = len(zones)
+        self.Nmax = Nmax
+        self.GPscaleFactor = GPscaleFactor
+        self.nu = nu
+        self.U_OT = ot.Memoize( ot.PythonFunction( 2, self.J self.U ) )     
+        # bounding box for uniform sampling of the data
+        self.Domain = shapely.union_all(self.zones)
+        coords = np.array(self.Domain.boundary.coords)
+        lower = coords.min(axis=1)[]
+        upper = coords.max(axis=1)
+        self.Uniform = ot.ComposedDistribution([ot.Uniform(lower[j], upper[j]) for j in range(2)])
+        # Define GP and sparse GP hyperparams
+        c1, c2 = 0.5*(lower + upper)
+        s1, s2 = 0.5*(upper - lower)
+        l1, l2 = GPscaleFactor*np.array([s1, s2])
+        hypers = (l1, l2, c1, c2, s1, s2, nu)
+        self.sparse_gp = sparseGP(hypers)
+        self.regressorD = self.sparse_gp.regressorOT(D)
+        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)        
+    
+    def U(self, x):
+        """zones indicators
+
+        Args:
+            x (2,) 2D point
+        
+        Returns:
+            (J,): binary vector (sums to 1)
+        """
+        u = np.zeros(self.J, int)
+        j = 0
+        while not inzone:
+            u[j] = self.zones[j].contains(shapely.Point(x))
+            inzone = u[j]
+        return u
+
 
 ##################################
 # Latent Gaussian process update # 
@@ -219,7 +288,7 @@ def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
 
 class PoissonProcess(ot.PythonRandomVector):
     """
-    Given current states of epsilon
+    Given current states of epsilon and Lambda,
     Generates an updated set of latent points 
     """
     def __init__( self, epsilon, Lambda, U, PoissonScale, Uniform, sparse_gp, gibbs_indices):
@@ -947,4 +1016,3 @@ if __name__ == "__main__":
 
 
 # %%
-qq
