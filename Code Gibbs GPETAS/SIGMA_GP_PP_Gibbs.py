@@ -153,12 +153,11 @@ class NormalCholesky(ot.PythonRandomVector):
 class SGPPIUseCase():
     """Use-Case Class, collecting all necessary inputs for SGPPI case study
     """
-    def __init__(self, zones, D, PoissonScales, a, b, Nmax, GPscaleFactor, nu ):
+    def __init__(self, zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu, D=None ):
         """Specifying data and priors for 2D SGPP model
 
         Args:
             zones (list): list of J shapely.Polygons
-            D (N,2): dataset (seismic catalog)
             PoissonScales (J,): 
                 list of J scale factors for Poisson distribution
             a (J,): prior gamma shapes
@@ -167,6 +166,7 @@ class SGPPIUseCase():
             GPscaleFactor (float): used to determine correlation length
             proportionally to domain radius
             nu (float): marginal GP variance
+            D (N,2) (optional): dataset (seismic catalog)
             
         Notes
             - Nmax must be >= Ntot (Size of latent PP) or an exception is raised
@@ -177,24 +177,34 @@ class SGPPIUseCase():
         self.PoissonScales = PoissonScales
         self.a = a
         self.b = b
-        self.D = D
         self.J = len(zones)
         self.Nmax = Nmax
         self.GPscaleFactor = GPscaleFactor
         self.nu = nu
-        self.U_OT = ot.Memoize( ot.PythonFunction( 2, self.J self.U ) )     
+        self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
         # bounding box for uniform sampling of the data
         self.Domain = shapely.union_all(self.zones)
         coords = np.array(self.Domain.boundary.coords)
-        lower = coords.min(axis=1)[]
-        upper = coords.max(axis=1)
+        lower = coords.min(axis=0)
+        upper = coords.max(axis=0)
         self.Uniform = ot.ComposedDistribution([ot.Uniform(lower[j], upper[j]) for j in range(2)])
         # Define GP and sparse GP hyperparams
         c1, c2 = 0.5*(lower + upper)
         s1, s2 = 0.5*(upper - lower)
         l1, l2 = GPscaleFactor*np.array([s1, s2])
         hypers = (l1, l2, c1, c2, s1, s2, nu)
+
         self.sparse_gp = sparseGP(hypers)
+        if not D is None:
+            self.setD(D)
+    
+    def setD(self, D):
+        """Set dataset for case-study
+
+        Args:
+            D (N,2) : dataset (seismic catalog)
+        """
+        self.D = D
         self.regressorD = self.sparse_gp.regressorOT(D)
         self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)        
     
@@ -209,18 +219,19 @@ class SGPPIUseCase():
         """
         u = np.zeros(self.J, int)
         j = 0
+        inzone = False
         while not inzone:
             u[j] = self.zones[j].contains(shapely.Point(x))
             inzone = u[j]
+            j += 1
+            if j == self.J: break
         return u
-
 
 ##################################
 # Latent Gaussian process update # 
 ##################################
 
-
-def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
+def py_link_function_eps(x, case):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -230,13 +241,8 @@ def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
     ----------
     x : array / list
         Current MCMC chain state
-    sparse_gp : sparseGP
-        class providing sparse GP design matrix
-    gibbs_indices : GibbsIndices
-        provides parameter indices within Markov chain
-    regressorD : (N, m)
-        regressor functions evaluated over dataset
-        must be pre-computed using sparseGP.regressorOT()
+    case : SGPPIUseCase
+        contains data and priors for 2D SGPP model
         
     Returns
     -------
@@ -247,6 +253,9 @@ def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
         with m the sparse GP truncation order 
     
     """
+    gibbs_indices = case.gibbs_indices
+    sparse_gp = case.sparse_gp
+    regressorD = case.regressorD
     # Check that gibbs_indices has same "m" attribute as sparse_gp
     if gibbs_indices.m != sparse_gp.m:
         raise ValueError
@@ -256,10 +265,6 @@ def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
     Ntot = int(x[gibbs_indices.Pi_indices[-1]])
     Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
     Omega = np.array(x[gibbs_indices.Omega_indices[:Ntot]]).reshape(-1,1)
-    # # total (augmented) data
-    # Dtot = ot.Sample(Ntot, 2)
-    # Dtot[:N] = D
-    # Dtot[N:] = Pi
     u = ot.Sample(np.array([[0.5]]*N + [[-0.5]]*(Ntot-N)))
     M = np.vstack([ regressorD, sparse_gp.regressorOT( Pi ) ])
     # precision matrix
@@ -284,59 +289,44 @@ def py_link_function_eps(x, sparse_gp, gibbs_indices, regressorD):
 # Latent Poisson update # 
 #########################
 
-# Uniform_RV = ot.RandomVector(ot.Uniform())
-
 class PoissonProcess(ot.PythonRandomVector):
     """
     Given current states of epsilon and Lambda,
     Generates an updated set of latent points 
     """
-    def __init__( self, epsilon, Lambda, U, PoissonScale, Uniform, sparse_gp, gibbs_indices):
+    def __init__( self, case, x=None):
         """
         Parameters
         ----------
-        epsilon : vector
-            sparse GP coefficients 
-            Size: m
-        Lambda : (J,1)
-            current value of zones effects
-        U : Open TURNS function
-            zone indicator functions
-            given a point (x,y), outputs J 0-1 indicators,
-            summing to 1
-        PoissonScale: Scale factor for homogeneous Poisson distribution
-            This is equal to observation period T times search domain area
-        Uniform : OpenTURNS distribution
-            uniform distribution over the search domain
-        sparse_gp : (sparseGP)
-            sparse GP design matrix calculation
-        gibbs_indices : GibbsIndices
-            provides parameter indices within Markov chain
-        
+        case : SGPPIUseCase
+            contains data and priors for 2D SGPP model
+        x : array / list, optional
+            Current MCMC chain state
         Notes
         -----
-        - epsilon and Lambda are flattened and concatenated in above order
         - parameter list size: m + J
-        - Simulated variables dimension: 2*(Nmax-N)+1 (Pi + Ntot)
+        - Simulated variables dimension: 2*(Nmax-N)+1
         - Nmax must be >= Ntot (or else a ValueError is raised)
         - when Nmax > Ntot, realizations are zero-padded
         """
-        Nmax = gibbs_indices.Nmax
-        N = gibbs_indices.N
+        Nmax = case.gibbs_indices.Nmax
+        N = case.gibbs_indices.N
         super(PoissonProcess, self).__init__(int(2*(Nmax-N))+1)
         # Internal parameters (numpy arrays)
-        self.epsilon = np.array(epsilon).reshape(-1,1)
-        self.Lambda = Lambda
-        self.J = len(Lambda)
-        self.m = sparse_gp.m
+        self.J = case.gibbs_indices.J
+        self.m = case.sparse_gp.m
         if self.m != gibbs_indices.m:
             print("sparseGP and gibbsIndices objects have different m values")
             raise ValueError
-        self.U = U
-        self.PoissonScale = PoissonScale
-        self.Uniform = Uniform
-        self.sparse_gp = sparse_gp
-        self.gibbs_indices = gibbs_indices
+        self.U = case.U_OT
+        self.PoissonScales = case.PoissonScales
+        self.Uniform = case.Uniform
+        self.sparse_gp = case.sparse_gp
+        self.gibbs_indices = case.gibbs_indices
+        self.case = case
+        if not x is None:
+            self.epsilon = x[self.gibbs_indices.epsilon_indices]
+            self.Lambda = x[self.gibbs_indices.lambda_indices]
     
     def setParameter(self, parameter):
         """
@@ -389,12 +379,12 @@ class PoissonProcess(ot.PythonRandomVector):
         N = self.gibbs_indices.N
         # Step 2: Generate candidate points uniformly over search domain
         LambdaMax = self.Lambda.max()
-        N_star = int(ot.Poisson(self.PoissonScale*LambdaMax).getRealization()[0]) # Poisson candidate number
+        N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
         XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
         # Step 3: Simulate GP trajectories
-        M = sparse_gp.regressorOT(XY_star)
-        epsilon = np.array( ot.Normal(self.m).getRealization() ).reshape(-1,1)
-        f_star = np.dot( M, epsilon )
+        M = self.sparse_gp.regressorOT(XY_star)
+        # epsilon = np.array( ot.Normal(self.m).getRealization() ).reshape(-1,1)
+        f_star = np.dot( M, self.epsilon )
         # Step 4: Thinning
         U_star = np.array( self.U(XY_star) )
         Lambda_star = np.dot( U_star, self.Lambda).reshape(-1,1)
@@ -411,30 +401,28 @@ class PoissonProcess(ot.PythonRandomVector):
         results[:2*(Ntot_new-N)] = np.array(XY_star)[accept.ravel()].ravel()
         return results
 
-def py_link_function_Pi(x, gibbs_indices):
-    """
-    Given the current state of the MCMC chain,
-    output parameters of the conditional density of
-    the Latent Poisson process, as required by the 
-    PoissonProcess class.
+    def py_link_function_Pi(self, x):
+        """
+        Given the current state of the MCMC chain,
+        output parameters of the conditional density of
+        the Latent Poisson process, as required by the 
+        PoissonProcess class.
 
-    Parameters
-    ----------
-    x : array / list
-        Current MCMC chain state
-    gibbs_indices : GibbsIndices
-        provides parameter indices within Markov chain
-    
-    Returns
-    -------
-    param : list
-        in the order required by 
-        the PoissonProcess class
-        Size : m+J)
-    """
-    epsilon = np.array(x)[:gibbs_indices.m]
-    Lambda = np.array(x)[-gibbs_indices.J:]
-    return np.concatenate([epsilon, Lambda])
+        Parameters
+        ----------
+        x : array / list
+            Current MCMC chain state
+        
+        Returns
+        -------
+        param : list
+            in the order required by 
+            the PoissonProcess class
+            Size : m+J)
+        """
+        epsilon = np.array(x)[:self.gibbs_indices.m]
+        Lambda = np.array(x)[-self.gibbs_indices.J:]
+        return np.concatenate([epsilon, Lambda])
 
 #%%
 
@@ -447,39 +435,31 @@ class PolyaGammaProcess(ot.PythonRandomVector):
     Given current states of MCMC chain 
     Generates an updated set of Polya-Gamma values
     """
-    def __init__( self, epsilon, Pi, Ntot, gibbs_indices, sparse_gp, regressorD ):
+    def __init__( self, case, x=None ):
         """
         Parameters
         ----------
-        epsilon : vector
-            sparse GP coefficients 
-            Size: m
-        Pi : (Nmax, 2) array
-            latent PP
-        Ntot : int
-            current value of total data size
-        gibbs_indices : GibbsIndices
-            provides parameter indices within Markov chain
-        sparse_gp : sparseGP
-            provides sparse GP approximation
-        regressorD : (N, m)
-            regressor functions evaluated over dataset,
-            must be pre-computed using sparseGP.regressorOT() 
+        case : SGPPIUseCase
+            contains data and priors for 2D SGPP model
+        x : array / list, optional
+            Current MCMC chain state
         """
+        self.gibbs_indices = case.gibbs_indices
+        self.sparse_gp = case.sparse_gp
         # Check that gibbs_indices has same "m" attribute as sparse_gp
-        if gibbs_indices.m != sparse_gp.m:
+        if self.gibbs_indices.m != self.sparse_gp.m:
             raise ValueError
-        self.m = sparse_gp.m
-        super(PolyaGammaProcess, self).__init__(gibbs_indices.Nmax)
-        self.epsilon = epsilon.reshape(-1,1)
-        self.Pi = Pi
-        self.Ntot = Ntot
-        self.gibbs_indices = gibbs_indices
-        self.sparse_gp = sparse_gp
-        self.regressorD = regressorD
+        super(PolyaGammaProcess, self).__init__(self.gibbs_indices.Nmax)
+        self.regressorD = case.regressorD
+        self.case = case
+        self.m = self.sparse_gp.m
+        if not x is None:
+            self.epsilon = np.array(x[self.gibbs_indices.epsilon_indices]).reshape(-1,1)
+            self.Pi = np.array(x[self.gibbs_indices.Pi_indices[:-1]]).reshape(-1,2)
+            self.Ntot = x[self.gibbs_indices.Pi_indices[-1]]
     
     def setParameter(self, parameter):
-        m = self.sparse_gp.m
+        m = self.m
         Nmax = self.gibbs_indices.Nmax
         N = self.gibbs_indices.N
         self.epsilon = np.array(parameter[:m]).reshape(-1,1)
@@ -504,35 +484,38 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         Nmax = self.gibbs_indices.Nmax
         Ntot = int(self.Ntot)
         w = np.zeros(Nmax)
-        M = np.vstack([ regressorD, sparse_gp.regressorOT( self.Pi[:Ntot-N] ) ])
+        M = np.vstack([ self.regressorD, self.sparse_gp.regressorOT( self.Pi[:Ntot-N] ) ])
         ftot = np.dot( M, self.epsilon )
         w[:Ntot] = np.abs( random_polyagamma(z=np.array(ftot)[:,0]) )
         return w
 
-def py_link_function_w(x, gibbs_indices):
-    """
-    Given the current state of the MCMC chain,
-    output parameters of the conditional Polya
-    Gamma process, as required by the 
-    PolyaGammaProcess class.
+    def py_link_function_w(self, x):
+        """
+        Given the current state of the MCMC chain,
+        output parameters of the conditional Polya
+        Gamma process, as required by the 
+        PolyaGammaProcess class.
 
-    Parameters
-    ----------
-    x : array / list
-        Current MCMC chain state
+        Parameters
+        ----------
+        x : array / list
+            Current MCMC chain state
 
-    Returns
-    -------
-    param : list
-        epsilon, Pi and Ntot values
-        as required by 
-        the PolyaGammaProcess class
-        Size : m+2*(Nmax-N)+1
-    """
-    epsilon = np.array(x)[gibbs_indices.epsilon_indices]
-    Ntot = np.array(x)[gibbs_indices.Pi_indices[-1]]
-    Pi = np.array(x)[gibbs_indices.Pi_indices[:-1]]
-    return np.hstack(( epsilon, Pi, [Ntot] ))
+        Returns
+        -------
+        param : list
+            epsilon, Pi and Ntot values
+            as required by 
+            the PolyaGammaProcess class
+            Size : m+2*(Nmax-N)+1
+        
+        Notes
+        -----
+        Ntot corresponds to the last component of Pi
+        """
+        epsilon = np.array(x)[self.gibbs_indices.epsilon_indices]
+        Pi = np.array(x)[gibbs_indices.Pi_indices]
+        return np.hstack(( epsilon, Pi ))
 
 #%%
 
@@ -541,7 +524,7 @@ def py_link_function_w(x, gibbs_indices):
 ###############################
 
 
-def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
+def py_link_function_Lambda(x, case):
     """
     Given the current state of the MCMC chain,
     output parameters of the conditional density of
@@ -549,23 +532,11 @@ def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
 
     Parameters
     ----------
+    case : SGPPIUseCase
+        contains data and priors for 2D SGPP model
     x : array / list
         Current MCMC chain state
         Size : 4*Nmax - 2*N + J + 1
-    D : (N,2)
-        Observed Poisson process
-    U : Open TURNS function
-        zone indicator functions
-        given a point (x,y), outputs J 0-1 indicators,
-        summing to 1
-    PoissonScales: (J,)
-        list of J scale factors for Poisson distribution
-    a : (J,)
-        prior shape parameters for Gamma distribution of Lambdas
-    b : (J,)
-        prior rate parameters for Gamma distribution of Lambdas
-    gibbs_indices : GibbsIndices
-        provides parameter indices within Markov chain
 
     Returns
     -------
@@ -574,6 +545,11 @@ def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
         in the order required by the RV_Lambdas class
         Size : J*3
     """
+    D = case.D
+    U = case.U_OT 
+    PoissonScales = case.PoissonScales
+    a, b = case.a, case.b
+    gibbs_indices = case.gibbs_indices
     # Extract current state of conditioning variables
     Nmax = gibbs_indices.Nmax
     N = gibbs_indices.N
@@ -585,7 +561,7 @@ def py_link_function_Lambda(x, D, U, PoissonScales, a, b, gibbs_indices):
     Dtot[:N] = D
     Dtot[N:] = Pi
     # Compute number of points in each zone
-    U_Dtot = np.array(U_OT(Dtot))
+    U_Dtot = np.array(case.U_OT(Dtot))
     Nk = U_Dtot.sum(axis=0).reshape(-1,1)
     # extract parameters in correct order (coherent with getParameter() method of RV_Lambdas)
     parameter = np.zeros( J*3 )
@@ -624,40 +600,39 @@ if __name__ == "__main__":
 
 
     #%%
-    ####################
-    # Generative model #
-    ####################
-
-    # Assuming square domain [0,1]*[0,1] (surface 1)
-    # and null trend
-
+    ##############
+    # Build case #
+    ##############
+    
     T = 50
-
-    def U(xy):
-        u = [0, 0]
-        u[0] = (xy[0]>0.5)*(xy[1]>0.5) + (xy[0]<=0.5)*(xy[1]<=0.5)
-        u[1] = 1 - u[0]
-        return u
-
-    U_OT = ot.PythonFunction( 2, 2, U )
-    J = 2
-    PoissonScales = 0.5 * T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
-    LambdaTrue = np.array([[0.2],[4.]]) # true zones effects   
+    cube = np.array([[0,0], [0,1], [1,1], [1,0], [0,0]])
+    zone00 = shapely.Polygon(cube*0.5)
+    zone11 = shapely.Polygon((1+cube)*0.5)
+    zone0 = shapely.union_all((zone00, zone11))
+    zone01 = shapely.Polygon(cube*0.5 + np.array([[0.5, 0]]))
+    zone10 = shapely.Polygon(cube*0.5 + np.array([[0, 0.5]]))
+    zone1 = shapely.union_all((zone01, zone10))
+    zones = [zone0, zone1]
+    
+    PoissonScales = T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
+    LambdaTrue = np.array([[0.2],[4.]]) # true zones effects  
+    LambdaMax = LambdaTrue.max() 
 
     # prior on zone effects
-    a = PoissonScales 
+    a = 2*PoissonScales 
     b = PoissonScales 
 
     # GP model specification
     l1, l2, nu = 0.1, 0.5, 0.5**2
     covarianceModel = ot.SquaredExponential([l1, l2], [np.sqrt(nu)])
+    
     m = ot.PythonFunction(2, 1, lambda x:[0])
         
-    LambdaMax = LambdaTrue.max()
     # Upper bound on size of augmented Poisson process
     Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
-    # this is a very crude upper bound, but it allows to avoid crashes due to size issues during MCMC updates. 
-    # It can be set to a lower value to speed up computations, at the risk of crashes.    
+
+    GPscaleFactor = 0.5
+    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
 
     #%%
 
@@ -668,9 +643,9 @@ if __name__ == "__main__":
 
     # Simulate according to homogogeneous Poisson process over search domain
     N_star = int( ot.Poisson(LambdaMax*T).getRealization()[0] )
-    myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
+    # myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
 
-    XY_star = myUniform.getSample(N_star)
+    XY_star = case.Uniform.getSample(N_star)
     mesh = ot.Mesh(XY_star)
 
     # apply trend function to mesh and create Gaussian process
@@ -682,31 +657,34 @@ if __name__ == "__main__":
     process = ot.CompositeProcess(field_function, Ftot) 
 
     field_f = process.getRealization()
-        
-    # Use thinning
-    U_star = np.array( U_OT(XY_star) )
+    
+    # Renormalized Intensity
+    U_star = np.array( case.U_OT(XY_star) )
     p_accept = np.array( field_f.getValues() ) * np.dot( U_star, LambdaTrue ) / LambdaMax
+    
+    # Use thinning    
     accepted = np.array( ot.Uniform(0, 1).getSample(N_star) ) <= p_accept 
     accepted = accepted.ravel()
     N = accepted.sum()
-    Ntot = len(accepted)
+    Ntot = N_star
     NPi = Ntot - N
 
     # Assemble Augmented (Obs + Latent) Poisson process
     # /!\ Zero-padded to reach Nmax length
     D = np.array( XY_star )[accepted]
-    Pi = np.array( XY_star )[accepted==False]
+    
+    case.setD(D)
+    # Pi = np.array( XY_star )[accepted==False]
 
-    Dtot = np.vstack((D,Pi,[[0,0]]*(Nmax-Ntot)))
+    # Dtot = np.vstack((D,Pi,[[0,0]]*(Nmax-Ntot)))
 
-    # Assemble Augmented (Obs + Latent) Gaussian process
-    # /!\ Zero-padded to reach Nmax length
-    fD = np.array(field_f)[accepted]
-    fPi = np.array(field_f)[accepted==False]
-    ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
+    # # Assemble Augmented (Obs + Latent) Gaussian process
+    # # /!\ Zero-padded to reach Nmax length
+    # fD = np.array(field_f)[accepted]
+    # fPi = np.array(field_f)[accepted==False]
+    # ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
 
     #%%
-
 
     #######################
     # TEST ON TOY DATASET #
@@ -727,32 +705,37 @@ if __name__ == "__main__":
     sampleSize=334
     blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
     ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
+        
+    # hypers = l1, l2, c1, c2, S1, S2, nu
+    sparse_gp = case.sparse_gp
+    regressorD = case.regressorD
+    gibbs_indices = case.gibbs_indices
     
-    c1, c2, S1, S2 = 0.5, 0.5, 0.5, 0.5
-    
-    hypers = l1, l2, c1, c2, S1, S2, nu
-    sparse_gp = sparseGP(hypers)
-    regressorD = sparse_gp.regressorOT(D)
-    
-    gibbs_indices = GibbsIndices(sparse_gp.m, Nmax, N, J)
-    
-    # Augmented Gaussian Process update
-    RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
-    ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, sparse_gp.m*(sparse_gp.m+1)+1, lambda x:py_link_function_eps(np.array(x), sparse_gp, gibbs_indices, regressorD))
+    # Sparse Gaussian Process update
+    RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(case.sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
+    ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_eps.getParameter()), lambda x:py_link_function_eps(np.array(x), case))
 
+    # Default chain state
+    x = np.zeros(case.gibbs_indices.chain_dim)
+    x[case.gibbs_indices.Pi_indices[-1]] = int(0.5*(case.gibbs_indices.Nmax + case.gibbs_indices.N))
+    x[case.gibbs_indices.lambda_indices] = 1
+    
+    
     # Latent Poisson Process update
-    PyRV_Pi = PoissonProcess(epsilon=np.zeros(sparse_gp.m), Lambda=LambdaTrue, U=U_OT, PoissonScale=T, Uniform=myUniform, sparse_gp=sparse_gp, gibbs_indices=gibbs_indices )
+    PyRV_Pi = PoissonProcess(case, x)
     RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, sparse_gp.m+J, lambda x:py_link_function_Pi(x,gibbs_indices))
+    ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Pi.getParameter()), PyRV_Pi.py_link_function_Pi)
 
     # Latent Polya Gamma Process update
-    PyRV_w = PolyaGammaProcess(epsilon=np.zeros(sparse_gp.m), Pi=np.zeros((Nmax-N,2)), Ntot=Ntot, gibbs_indices=gibbs_indices, sparse_gp=sparse_gp, regressorD=regressorD )
+    PyRV_w = PolyaGammaProcess(case, x)
     RV_w = ot.RandomVector( PyRV_w )
-    ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, sparse_gp.m + 2*(Nmax-N)+1, lambda x:py_link_function_w(x, gibbs_indices=gibbs_indices))
+    ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_w.getParameter()), PyRV_w.py_link_function_w)
 
     # Latent zone effects update
-    RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*J))
-    ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(np.array(x), D=D, U=U_OT, PoissonScales=PoissonScales, a=a, b=b, gibbs_indices=gibbs_indices))
+    RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*case.J))
+    # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(case, np.array(x)))
+    ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Lambda.getParameter()), lambda x:py_link_function_Lambda(np.array(x), case))
+    
     # TEST latent GP update
     RV_eps.getRealization()
     RV_eps.getParameter()
@@ -769,10 +752,10 @@ if __name__ == "__main__":
     # Learn sparse GP on observed data
      
     
-    # Plot Real sparse GP trajectory on meshgrid over search domain
-    gridsize = 20
-    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
-    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
+    # # Plot Real sparse GP trajectory on meshgrid over search domain
+    # gridsize = 20
+    # xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
+    # XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
 
     # # Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
     # M_new = sparse_gp.regressorOT( XY_new )
@@ -805,17 +788,19 @@ if __name__ == "__main__":
         # break
         # Random initialization
         randinit = np.zeros(gibbs_indices.chain_dim)
+        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
+        LambdaMax = max(randinit[gibbs_indices.lambda_indices])
         Ntot_init = 0
-        while Ntot_init < N:
+        while Ntot_init <= N:
             Ntot_init = int(ot.Poisson(LambdaMax * T).getRealization()[0])
         randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
         NPi_init = int(Ntot_init - N)
         Pi_init = np.zeros(( Nmax - N, 2 ))
-        Pi_init[:NPi_init] = np.array(myUniform.getSample(NPi_init))
+        Pi_init[:NPi_init] = np.array(case.Uniform.getSample(NPi_init))
         randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
         randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
-        # check whether useful:
-        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(J)]
+        # # check whether useful:
+        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
         randinits.append(randinit)
         # Assemble Gibbs sampler
         print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
