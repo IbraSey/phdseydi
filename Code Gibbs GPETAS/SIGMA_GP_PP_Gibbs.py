@@ -753,9 +753,9 @@ if __name__ == "__main__":
      
     
     # # Plot Real sparse GP trajectory on meshgrid over search domain
-    # gridsize = 20
-    # xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
-    # XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
+    gridsize = 20
+    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
+    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
 
     # # Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
     # M_new = sparse_gp.regressorOT( XY_new )
@@ -838,11 +838,11 @@ if __name__ == "__main__":
 
     # components = [j for j in range(paramDim-1-J,paramDim)] 
     components = [gibbs_indices.Pi_indices[-1]] + gibbs_indices.lambda_indices 
-    names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,J+1)]
+    names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,case.J+1)]
     true_values = [Ntot] + LambdaTrue.ravel().tolist()
 
     # MCMC convergence plots
-    fig = plt.figure( figsize=(5*J,5) )
+    fig = plt.figure( figsize=(5*case.J,5) )
     for i, X, c in zip( range(ninits), samples, colors ):
         # break
         for j in range(len(components)):
@@ -861,7 +861,7 @@ if __name__ == "__main__":
 
 
     # ACF (MCMC autocorrelation) plot 
-    fig = plt.figure( figsize=(5*J, 5))
+    fig = plt.figure( figsize=(5*case.J, 5))
     for i, X, c in zip( range(ninits), samples, colors ):
         for j in range(len(components)):
             plt.subplot(1, len(components), j+1)
@@ -889,7 +889,7 @@ if __name__ == "__main__":
         # on prend les variances cumulées suivant le deuxième axe (une par composante de la chaîne)
         return np.square(X).cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1) - iterative_mean(X)**2
 
-    fig = plt.figure( figsize=(5*J, 5))
+    fig = plt.figure( figsize=(5*case.J, 5))
     for j in range(len(components)):
         # remarque : on enlève la première valeur des moyennes / variances cumulés
         # pour éviter des valeurs de variance égales à zéro...
@@ -920,7 +920,7 @@ if __name__ == "__main__":
     sample = np.vstack([sample[burnin:] for sample in samples])
 
     # Posterior marginals (pooling from both chains)
-    fig = plt.figure( figsize=(5*J, 5))
+    fig = plt.figure( figsize=(5*case.J, 5))
     for j in range(len(components)):
         plt.subplot( 1, len(components), j+1)
         X = sample[burnin:,components[j]]
@@ -945,9 +945,9 @@ if __name__ == "__main__":
     ###############################################################
 
     Z_new = np.zeros((len(sample), len(XY_new))) 
-    U_new = np.array(U_OT(XY_new))
+    U_new = np.array(case.U_OT(XY_new))
     intensity_new = np.zeros((len(sample), len(XY_new))) 
-    M = np.array(sparse_gp.regressorOT( XY_new ))
+    M = np.array(case.sparse_gp.regressorOT( XY_new ))
     for i in range(len(sample)):
         # break
         sample_i =sample[i]
