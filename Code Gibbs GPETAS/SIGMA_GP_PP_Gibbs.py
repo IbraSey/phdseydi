@@ -600,9 +600,9 @@ if __name__ == "__main__":
 
 
     #%%
-    ##############
-    # Build case #
-    ##############
+    #############################
+    # Build case for simulation #
+    #############################
     
     T = 50
     cube = np.array([[0,0], [0,1], [1,1], [1,0], [0,0]])
@@ -622,30 +622,29 @@ if __name__ == "__main__":
     a = 2*PoissonScales 
     b = PoissonScales 
 
-    # GP model specification
-    l1, l2, nu = 0.1, 0.5, 0.5**2
+    # GP model specification (True values)
+    l = 0.5
+    l1, l2, nu = l, l, 0.5**2
     covarianceModel = ot.SquaredExponential([l1, l2], [np.sqrt(nu)])
     
     m = ot.PythonFunction(2, 1, lambda x:[0])
         
     # Upper bound on size of augmented Poisson process
     Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
-
+    
     GPscaleFactor = 0.5
-    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
 
-    #%%
-
-
+    case_simu = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
+    
     ###################
     # Data generation #
     ###################
-
+0
     # Simulate according to homogogeneous Poisson process over search domain
     N_star = int( ot.Poisson(LambdaMax*T).getRealization()[0] )
     # myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
 
-    XY_star = case.Uniform.getSample(N_star)
+    XY_star = case_simu.Uniform.getSample(N_star)
     mesh = ot.Mesh(XY_star)
 
     # apply trend function to mesh and create Gaussian process
@@ -659,7 +658,7 @@ if __name__ == "__main__":
     field_f = process.getRealization()
     
     # Renormalized Intensity
-    U_star = np.array( case.U_OT(XY_star) )
+    U_star = np.array( case_simu.U_OT(XY_star) )
     p_accept = np.array( field_f.getValues() ) * np.dot( U_star, LambdaTrue ) / LambdaMax
     
     # Use thinning    
@@ -673,16 +672,48 @@ if __name__ == "__main__":
     # /!\ Zero-padded to reach Nmax length
     D = np.array( XY_star )[accepted]
     
-    case.setD(D)
-    # Pi = np.array( XY_star )[accepted==False]
+    ###################################################
+    # Use Ibra's code to estimate correlation lengths    
+    
+    import sys, os
+    sys.path.append( os.path.join( os.pardir, "spatial_density_estimation", "gp_spatial" ) )
+    from gp.gibbs_sampler import iSGCP_GibbsSampler
+    from shapely.prepared import prep
 
-    # Dtot = np.vstack((D,Pi,[[0,0]]*(Nmax-Ntot)))
+    zones_prep = [prep(p) for p in zones]
+    Areas      = [(zp, 0.0) for zp in zones_prep]
 
-    # # Assemble Augmented (Obs + Latent) Gaussian process
-    # # /!\ Zero-padded to reach Nmax length
-    # fD = np.array(field_f)[accepted]
-    # fPi = np.array(field_f)[accepted==False]
-    # ftot = np.vstack((fD,fPi,[[0]]*(Nmax-Ntot)))
+    sampler = iSGCP_GibbsSampler(
+        X_bounds  = (0, 1),
+        Y_bounds  = (0, 1),
+        T         = T,
+        Areas     = Areas,
+        polygons  = zones,
+        lambda_nu = 1.,
+        nu        = [0.5, 0.5],
+        delta     = [0.5, 0.5],
+        jitter    = 1e-5,
+        rng_seed  = 15,
+    )
+
+    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
+    
+    print(f"True l :{l}, estimated l :{l_ot}")
+    print(f"True nu :{nu}, estimated nu :{v}")
+
+    #%%
+
+    ############################
+    # Create case for learning #
+    ############################
+    
+    # case_learn = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
+    
+    case_learn.setD(D)
+    
+    
+    
+
 
     #%%
 
@@ -706,7 +737,6 @@ if __name__ == "__main__":
     blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
     ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
         
-    # hypers = l1, l2, c1, c2, S1, S2, nu
     sparse_gp = case.sparse_gp
     regressorD = case.regressorD
     gibbs_indices = case.gibbs_indices
