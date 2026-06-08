@@ -493,7 +493,7 @@ class iSGCP_GibbsSampler:
     
     def estimate_eps_mle(self, x, y):
         """
-
+        
         """
         counts = np.zeros(self.J)
         for i in range(len(x)):
@@ -509,19 +509,20 @@ class iSGCP_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, grid_size=50, verbose=True):
-        """
-
-        """
+    def calibrate_nu(self, x, y, grid_size=None, verbose=True):
+        """"""
         xmin, xmax = self.X_bounds
         ymin, ymax = self.Y_bounds
 
-        # Grid 
-        gx = np.linspace(xmin, xmax, grid_size)
-        gy = np.linspace(ymin, ymax, grid_size)
-        GX, GY = np.meshgrid(gx, gy)
-        grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-        ot_grid = ot.Sample(grid_pts)
+        if grid_size is None:
+            ot_grid = ot.Sample( np.vstack((x, y)).reshape(-1,2) )
+        else:
+            # Grid 
+            gx = np.linspace(xmin, xmax, grid_size)
+            gy = np.linspace(ymin, ymax, grid_size)
+            GX, GY = np.meshgrid(gx, gy)
+            grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
+            ot_grid = ot.Sample(grid_pts)
 
         # KDE -> p_hat 
         sample_ot = ot.Sample([[float(x[i]), float(y[i])] for i in range(len(x))])

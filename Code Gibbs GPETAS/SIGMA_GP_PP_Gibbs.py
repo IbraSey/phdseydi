@@ -206,7 +206,7 @@ class SGPPIUseCase():
         """
         self.D = D
         self.regressorD = self.sparse_gp.regressorOT(D)
-        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)        
+        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)
     
     def U(self, x):
         """zones indicators
@@ -523,7 +523,6 @@ class PolyaGammaProcess(ot.PythonRandomVector):
 # Latent zones effects update # 
 ###############################
 
-
 def py_link_function_Lambda(x, case):
     """
     Given the current state of the MCMC chain,
@@ -588,7 +587,7 @@ def py_link_function_Lambda(x, case):
 
 
 
-
+sparseGP
 
 
 
@@ -699,7 +698,7 @@ if __name__ == "__main__":
     v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
     
     print(f"True l :{l}, estimated l :{l_ot}")
-    print(f"True nu :{nu}, estimated nu :{v}")
+    print(f"True nu :{nu}, estimated nu :{v**2}")
 
     #%%
 
