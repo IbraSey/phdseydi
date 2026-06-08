@@ -83,7 +83,7 @@ def plot_field(
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                 fig.savefig(FIGURES_DIR / title_savefig,
-                            dpi=200, bbox_inches="tight")
+                            dpi=150, bbox_inches="tight")
                 print(f"Figure sauvegardée : {FIGURES_DIR / title_savefig}")
             except Exception as e:
                 print(f"Erreur lors de la sauvegarde : {e}")
@@ -180,7 +180,7 @@ def plot_process_dashboard(sim_data, grids, cmap="viridis",
             FIGURES_DIR = ROOT / "visualizations" / "figures"
             FIGURES_DIR.mkdir(parents=True, exist_ok=True)
             save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
-            fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+            fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
             print(f"Figure sauvegardée : {save_path}")
         except Exception as e:
             print(f"Erreur lors de la sauvegarde : {e}")
@@ -248,7 +248,7 @@ def plot_voronoi_cells(
             FIGURES_DIR = ROOT / "visualizations" / "figures"
             FIGURES_DIR.mkdir(parents=True, exist_ok=True)
             save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
-            fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+            fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
             print(f"Figure sauvegardée : {save_path}")
         except Exception as e:
             print(f"Erreur lors de la sauvegarde : {e}")
