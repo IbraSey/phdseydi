@@ -79,7 +79,7 @@ plt.show()
 #ROOT = Path(__file__).resolve().parent.parent
 #FIGURES_DIR = ROOT / "visualizations" / "figures"
 #FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-#fig.savefig(FIGURES_DIR / "figure_test_hyperparameters_gp.pdf", dpi=300, bbox_inches="tight")
+#fig.savefig(FIGURES_DIR / "figure_test_hyperparameters_gp.pdf", dpi=150, bbox_inches="tight")
 
 
 # %%
@@ -165,7 +165,7 @@ plt.show()
 #ROOT = Path(__file__).resolve().parent.parent
 #FIGURES_DIR = ROOT / "visualizations" / "figures"
 #FIGURES_DIR.mkdir(parents=True, exist_ok=True)
-#fig.savefig(FIGURES_DIR / "figure_zonage_jouet.pdf", dpi=300, bbox_inches="tight")
+#fig.savefig(FIGURES_DIR / "figure_zonage_jouet.pdf", dpi=150, bbox_inches="tight")
 
 def tend(X):
     x, y = float(X[0]), float(X[1])

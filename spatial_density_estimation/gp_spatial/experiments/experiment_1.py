@@ -1,7 +1,7 @@
 #%%
 """
-Experiment 1 — iSGCP spatial intensity estimation
-Settings A, B, C
+Experiment 1 — SSGC posterior recovery
+Profile 1, 2, 3 x Settings A, B, C
 """
 
 # ========
@@ -29,7 +29,6 @@ from gp.data_generation import generate_voronoi_cells, simulate_process
 from visualizations.plot import plot_voronoi_cells, plot_process_dashboard
 
 
-#%%
 # ===================
 # Paramètres globaux
 # ===================
@@ -41,23 +40,47 @@ MUS_VORONOI = (10.0, 1.0, 2.0, 10.0, 8.0, 2.0)
 
 NU_INIT = [5.0, 0.2]
 LAMBDA_NU = 0.5
-DELTA = [1.0, 0.01]
+DELTA = [1.5, 0.01]
 JITTER = 1e-5
 BURN_IN = 0.4
-N_ITER = 100
-THIN = 2
-MALA_STEP = 0.1
+N_ITER = 5000
+THIN = 3
+MALA_STEP = 0.095
 LEARN_NU = False
 USE_CALIBRATION = True
 T0_NU = 50
 STEP_NU_INIT = 0.0009
 VERBOSE = True
-VERBOSE_EVERY = 10
+VERBOSE_EVERY = 100
 SEED = 42
-NX, NY = 3, 3
-NX_POST, NY_POST = 12, 12
+NX, NY = 30, 30
+NX_POST, NY_POST = 60, 60
 XB, YB = (0.0, 2.0), (0.0, 2.0)
 N_CHAINS = 5
+
+
+# Profils de regions
+PROFILES = {
+    "1": {
+        "n_germs": 6, "rng_seed": 15,
+        "mus": (10.0, 1.0, 2.0, 10.0, 8.0, 2.0),
+    },
+    "2": {
+        "n_germs": 5, "rng_seed": 15,
+        "mus": (3.5, 2.0, 4.0, 3.0, 2.5),
+    },
+    "3": {
+        "n_germs": 7, "rng_seed": 15,
+        "mus": (20.0, 1.0, 1.0, 1.0, 1.0, 1.0, 20.0),
+    },
+}
+
+T_BY_PROFILE = {
+    "1": {"A": 30.0, "B": 25.0, "C": 15.0},
+    "2": {"A": 60.0, "B": 40.0, "C": 40.0},
+    "3": {"A": 20.0, "B": 25.0, "C": 15.0},
+}
+GRID_RES_BY_SETTING = {"A": 100,  "B": 300,  "C": 300}
 
 
 # ====================
@@ -228,45 +251,53 @@ def print_diagnostics(r_hat, ess_bulk, ess_tail, J, n_chains):
 # =================================
 # Fonction principale par setting
 # =================================
-def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
+def run_setting(setting_name, f_star_func, profile_name, savefigure,
+                cmap_voronoi="cividis", cmap_intensities="inferno"):
+    import warnings
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning) 
+    warnings.filterwarnings("ignore", category=RuntimeWarning) 
+    warnings.filterwarnings("ignore", category=UserWarning) 
+
+    profile = PROFILES[profile_name]
+    T = T_BY_PROFILE[profile_name][setting_name]
+    grid_res = GRID_RES_BY_SETTING[setting_name]
+
     print(f"\n{'#'*70}")
-    print(f"  SETTING {setting_name}")
+    print(f"  SETTING {setting_name} — PROFILE {profile_name}")
     print(f"{'#'*70}\n")
 
-    # ------------------------------------
-    # Génération du pavage et des données
-    # ------------------------------------
     cells, germs = generate_voronoi_cells(
-        n_germs=N_GERMS,
-        X_bounds=X_BOUNDS,
-        Y_bounds=Y_BOUNDS,
-        rng_seed=RNG_SEED,
+        n_germs=profile["n_germs"],
+        X_bounds=X_BOUNDS, Y_bounds=Y_BOUNDS,
+        rng_seed=profile["rng_seed"],
     )
 
     plot_voronoi_cells(
         cells, germs,
-        cmap_name="cividis",
-        title=f"Pavage de Voronoï — Setting {setting_name}",
+        cmap_name=cmap_voronoi,
+        title=f"Pavage — Profile {profile_name}, Setting {setting_name}",
         savefigure=savefigure,
+        title_savefig=f"exp1_voronoi_P{profile_name}_{setting_name}",
     )
 
     sim_data, grids = simulate_process(
-        X_bounds=X_BOUNDS,
-        Y_bounds=Y_BOUNDS,
-        T=T,
-        polygons=cells,
-        mus=MUS_VORONOI,
-        f=f_star_func,
-        grid_res=grid_res,
-        rng_seed=RNG_SEED,
+        X_bounds=X_BOUNDS, Y_bounds=Y_BOUNDS, T=T,
+        polygons=cells, mus=profile["mus"],
+        f=f_star_func, grid_res=grid_res, rng_seed=RNG_SEED,
     )
 
-    plot_process_dashboard(sim_data, grids, savefigure=savefigure)
+    plot_process_dashboard(
+        sim_data, grids, cmap=cmap_intensities,
+        title=f"Processus — Profile {profile_name}, Setting {setting_name}",
+        savefigure=savefigure,
+        title_savefig=f"exp1_dashboard_P{profile_name}_{setting_name}",
+    )
 
     X_data = sim_data["X"]
     zones = sim_data["zones"]
     N = X_data.getSize()
-
+    
     x_arr = np.array([float(X_data[i, 0]) for i in range(N)])
     y_arr = np.array([float(X_data[i, 1]) for i in range(N)])
     t_arr = np.array([float(X_data[i, 2]) for i in range(N)])
@@ -331,49 +362,28 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
         )
 
         out_k = sampler_k.plot_posterior_intensity(
-            x=x_arr,
-            y=y_arr,
-            t=t_arr,
+            x=x_arr, y=y_arr, t=t_arr,
             results=results_k,
-            nx=NX_POST,
-            ny=NY_POST,
+            nx=NX_POST, ny=NY_POST,
             burn_in=BURN_IN,
-            cmap="viridis",
+            cmap=cmap_intensities,
             mu_star_func=mu_star_for_workers,
             savefigure=savefigure,
             savefigure_Emu=savefigure,
-            title_savefig=f"exp1_intensity_setting{setting_name}_chain{k+1}",
-            title_savefig_Emu=f"exp1_Emu_setting{setting_name}_chain{k+1}",
+            title_savefig=f"exp1_intensity_P{profile_name}_{setting_name}_chain{k+1}",
+            title_savefig_Emu=f"exp1_Emu_P{profile_name}_{setting_name}_chain{k+1}",
         )
         all_outputs.append(out_k)
 
-    # ------------------------------------------
-    # Diagnostics chaîne finale + multi-chaînes
-    # ------------------------------------------
-    sampler_k.plot_chains(
-        results_k,
-        savefigure=savefigure,
-        title_savefig=f"exp1_traces_setting{setting_name}",
-    )
-
-    sampler_k.plot_acf(
-        results_k,
-        burn_in=BURN_IN,
-        savefigure=savefigure,
-        title_savefig=f"exp1_acf_setting{setting_name}",
-    )
-
-    # sampler_k.plot_rhat_arviz(
-    #     all_results,
-    #     burn_in=BURN_IN,
-    #     savefigure=savefigure,
-    #     title_savefig=f"exp1_rhat_setting{setting_name}",
-    # )
-
-    # r_hat, ess_bulk, ess_tail = sampler_k.compute_diagnostics_multichain(
-    #     all_results, burn_in=BURN_IN
-    # )
-    # print_diagnostics(r_hat, ess_bulk, ess_tail, sampler_k.J, N_CHAINS)
+        # Diagnostics — noms distincts
+        sampler_k.plot_chains(
+        results_k, savefigure=savefigure,
+        title_savefig=f"exp1_traces_P{profile_name}_{setting_name}",
+        )
+        sampler_k.plot_acf(
+        results_k, burn_in=BURN_IN, savefigure=savefigure,
+        title_savefig=f"exp1_acf_P{profile_name}_{setting_name}",
+        )
 
     return all_results, all_outputs, all_nu_finals
 
@@ -383,32 +393,17 @@ def run_setting(setting_name, f_star_func, T, savefigure, grid_res=100):
 # ================
 if __name__ == "__main__":
 
-    results_A, outputs_A, nu_A = run_setting(
-        setting_name="A",
-        f_star_func=f_star_A,
-        #T=60.0,
-        T=6.0,
-        savefigure=False,
-        grid_res=100,
-    )
+    SAVEFIGURE = True
+    F_STAR = {"A": f_star_A, "B": f_star_B, "C": f_star_C}
 
-    results_B, outputs_B, nu_B = run_setting(
-        setting_name="B",
-        f_star_func=f_star_B,
-        #T=45.0,
-        T=6.0,
-        savefigure=False,
-        grid_res=300,
-    )
-
-    results_C, outputs_C, nu_C = run_setting(
-        setting_name="C",
-        f_star_func=f_star_C,
-        #T=30.0,
-        T=6.0,
-        savefigure=False,
-        grid_res=300,
-    )
+    for profile_name in ["1", "2", "3"]:
+        for setting_name in ["A", "B", "C"]:
+            run_setting(
+                setting_name=setting_name,
+                f_star_func=F_STAR[setting_name],
+                profile_name=profile_name,
+                savefigure=SAVEFIGURE,
+            )
 
     print("\nExperiment 1 terminé !")
 
