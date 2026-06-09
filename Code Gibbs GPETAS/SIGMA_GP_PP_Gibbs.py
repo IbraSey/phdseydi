@@ -587,7 +587,6 @@ def py_link_function_Lambda(x, case):
 
 
 
-sparseGP
 
 
 
@@ -670,7 +669,17 @@ if __name__ == "__main__":
     # Assemble Augmented (Obs + Latent) Poisson process
     # /!\ Zero-padded to reach Nmax length
     D = np.array( XY_star )[accepted]
+
+    # Plot the data
+    fig = plt.figure()
+    plt.scatter( D[:,0], D[:,1])
+    plt.colorbar()
+    # plt.show()
+    plt.savefig("Data.png")
+    #plt.close()
+
     
+    #%%
     ###################################################
     # Use Ibra's code to estimate correlation lengths    
     
@@ -695,7 +704,7 @@ if __name__ == "__main__":
         rng_seed  = 15,
     )
 
-    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
+    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1], grid_size=None )
     
     print(f"True l :{l}, estimated l :{l_ot}")
     print(f"True nu :{nu}, estimated nu :{v**2}")
@@ -706,27 +715,10 @@ if __name__ == "__main__":
     # Create case for learning #
     ############################
     
-    # case_learn = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
+    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
     
-    case_learn.setD(D)
-    
-    
-    
-
-
+    case.setD(D)
     #%%
-
-    #######################
-    # TEST ON TOY DATASET #
-    #######################
-
-    # Plot the data
-    fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1])
-    plt.colorbar()
-    # plt.show()
-    plt.savefig("Data.png")
-    #plt.close()
 
     ###################
     # MCMC parameters # 

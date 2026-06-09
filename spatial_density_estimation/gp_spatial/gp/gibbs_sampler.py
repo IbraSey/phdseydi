@@ -509,26 +509,39 @@ class iSGCP_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, grid_size=None, verbose=True):
+    def calibrate_nu(self, x, y, grid_size=50, verbose=True, pictose=False, scikit=True):
         """"""
         xmin, xmax = self.X_bounds
         ymin, ymax = self.Y_bounds
-
+    
         if grid_size is None:
-            ot_grid = ot.Sample( np.vstack((x, y)).reshape(-1,2) )
+            grid_pts = np.vstack((
+                np.atleast_2d(x), np.atleast_2d(y)
+                )).T
         else:
             # Grid 
             gx = np.linspace(xmin, xmax, grid_size)
             gy = np.linspace(ymin, ymax, grid_size)
             GX, GY = np.meshgrid(gx, gy)
             grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-            ot_grid = ot.Sample(grid_pts)
+        ot_grid = ot.Sample(grid_pts)
 
         # KDE -> p_hat 
         sample_ot = ot.Sample([[float(x[i]), float(y[i])] for i in range(len(x))])
         ks = ot.KernelSmoothing()
         kde = ks.build(sample_ot)
         p_hat = np.array(kde.computePDF(ot_grid)).flatten()
+        
+        if pictose:
+            gx = np.linspace(xmin, xmax, 50)
+            gy = np.linspace(ymin, ymax, 50)
+            GX, GY = np.meshgrid(gx, gy)
+            grid  = np.column_stack([GX.ravel(), GY.ravel()])
+            Z = np.array(kde.computePDF(grid)).reshape(50, 50)
+            fig = plt.figure()
+            plt.contourf(GX, GY, Z)
+            plt.colorbar()
+            plt.scatter(x, y, s=5, c='r')
 
         # eps par MLE 
         eps_mle = self.estimate_eps_mle(x, y)
@@ -536,7 +549,7 @@ class iSGCP_GibbsSampler:
         if verbose:
             print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
 
-        # Target : z(x,y) = 2*N*|S_j|/N_j * p_hat - 2 
+        # Target : z(x,y) = 2*N*|S_j|/N_j * p_hat - 2             
         N_obs = len(x)
         counts = np.zeros(self.J)
         for i in range(N_obs):
