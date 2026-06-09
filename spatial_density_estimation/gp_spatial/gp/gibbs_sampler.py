@@ -15,10 +15,12 @@ from polyagamma import random_polyagamma
 from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
 import arviz as az
+import properscoring as ps
 from visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+
 
 
 # %%
@@ -509,84 +511,51 @@ class iSGCP_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, grid_size=50, verbose=True, pictose=False, scikit=True):
-        """"""
-        xmin, xmax = self.X_bounds
-        ymin, ymax = self.Y_bounds
-    
-        if grid_size is None:
-            grid_pts = np.vstack((
-                np.atleast_2d(x), np.atleast_2d(y)
-                )).T
-        else:
-            # Grid 
-            gx = np.linspace(xmin, xmax, grid_size)
-            gy = np.linspace(ymin, ymax, grid_size)
-            GX, GY = np.meshgrid(gx, gy)
-            grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-        ot_grid = ot.Sample(grid_pts)
+    def calibrate_nu(self, x, y, verbose=True):
+        N_obs = len(x)
+        obs_pts = np.array([[float(x[i]), float(y[i])] for i in range(N_obs)])
 
-        # KDE -> p_hat 
-        sample_ot = ot.Sample([[float(x[i]), float(y[i])] for i in range(len(x))])
+        # KDE -> p_hat aux points observés
+        sample_ot = ot.Sample(obs_pts)
         ks = ot.KernelSmoothing()
         kde = ks.build(sample_ot)
-        p_hat = np.array(kde.computePDF(ot_grid)).flatten()
-        
-        if pictose:
-            gx = np.linspace(xmin, xmax, 50)
-            gy = np.linspace(ymin, ymax, 50)
-            GX, GY = np.meshgrid(gx, gy)
-            grid  = np.column_stack([GX.ravel(), GY.ravel()])
-            Z = np.array(kde.computePDF(grid)).reshape(50, 50)
-            fig = plt.figure()
-            plt.contourf(GX, GY, Z)
-            plt.colorbar()
-            plt.scatter(x, y, s=5, c='r')
+        p_hat = np.array(kde.computePDF(sample_ot)).flatten()
 
-        # eps par MLE 
+        # # KDE leave-one-out aux points observés
+        # sample_ot = ot.Sample(obs_pts)
+        # ks = ot.KernelSmoothing()
+        # h = ks.computeSilvermanBandwidth(sample_ot)
+        # kde_full = ks.build(sample_ot, h)
+        # p_hat_full = np.array(kde_full.computePDF(sample_ot)).flatten()
+        # K0 = 1.0 / (2.0 * np.pi * float(h[0]) * float(h[1]))
+        # p_hat = (N_obs * p_hat_full - K0) / (N_obs - 1)
+        # p_hat = np.maximum(p_hat, 1e-10)
+
+        # eps MLE (conservé pour initialisation du sampler)
         eps_mle = self.estimate_eps_mle(x, y)
-
         if verbose:
             print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
 
-        # Target : z(x,y) = 2*N*|S_j|/N_j * p_hat - 2             
-        N_obs = len(x)
-        counts = np.zeros(self.J)
-        for i in range(N_obs):
-            pt = ShapelyPoint(float(x[i]), float(y[i]))
-            for j, poly in enumerate(self.areas):
-                if poly.covers(pt):
-                    counts[j] += 1
-                    break
-        areas_j = np.array([self.polygons[j].area for j in range(self.J)])
-        counts = np.maximum(counts, 1e-6)
-        coefs = 2.0 * N_obs * areas_j / counts 
+        # Aire totale du domaine
+        D_area = sum(self.polygons[j].area for j in range(self.J))
 
-        n_grid = len(grid_pts)
-        z = np.zeros(n_grid)
-        for k in range(n_grid):
-            pt = ShapelyPoint(float(grid_pts[k, 0]), float(grid_pts[k, 1]))
-            for j, poly in enumerate(self.areas):
-                if poly.covers(pt):
-                    z[k] = coefs[j] * p_hat[k] - 2.0
-                    break
+        # Cible : z(x,y) = 2|D| p_hat(x,y) - 2
+        z = 2.0 * D_area * p_hat - 2.0
 
-        # GP regression : z ~ GP(0, v^2 * RBF(l)) + noise ---
+        # GP regression
         kernel = (
             C(0.1, (1e-3, 0.58 ** 2))
+            #C(0.1, (1e-3, 2.0))
             * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
             + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
         )
         gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-        gp.fit(grid_pts, z)
-    
-        # ----- Extract fitted hyperparameters -----
+        gp.fit(obs_pts, z)
+
         k_params = gp.kernel_.get_params()
         v_sq = float(k_params["k1__k1__constant_value"])
         l = float(k_params["k1__k2__length_scale"])
         v = np.sqrt(v_sq)
-        
-        # Attention différente écriture pour noyau SE entre Sklearn et OT
         l_ot = l * np.sqrt(2.0)
         self.nu = ot.Point([v_sq, l_ot])
 
@@ -595,6 +564,80 @@ class iSGCP_GibbsSampler:
 
         return v, l_ot, eps_mle
     
+    
+    # def calibrate_nu(self, x, y, grid_size=50, verbose=True):
+    #     """
+
+    #     """
+    #     xmin, xmax = self.X_bounds
+    #     ymin, ymax = self.Y_bounds
+
+    #     # Grid 
+    #     gx = np.linspace(xmin, xmax, grid_size)
+    #     gy = np.linspace(ymin, ymax, grid_size)
+    #     GX, GY = np.meshgrid(gx, gy)
+    #     grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
+    #     ot_grid = ot.Sample(grid_pts)
+
+    #     # KDE -> p_hat 
+    #     sample_ot = ot.Sample([[float(x[i]), float(y[i])] for i in range(len(x))])
+    #     ks = ot.KernelSmoothing()
+    #     kde = ks.build(sample_ot)
+    #     p_hat = np.array(kde.computePDF(ot_grid)).flatten()
+
+    #     # eps par MLE 
+    #     eps_mle = self.estimate_eps_mle(x, y)
+
+    #     if verbose:
+    #         print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
+
+    #     # Target : z(x,y) = 2*N*|S_j|/N_j * p_hat - 2 
+    #     N_obs = len(x)
+    #     counts = np.zeros(self.J)
+    #     for i in range(N_obs):
+    #         pt = ShapelyPoint(float(x[i]), float(y[i]))
+    #         for j, poly in enumerate(self.areas):
+    #             if poly.covers(pt):
+    #                 counts[j] += 1
+    #                 break
+    #     areas_j = np.array([self.polygons[j].area for j in range(self.J)])
+    #     counts = np.maximum(counts, 1e-6)
+    #     coefs = 2.0 * N_obs * areas_j / counts 
+
+    #     n_grid = len(grid_pts)
+    #     z = np.zeros(n_grid)
+    #     for k in range(n_grid):
+    #         pt = ShapelyPoint(float(grid_pts[k, 0]), float(grid_pts[k, 1]))
+    #         for j, poly in enumerate(self.areas):
+    #             if poly.covers(pt):
+    #                 z[k] = coefs[j] * p_hat[k] - 2.0
+    #                 break
+
+    #     # GP regression : z ~ GP(0, v^2 * RBF(l)) + noise ---
+    #     kernel = (
+    #         C(0.1, (1e-3, 0.58 ** 2))
+    #         * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
+    #         + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
+    #     )
+    #     gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+    #     gp.fit(grid_pts, z)
+    
+    #     # ----- Extract fitted hyperparameters -----
+    #     k_params = gp.kernel_.get_params()
+    #     v_sq = float(k_params["k1__k1__constant_value"])
+    #     l = float(k_params["k1__k2__length_scale"])
+    #     v = np.sqrt(v_sq)
+        
+    #     # Attention différente écriture pour noyau SE entre Sklearn et OT
+    #     l_ot = l * np.sqrt(2.0)
+    #     self.nu = ot.Point([v_sq, l_ot])
+
+    #     if verbose:
+    #         print(f"[calibrate_nu] v = {np.round(v, 4)} ; l_ot = {l_ot:.4f}")
+
+    #     return v, l_ot, eps_mle
+    
+
 
     # =================================================================================================
     # ----------------------------------------- Run du Gibbs ------------------------------------------
@@ -611,7 +654,7 @@ class iSGCP_GibbsSampler:
         if use_calibration:
             if verbose:
                 print("[Pre-run] Calibrating GP hyperparameters")
-            _, _, eps_mle = self.calibrate_nu(x, y, grid_size=50, verbose=verbose)
+            _, _, eps_mle = self.calibrate_nu(x, y, verbose=verbose)
         else:
             if verbose:
                 print(f"[Pre-run] Using provided nu_init = {list(self.nu)}")
@@ -678,7 +721,7 @@ class iSGCP_GibbsSampler:
 
                 # Step 3 : f | omega_D0, pi_S ~ N(mu_post, Sigma_post) 
                 f_D0, f_Df, D_f_xy, K_ff = self.update_f(x, y, Z, omega_D0, Pi_S)
-                # f_data = f_D0    # restriction à D_0 déjà faite dans update_f
+                # f_data = f_D0    # restriction à D_0 déjà faite dans update_f, re-réfléchis bien
 
                 # Extract f at observed locations D_0 (first N_0 entries of D_f)
                 idx_D0 = [i for i in range(N) if Z[i] == 0.0]
@@ -837,7 +880,8 @@ class iSGCP_GibbsSampler:
     def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3,
                              cmap="viridis", savefigure=False, title_savefig="posterior",
                              savefigure_Emu=False, title_savefig_Emu="Emu", color_Emu="steelblue",
-                             mu_star_func=None):
+                             mu_star_func=None, alpha_ecp=0.95):
+
         post_sum = self.posterior_summary(results, burn_in)
         eps_hat = post_sum["eps_hat"]
         f_data_hat = post_sum["f_data_hat"]
@@ -852,29 +896,127 @@ class iSGCP_GibbsSampler:
         interval = ot.Interval([xmin, ymin], [xmax, ymax])
         mesher = ot.IntervalMesher([nx - 1, ny - 1])
         mesh = mesher.build(interval)
-        M = mesh.getVertices().getSize()
-        if M > 22500:
+
+        XY_grid = mesh.getVertices()
+        M = XY_grid.getSize()
+
+        if M > 10000:
             raise ValueError(f"Mesh too large : {M} points")
 
+        ### Évaluation des marginales (suppose que les évaluations du GP sont indépendantes)
+        # mu_post_grid, Sigma_post_grid = self.posterior_gp(
+        #     XY_data, ot.Point(list(f_data_hat)), mesh, eps_hat
+        # )
+
+        # means = np.array(mu_post_grid).flatten()
+        # std_devs = np.sqrt(np.diagonal(np.array(Sigma_post_grid)))
+        # # n_mc = 1000
+        # n_mc = 500
+
+        # noise = np.random.randn(M, n_mc)
+        # f_sims = means[:, None] + std_devs[:, None] * noise
+        # XY_grid = mesh.getVertices()
+        # mu_tilde_grid = self.compute_mu_tilde(XY_grid, eps=eps_hat)
+        # sig_sims = expit(f_sims)
+        # mu_hat_sims = mu_tilde_grid[:, None] * sig_sims   # shape (M, n_mc)
+        # mu_hat = mu_hat_sims.mean(axis=1)
+        # squared_mu_hat = (mu_hat_sims ** 2).mean(axis=1)
+
+        # mu_hat_sample = ot.Sample([[val] for val in mu_hat])
+        # mu_hat_field  = ot.Field(mesh, mu_hat_sample)
+
+        # ---------- Simulation posterior complète du champ GP ----------
         mu_post_grid, Sigma_post_grid = self.posterior_gp(
             XY_data, ot.Point(list(f_data_hat)), mesh, eps_hat
         )
 
-        means = np.array(mu_post_grid).flatten()
-        std_devs = np.sqrt(np.diagonal(np.array(Sigma_post_grid)))
-        n_mc = 5000
+        means = np.asarray(mu_post_grid).reshape(-1)
+        Sigma = np.asarray(Sigma_post_grid)
 
-        noise = np.random.randn(M, n_mc)
-        f_sims = means[:, None] + std_devs[:, None] * noise
-        XY_grid = mesh.getVertices()
-        mu_tilde_grid = self.compute_mu_tilde(XY_grid, eps=eps_hat)
-        sig_sims = 1.0 / (1.0 + np.exp(-f_sims))
-        mu_hat_sims = mu_tilde_grid[:, None] * sig_sims
+        if means.shape[0] != M:
+            raise ValueError(
+                f"Inconsistent posterior mean size: means has size {means.shape[0]}, "
+                f"but mesh has {M} vertices"
+            )
+
+        if Sigma.shape != (M, M):
+            raise ValueError(
+                f"Inconsistent posterior covariance shape: Sigma has shape {Sigma.shape}, "
+                f"but expected {(M, M)}"
+            )
+
+        # n_mc = 1000
+        n_mc = 500
+
+        # Symétrisation numérique de la covariance
+        Sigma = 0.5 * (Sigma + Sigma.T)
+
+        # Cholesky robuste avec augmentation progressive du jitter
+        base_jitter = getattr(self, "jitter", 1e-8)
+        jitter_values = [
+            base_jitter,
+            1e-8,
+            1e-7,
+            1e-6,
+            1e-5,
+            1e-4
+        ]
+
+        L = None
+        last_error = None
+
+        for jitter in jitter_values:
+            try:
+                L = np.linalg.cholesky(Sigma + jitter * np.eye(M))
+                break
+            except np.linalg.LinAlgError as e:
+                last_error = e
+
+        if L is None:
+            raise np.linalg.LinAlgError(
+                f"Cholesky failed even with jitter up to {jitter_values[-1]}"
+            ) from last_error
+
+        # Simulation du processus GP complet : chaque colonne de f_sims est une réalisation spatiale corrélée du champ
+        Z = np.random.randn(M, n_mc)
+        f_sims = means[:, None] + L @ Z
+
+        # Intensité de base mu_tilde
+        mu_tilde_grid = np.asarray(self.compute_mu_tilde(XY_grid, eps=eps_hat)).reshape(-1)
+
+        if mu_tilde_grid.shape[0] != M:
+            raise ValueError(
+                f"Inconsistent mu_tilde size : mu_tilde_grid has size {mu_tilde_grid.shape[0]}, "
+                f"but mesh has {M} vertices"
+            )
+
+        sig_sims = expit(f_sims)
+
+        # Simulations de l'intensité posterior complète
+        mu_hat_sims = mu_tilde_grid[:, None] * sig_sims  # shape (M, n_mc)
+
+        # Moyenne, moment d'ordre 2, variance et intervalles crédibles point par point
         mu_hat = mu_hat_sims.mean(axis=1)
         squared_mu_hat = (mu_hat_sims ** 2).mean(axis=1)
 
+        var_mu_hat = squared_mu_hat - mu_hat**2
+        std_mu_hat = np.sqrt(np.maximum(var_mu_hat, 0.0))
+
+        lower_mu_hat = np.quantile(mu_hat_sims, 0.025, axis=1)
+        upper_mu_hat = np.quantile(mu_hat_sims, 0.975, axis=1)
+
+        # Conversion OpenTURNS
         mu_hat_sample = ot.Sample([[val] for val in mu_hat])
-        mu_hat_field  = ot.Field(mesh, mu_hat_sample)
+        mu_hat_field = ot.Field(mesh, mu_hat_sample)
+
+        std_mu_hat_sample = ot.Sample([[val] for val in std_mu_hat])
+        std_mu_hat_field = ot.Field(mesh, std_mu_hat_sample)
+
+        lower_mu_hat_sample = ot.Sample([[val] for val in lower_mu_hat])
+        lower_mu_hat_field = ot.Field(mesh, lower_mu_hat_sample)
+
+        upper_mu_hat_sample = ot.Sample([[val] for val in upper_mu_hat])
+        upper_mu_hat_field = ot.Field(mesh, upper_mu_hat_sample)
 
         # ---------- Calcul de E_mu ----------
         domain_area = (xmax - xmin) * (ymax - ymin)
@@ -904,26 +1046,56 @@ class iSGCP_GibbsSampler:
                     FIGURES_DIR = ROOT / "visualizations" / "figures"
                     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                     save_path = FIGURES_DIR / Path(title_savefig_Emu).with_suffix(".pdf")
-                    fig_err.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+                    fig_err.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
                     print(f"Figure E_mu sauvegardée : {save_path}")
                 except Exception as e:
                     print(f"Erreur lors de la sauvegarde E_mu : {e}")
 
             plt.show()
 
-        # ---------- Vraie intensité sur la grille (si fournie) ----------
+        # ---------- Vraie intensité + métriques (si fournie) ----------
         mu_star_grid = None
+        rmse = mae = ecp = crps_bar = diff = None
+
         if mu_star_func is not None:
+            import properscoring as ps
+
             grid_xy = np.array(XY_grid)
             mu_star_grid = mu_star_func(grid_xy[:, 0], grid_xy[:, 1])
 
             mu_star_sample = ot.Sample([[val] for val in mu_star_grid])
             mu_star_field = ot.Field(mesh, mu_star_sample)
 
-            #diff = np.abs(mu_hat - mu_star_grid)
             diff = np.abs(mu_hat - mu_star_grid) / (mu_star_grid + self.jitter)
             diff_sample = ot.Sample([[val] for val in diff])
-            diff_field  = ot.Field(mesh, diff_sample)
+            diff_field = ot.Field(mesh, diff_sample)
+
+            # --- RMSE ---
+            rmse = np.sqrt(np.mean((mu_hat - mu_star_grid) ** 2))
+
+            # --- MAE ---
+            mae = np.mean(np.abs(mu_hat - mu_star_grid))
+
+            # --- CRPS ---
+            # ps.crps_ensemble attend (observations, forecasts)
+            # observations : shape (M,)
+            # forecasts : shape (M, n_mc) 
+            crps_pointwise = ps.crps_ensemble(mu_star_grid, mu_hat_sims)  # shape (M,)
+            crps_bar = float(crps_pointwise.mean())
+
+            # --- ECP(alpha) ---
+            q_lo = np.quantile(mu_hat_sims, (1 - alpha_ecp) / 2, axis=1)
+            q_hi = np.quantile(mu_hat_sims, 1 - (1 - alpha_ecp) / 2, axis=1)
+            ecp = np.mean((mu_star_grid >= q_lo) & (mu_star_grid <= q_hi))
+
+            print(f"\n{'='*45}")
+            print(f"  Métriques (grille {nx}x{ny}, n_mc={n_mc})")
+            print(f"{'='*45}")
+            print(f"  RMSE          : {rmse:.4f}")
+            print(f"  MAE           : {mae:.4f}")
+            print(f"  CRPS          : {crps_bar:.4f}")
+            print(f"  ECP({alpha_ecp:.2f})   : {ecp:.4f}  (cible : {alpha_ecp:.2f})")
+            print(f"{'='*45}\n")
 
         # ---------- Figure ----------
         if mu_star_func is not None:
@@ -932,21 +1104,22 @@ class iSGCP_GibbsSampler:
             ax = axes[0]
             plot_field(mu_star_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
             ax.set_title(r"Vraie intensité $\mu^\star(s)$" + "\n")
-            ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
             ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
-            # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
-            ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
             ax = axes[2]
             plot_field(diff_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            #ax.set_title(r"$|\hat{\mu}(s) - \mu^\star(s)|$")
             ax.set_title(r"Erreur relative $\frac{|\hat{\mu}(s) - \mu^\star(s)|}{\mu^\star(s)}$" + "\n")
-            ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
         else:
@@ -955,15 +1128,16 @@ class iSGCP_GibbsSampler:
             ax = axes[0]
             ax.scatter(x, y, c=t, s=12, alpha=0.7, edgecolors="black", cmap="plasma")
             ax.set_title(f"Données observées (N={N})" + "\n")
-            ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
-            ax.set_aspect("equal", adjustable="box"); ax.grid(alpha=0.3)
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
+            ax.set_aspect("equal", adjustable="box")
+            ax.grid(alpha=0.3)
 
             ax = axes[1]
             plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            # ax.set_title(r"Intensité a posteriori $\hat{\mu}(s)$" + "\n")
-            # ax.scatter(x, y, s=10, alpha=0.5, color="white", edgecolors="black", linewidths=0.5)
             ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
-            ax.set_xlim(self.X_bounds); ax.set_ylim(self.Y_bounds)
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
         plt.tight_layout()
@@ -977,7 +1151,7 @@ class iSGCP_GibbsSampler:
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                 save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
-                fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+                fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
                 print(f"Figure sauvegardée : {save_path}")
             except Exception as e:
                 print(f"Erreur lors de la sauvegarde : {e}")
@@ -985,19 +1159,31 @@ class iSGCP_GibbsSampler:
         plt.show()
 
         return {
-            "mu_hat"         : mu_hat,
-            "mu_star"        : mu_star_grid,
-            #"diff"           : np.abs(mu_hat - mu_star_grid) if mu_star_grid is not None else None,
-            "diff"           : diff if mu_star_grid is not None else None,
-            "squared_mu_hat" : squared_mu_hat,
-            "mu_field"       : mu_hat_field,
-            "mesh"           : mesh,
-            "mu_post_gp"     : mu_post_grid,
-            "Sigma_post_gp"  : Sigma_post_grid,
-            "eps_hat"        : eps_hat,
-            "f_data_hat"     : f_data_hat,
-            "E_mu_bar"       : E_mu_bar,
-            "E_mu_chain"     : E_mu_post,
+            "mu_hat"              : mu_hat,
+            "mu_star"             : mu_star_grid,
+            "diff"                : diff,
+            "squared_mu_hat"      : squared_mu_hat,
+            "var_mu_hat"          : var_mu_hat,
+            "std_mu_hat"          : std_mu_hat,
+            "lower_mu_hat"        : lower_mu_hat,
+            "upper_mu_hat"        : upper_mu_hat,
+            "mu_hat_sims"         : mu_hat_sims,
+            "mu_field"            : mu_hat_field,
+            "std_mu_field"        : std_mu_hat_field,
+            "lower_mu_field"      : lower_mu_hat_field,
+            "upper_mu_field"      : upper_mu_hat_field,
+            "mesh"                : mesh,
+            "mu_post_gp"          : mu_post_grid,
+            "Sigma_post_gp"       : Sigma_post_grid,
+            "eps_hat"             : eps_hat,
+            "f_data_hat"          : f_data_hat,
+            "E_mu_bar"            : E_mu_bar,
+            "E_mu_chain"          : E_mu_post,
+            "rmse"                : rmse,
+            "mae"                 : mae,
+            "crps"                : crps_bar,
+            "ecp"                 : ecp,
+            "alpha_ecp"           : alpha_ecp,
         }
     ####################################################################################################
     ####################################################################################################
@@ -1047,7 +1233,7 @@ class iSGCP_GibbsSampler:
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                 save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
-                fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+                fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
                 print(f"Figure sauvegardée : {save_path}")
             except Exception as e:
                 print(f"Erreur lors de la sauvegarde : {e}")
@@ -1075,7 +1261,7 @@ class iSGCP_GibbsSampler:
                     FIGURES_DIR = ROOT / "visualizations" / "figures"
                     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                     save_path = FIGURES_DIR / Path("traces_nu").with_suffix(".pdf")
-                    fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+                    fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
                     print(f"Figure sauvegardée : {save_path}")
                 except Exception as e:
                     print(f"Erreur lors de la sauvegarde : {e}")
@@ -1131,7 +1317,7 @@ class iSGCP_GibbsSampler:
                 FIGURES_DIR = ROOT / "visualizations" / "figures"
                 FIGURES_DIR.mkdir(parents=True, exist_ok=True)
                 save_path = FIGURES_DIR / Path(title_savefig).with_suffix(".pdf")
-                fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+                fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
                 print(f"Figure sauvegardée : {save_path}")
             except Exception as e:
                 print(f"Erreur lors de la sauvegarde : {e}")
@@ -1182,7 +1368,7 @@ class iSGCP_GibbsSampler:
     #             FIGURES_DIR = ROOT / "visualizations" / "figures"
     #             FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     #             save_path = FIGURES_DIR / Path("ess").with_suffix(".pdf")
-    #             fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+    #             fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
     #             print(f"Figure sauvegardée : {save_path}")
     #         except Exception as e:
     #             print(f"Erreur lors de la sauvegarde : {e}")
@@ -1242,7 +1428,7 @@ class iSGCP_GibbsSampler:
     #             FIGURES_DIR = ROOT / "visualizations" / "figures"
     #             FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     #             save_path = FIGURES_DIR / Path("r_hat").with_suffix(".pdf")
-    #             fig.savefig(save_path, format="pdf", dpi=200, bbox_inches="tight")
+    #             fig.savefig(save_path, format="pdf", dpi=150, bbox_inches="tight")
     #             print(f"Figure sauvegardée : {save_path}")
     #         except Exception as e:
     #             print(f"Erreur lors de la sauvegarde : {e}")
@@ -1276,4 +1462,81 @@ class iSGCP_GibbsSampler:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # %%
+
+    
+
+
+
+# %%
+
+
+
+
