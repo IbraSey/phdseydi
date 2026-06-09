@@ -703,7 +703,7 @@ if __name__ == "__main__":
         rng_seed  = 15,
     )
 
-    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1], grid_size=None )
+    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
     
     print(f"True l :{l}, estimated l :{l_ot}")
     print(f"True nu :{nu}, estimated nu :{v**2}")
