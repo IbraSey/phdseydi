@@ -495,7 +495,7 @@ class iSGCP_GibbsSampler:
     
     def estimate_eps_mle(self, x, y):
         """
-
+        
         """
         counts = np.zeros(self.J)
         for i in range(len(x)):
