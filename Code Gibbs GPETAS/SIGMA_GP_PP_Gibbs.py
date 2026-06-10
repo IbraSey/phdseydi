@@ -153,7 +153,7 @@ class NormalCholesky(ot.PythonRandomVector):
 class SGPPIUseCase():
     """Use-Case Class, collecting all necessary inputs for SGPPI case study
     """
-    def __init__(self, zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu, D=None ):
+    def __init__(self, zones, PoissonScales, a, b, Nmax, l, nu, D=None ):
         """Specifying data and priors for 2D SGPP model
 
         Args:
@@ -163,8 +163,7 @@ class SGPPIUseCase():
             a (J,): prior gamma shapes
             b (J,): prior gamma rates
             Nmax (int): Max allowed space to represent latent PP
-            GPscaleFactor (float): used to determine correlation length
-            proportionally to domain radius
+            GPscaleFactor (2,):  correlation lengths
             nu (float): marginal GP variance
             D (N,2) (optional): dataset (seismic catalog)
             
@@ -179,7 +178,7 @@ class SGPPIUseCase():
         self.b = b
         self.J = len(zones)
         self.Nmax = Nmax
-        self.GPscaleFactor = GPscaleFactor
+        self.l = l
         self.nu = nu
         self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
         # bounding box for uniform sampling of the data
@@ -191,7 +190,7 @@ class SGPPIUseCase():
         # Define GP and sparse GP hyperparams
         c1, c2 = 0.5*(lower + upper)
         s1, s2 = 0.5*(upper - lower)
-        l1, l2 = GPscaleFactor*np.array([s1, s2])
+        l1, l2 = l
         hypers = (l1, l2, c1, c2, s1, s2, nu)
 
         self.sparse_gp = sparseGP(hypers)
@@ -206,7 +205,7 @@ class SGPPIUseCase():
         """
         self.D = D
         self.regressorD = self.sparse_gp.regressorOT(D)
-        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)        
+        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)
     
     def U(self, x):
         """zones indicators
@@ -523,7 +522,6 @@ class PolyaGammaProcess(ot.PythonRandomVector):
 # Latent zones effects update # 
 ###############################
 
-
 def py_link_function_Lambda(x, case):
     """
     Given the current state of the MCMC chain,
@@ -593,7 +591,6 @@ def py_link_function_Lambda(x, case):
 
 
 
-
 #%%
 
 if __name__ == "__main__":
@@ -634,7 +631,7 @@ if __name__ == "__main__":
     
     GPscaleFactor = 0.5
 
-    case_simu = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
+    case_simu = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l1, l2], nu)
     
     ###################
     # Data generation #
@@ -671,7 +668,17 @@ if __name__ == "__main__":
     # Assemble Augmented (Obs + Latent) Poisson process
     # /!\ Zero-padded to reach Nmax length
     D = np.array( XY_star )[accepted]
+
+    # Plot the data
+    fig = plt.figure()
+    plt.scatter( D[:,0], D[:,1])
+    plt.colorbar()
+    # plt.show()
+    plt.savefig("Data.png")
+    #plt.close()
+
     
+    #%%
     ###################################################
     # Use Ibra's code to estimate correlation lengths    
     
@@ -699,7 +706,7 @@ if __name__ == "__main__":
     v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
     
     print(f"True l :{l}, estimated l :{l_ot}")
-    print(f"True nu :{nu}, estimated nu :{v}")
+    print(f"True nu :{nu}, estimated nu :{v**2}")
 
     #%%
 
@@ -707,27 +714,10 @@ if __name__ == "__main__":
     # Create case for learning #
     ############################
     
-    # case_learn = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, GPscaleFactor, nu)
+    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l_ot, l_ot], v**2)
     
-    case_learn.setD(D)
-    
-    
-    
-
-
+    case.setD(D)
     #%%
-
-    #######################
-    # TEST ON TOY DATASET #
-    #######################
-
-    # Plot the data
-    fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1])
-    plt.colorbar()
-    # plt.show()
-    plt.savefig("Data.png")
-    #plt.close()
 
     ###################
     # MCMC parameters # 
