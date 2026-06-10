@@ -2396,7 +2396,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         # ── Résumé ──
 
-        return 0
+        return 0 
     
 
 
