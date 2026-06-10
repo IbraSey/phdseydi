@@ -2071,6 +2071,345 @@ class SSGC_GibbsSampler:
 
 # %%
 
+class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
+    """
+    
+    """
+
+    def __init__(
+        self,
+        X_bounds, Y_bounds, T,
+        Areas, lambda_nu, nu, delta, polygons,
+        use_etas=False,
+        theta_phi_init=None,
+        theta_phi_priors=None,
+        m=None,
+        m_c=0.0,
+        m_max=None,
+        beta_init=2.3,
+        beta_priors=None,
+        sigma_MH_etas=0.1,
+        sigma_MH_beta=0.1,
+        t0_etas=50,
+        eps_mh_etas=1e-6,
+        jitter=1e-5,
+        rng_seed=None,
+    ):
+        super().__init__(
+            X_bounds=X_bounds, Y_bounds=Y_bounds, T=T,
+            Areas=Areas, lambda_nu=lambda_nu, nu=nu,
+            delta=delta, polygons=polygons,
+            jitter=jitter, rng_seed=rng_seed,
+        )
+
+        self.use_etas = use_etas
+        self.t0_etas = t0_etas
+        self.eps_mh_etas = eps_mh_etas
+        self.sigma_MH_etas = sigma_MH_etas
+        self.sigma_MH_beta = sigma_MH_beta
+
+        if use_etas:
+            self.theta_phi_priors = {}
+        else:
+            self.m = None
+            self.use_magnitudes = False
+            self.m_c = 0.0
+            self.m_max = None
+            self.beta = None
+            self.beta_priors = None
+            self.theta_phi = None
+            self.theta_phi_priors = None
+
+    
+    # =======================================================================================
+    # -------------------------------------- Outillage --------------------------------------
+    # =======================================================================================
+
+    def _phi_ij(self, i, j, t, x, y):
+        """
+        
+        """
+        tp = self.theta_phi
+        dt = float(t[i]) - float(t[j])
+        if dt <= 0:
+            return 0.0
+
+        phi_m = tp["A"]
+        if self.use_magnitudes:
+            phi_m *= np.exp(tp["alpha"] * (self.m[j] - self.m_c))
+
+        phi_t = (tp["p"] - 1) * tp["c"] ** (tp["p"] - 1) * (dt + tp["c"]) ** (-tp["p"])
+
+        R_mj = tp["d"] * (np.exp(tp["gamma"] * (self.m[j] - self.m_c))
+                           if self.use_magnitudes else 1.0)
+        r2 = (float(x[i]) - float(x[j])) ** 2 + (float(y[i]) - float(y[j])) ** 2
+        phi_s = (tp["q"] - 1) / (np.pi * R_mj) * (1 + r2 / R_mj) ** (-tp["q"])
+
+        return phi_m * phi_t * phi_s
+    
+
+    def _log_posterior_beta(self, beta):
+        """
+        
+        """
+        
+        return 
+    
+
+    def _log_posterior_A_alpha(self, A, alpha, t, Z):
+        """
+        
+        """
+        if A <= 0:
+            return -np.inf
+        if self.use_magnitudes and alpha <= 0:
+            return -np.inf
+
+        tp = self.theta_phi_priors
+        Z_arr = np.array([float(Z[i]) for i in range(len(Z))])
+        o_j = np.array([np.sum(Z_arr == (j + 1)) for j in range(len(Z))])
+        T_j_vec = self.T - np.array([float(t[j]) for j in range(len(t))])
+
+        log_lik = o_j.sum() * np.log(A)
+        if self.use_magnitudes:
+            log_lik += alpha * np.sum(o_j * (self.m - self.m_c))
+            log_lik -= A * np.sum(np.exp(alpha * (self.m - self.m_c)) * T_j_vec)
+        else:
+            log_lik -= A * np.sum(T_j_vec)
+
+        log_prior = (tp["a_A"] - 1) * np.log(A) - tp["b_A"] * A
+        if self.use_magnitudes:
+            log_prior += (tp["a_alpha"] - 1) * np.log(alpha) - tp["b_alpha"] * alpha
+
+        return log_lik + log_prior
+    
+
+    def _log_posterior_c_p(self, c, p, t, Z):
+        """
+        
+        """
+        if c <= 0 or p <= 1:
+            return -np.inf
+        tp = self.theta_phi_priors
+        log_lik = 0.0
+        for i in range(len(t)):
+            j = int(float(Z[i]))
+            if j == 0:
+                continue
+            dt = float(t[i]) - float(t[j - 1])
+            if dt <= 0:
+                continue
+            log_lik += np.log(p - 1) + (p - 1) * np.log(c) - p * np.log(dt + c)
+        log_prior = (tp["a_c"] - 1) * np.log(c) - tp["b_c"] * c
+        log_prior += (tp["a_p"] - 1) * np.log(p - 1) - tp["b_p"] * (p - 1)
+        return log_lik + log_prior
+    
+
+    def _log_posterior_d_q_gamma(self, d, q, gamma, x, y, Z):
+        """
+        
+        """
+        if d <= 0 or q <= 1:
+            return -np.inf
+        if self.use_magnitudes and gamma <= 0:
+            return -np.inf
+        tp = self.theta_phi_priors
+        log_lik = 0.0
+        for i in range(len(x)):
+            j = int(float(Z[i]))
+            if j == 0:
+                continue
+            j_py = j - 1
+            r2 = (float(x[i]) - float(x[j_py])) ** 2 + (float(y[i]) - float(y[j_py])) ** 2
+            R_mj = d * (np.exp(gamma * (self.m[j_py] - self.m_c))
+                        if self.use_magnitudes else 1.0)
+            log_lik += np.log(q - 1) - np.log(np.pi * R_mj) - q * np.log(1 + r2 / R_mj)
+        log_prior = (tp["a_d"] - 1) * np.log(d) - tp["b_d"] * d
+        log_prior += (tp["a_q"] - 1) * np.log(q - 1) - tp["b_q"] * (q - 1)
+        if self.use_magnitudes:
+            log_prior += (tp["a_gamma"] - 1) * np.log(gamma) - tp["b_gamma"] * gamma
+        return log_lik + log_prior
+    
+
+    
+    # ==============================================================================================
+    # --------------------------------- Posteriors conditionnelles ---------------------------------
+    # ==============================================================================================
+    def update_Z(self, t, x, y, eps_arr, f_data):
+        """
+
+        """
+        N = len(t)
+        if not self.use_etas:
+            return ot.Point([0.0] * N)
+
+        XY_obs = ot.Sample([[float(x[i]), float(y[i])] for i in range(N)])
+        mu_tilde_obs = self.compute_mu_tilde(XY_obs, eps=eps_arr)
+        sig_f = 1.0 / (1.0 + np.exp(-np.array(f_data)))
+        mu_obs = mu_tilde_obs * sig_f
+
+        Z_new = np.zeros(N)
+        for i in range(N):
+            weights = [mu_obs[i]]
+            for j in range(i):
+                weights.append(self._phi_ij(i, j, t, x, y))
+            weights = np.array(weights)
+            total = weights.sum()
+            if total <= 0:
+                Z_new[i] = 0
+                continue
+            Z_new[i] = np.random.choice(i + 1, p=weights / total)
+
+        return ot.Point(Z_new.tolist())
+    
+
+    def update_A_alpha(self, t, Z, history, it):
+        """
+        
+        """
+        
+        return False
+
+
+    def update_c_p(self, t, Z, history, it):
+        """
+        
+        """
+        
+        return False
+
+
+    def update_d_q_gamma(self, x, y, Z, history, it):
+        """
+        
+        """
+        
+        return False
+
+
+    def update_beta(self, history, it):
+        """
+        
+        """
+        
+        return False
+    
+
+
+    # ================================================================================================
+    # ----------------------------- Run du Gibbs (subplante Run de SSGC) -----------------------------
+    # ================================================================================================
+
+    def run(self, t, x, y, mala_step=0.05, n_iter=1000,
+            learn_nu=False, learn_beta=False,
+            t0_nu=50, step_nu_init=0.1,
+            verbose=True, verbose_every=100, use_calibration=True,
+            mu_star_func=None, grid_nx=30, grid_ny=30, thin=1):
+        """
+        Run of the full SPIN-Hawkes Gibbs sampler
+        """
+        # Delegate to parent when ETAS is off
+        if not self.use_etas:
+            return super().run(
+                t, x, y, mala_step=mala_step, n_iter=n_iter, learn_nu=learn_nu,
+                t0_nu=t0_nu, step_nu_init=step_nu_init, verbose=verbose,
+                verbose_every=verbose_every, use_calibration=use_calibration,
+                mu_star_func=mu_star_func, grid_nx=grid_nx, grid_ny=grid_ny, thin=thin,
+            )
+
+        N = len(t)
+        if learn_beta and not self.use_magnitudes:
+            if verbose:
+                print("[Warning] learn_beta=True ignoré : pas de magnitudes")
+            learn_beta = False
+
+        tp_names = (["A", "alpha", "c", "p", "d", "q", "gamma"]
+                    if self.use_magnitudes else ["A", "c", "p", "d", "q"])
+        n_tp = len(tp_names)
+
+        # --- Initialisation ---
+        Z = ot.Point([0.0] * N)
+        N_j, _ = self._count_events_per_zone(x, y, Z, ot.Sample(0, 3))
+
+        if use_calibration:
+            if verbose:
+                print("[Pre-run] Calibrating GP hyperparameters")
+            _, _, eps_mle = self.calibrate_nu(x, y, verbose=verbose)
+        else:
+            if verbose:
+                print(f"[Pre-run] Using provided nu_init = {list(self.nu)}")
+            eps_mle = self.estimate_eps_mle(x, y)
+
+        eps = ot.Point(eps_mle.tolist())
+        f_data = ot.Point([0.0] * N)
+
+        # --- Chaînes ---
+        n_store = (n_iter + thin - 1) // thin
+        eps_chain = np.zeros((n_store, self.J))
+        nPi_chain = np.zeros(n_store, dtype=int)
+        fdata_chain = np.zeros((n_store, N))
+        nu_chain = np.zeros((n_store, 2))
+        Z_chain = np.zeros((n_store, N))
+        tp_chain = np.zeros((n_store, n_tp))
+        beta_chain = np.zeros(n_store) if learn_beta else None
+        E_mu_chain = np.full(n_iter, np.nan)
+        store_idx = 0
+
+        acc_eps, acc_nu, acc_beta = 0, 0, 0
+        acc_etas = {"A_alpha": 0, "c_p": 0, "d_q_gamma": 0}
+
+        hist_nu, hist_Aa, hist_cp, hist_dqg, hist_beta = [], [], [], [], []
+
+        if verbose:
+            print("\n" + "=" * 100)
+            print(f"{'':>30} Gibbs : {n_iter} iter, N={N} {'':>30}")
+            print("=" * 100)
+
+        # for it in range(n_iter):
+            # try:
+                # 1. ω | f
+
+                # 2. π_S | f, ε
+                
+                # 3. f
+
+                # 4. epsilon (MALA)
+
+                # 5. nu (AM, optionnel)
+
+                # 6. Z
+
+                # 7. theta_phi (AM par blocs)
+
+                # 8. beta (AM)
+
+                # --- Verbose ---
+                # if verbose and (it % verbose_every == 0 or it == n_iter - 1):
+                #     print(msg)
+
+                # --- Stockage ---
+                # if it % thin == 0:
+
+            # except Exception as e:
+            #    print(f"\n[ERROR] iter {it}: {e}")
+            #    raise
+
+        # ── Résumé ──
+
+        return 0 
+    
+
+
+    # ================================================================================================
+    # ---------------------------------- Analyse posterior -------------------------------------------
+    # ================================================================================================
+
+    def posterior_summary(self, results, burn_in=0.3):
+        """
+        
+        """
+
+        return 
     
 
 
