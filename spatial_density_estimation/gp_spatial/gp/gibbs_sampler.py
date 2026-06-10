@@ -1,3 +1,8 @@
+"""
+
+"""
+
+
 # %%
 # =================================================================================================
 # -------------------------------------------- IMPORTS --------------------------------------------
@@ -25,12 +30,63 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 
 # %%
 # =========================================================================================================
-# -------------------------------------------- GIBBS POUR SGCP --------------------------------------------
+# -------------------------------------------- GIBBS POUR SSGC --------------------------------------------
 # =========================================================================================================
 
-class iSGCP_GibbsSampler:
-    """
-
+class SSGC_GibbsSampler:
+    """Gibbs sampler for the informative Spatially Structured sigmoidal Gaussian Cox process (SSGC)
+ 
+    The SSGC models the spatial intensity of a Cox process as the product of a piecewise-constant zonal 
+    baseline μ̃(x,y) = exp(ε_j) for (x,y) ∈ S_j and a sigmoidal transformation of a latent GP :
+ 
+        μ(x,y) = μ̃(x,y) · σ(f(x,y)),   f ~ GP(0, k(·,· | v², ℓ)).
+ 
+    The sampler alternates between :
+      1. Pólya-Gamma auxiliary variables ω | f,
+      2. latent marked Poisson thinned process π_S | f, ε,
+      3. GP realization f | ω, π_S  (conjugate Gaussian update),
+      4. zonal log-intensities ε | f, π_S  (MALA),
+      5. (optional) kernel hyperparameters ν = (v², ℓ) | f  (Adaptive MH).
+ 
+    Parameters
+    ----------
+    X_bounds : tuple of float
+        Spatial domain bounds along x: (x_min, x_max).
+    Y_bounds : tuple of float
+        Spatial domain bounds along y: (y_min, y_max).
+    T : float
+        Temporal observation window length.
+    Areas : list of (shapely.Polygon, float)
+        Each element is a pair (prepared_polygon, ε_j_init) specifying a zone
+        geometry and its initial log-intensity.
+    lambda_nu : float
+        Rate parameter of the exponential prior on each component of ν = (v², ℓ).
+    nu : list or array of float, shape (2,)
+        Initial GP kernel hyperparameters [v², ℓ], where v² is the marginal
+        variance and ℓ the characteristic length-scale (OpenTURNS convention).
+    delta : list or array of float, shape (2,)
+        Hyperparameters [δ₀, δ₁] of the Gaussian zonal prior Σ_ε, where δ₀
+        controls the marginal variance and δ₁ the inter-centroid correlation
+        length-scale.
+    polygons : list of shapely.Polygon
+        Raw (unprepared) polygon geometries for each zone, used for area
+        computation and centroid extraction.
+    jitter : float, optional
+        Numerical regularisation added to kernel matrix diagonals (default 1e-5).
+    rng_seed : int or None, optional
+        Seed for the OpenTURNS random generator. If None, no seed is set.
+    
+    Attributes
+    ----------
+    J : int
+        Number of domains in the partition.
+    centroids_xy : ndarray, shape (J, 2)
+        Centroids of the Voronoï domains.
+    Sigma_eps : ndarray, shape (J, J)
+        Prior covariance matrix of ε, constructed from the Gaussian kernel
+        evaluated at zone centroids.
+    Sigma_eps_inv : ot.CovarianceMatrix
+        Regularised inverse of Sigma_eps.
     """
 
     def __init__(
@@ -76,6 +132,24 @@ class iSGCP_GibbsSampler:
 
     @staticmethod
     def _acf(x, max_lag):
+        """Compute the empirical autocorrelation function of a univariate chain.
+ 
+        Uses the biased normalisation (dividing by n rather than n−k) which is
+        standard for MCMC diagnostics and guarantees a positive-semidefinite
+        estimate.
+ 
+        Parameters
+        ----------
+        x : array_like, shape (n,)
+            Univariate time series (typically a post-burn-in MCMC chain).
+        max_lag : int
+            Maximum lag at which to evaluate the ACF. Clamped to n−1 if larger.
+ 
+        Returns
+        -------
+        acf_vals : ndarray, shape (min(max_lag, n−1) + 1,)
+            Autocorrelation values from lag 0 (always 1.0) to lag max_lag.
+        """
         x = np.asarray(x)
         x = x - x.mean()
         n = len(x)
@@ -94,8 +168,21 @@ class iSGCP_GibbsSampler:
         return acf_vals
 
     def compute_Sigma_eps(self):
-        """
-
+        """Build the structured Gaussian prior covariance Σ_ε for the zonal log-intensities.
+ 
+        The covariance is a Gaussian (squared-exponential) kernel evaluated at
+        the centroids of the Voronoï zones:
+ 
+            Σ_{jj'} = δ₀ · exp(−‖c_j − c_{j'}‖² / (2 δ₁²))
+ 
+        where (δ₀, δ₁) = self.delta.
+ 
+        Returns
+        -------
+        centroids_xy : ndarray, shape (J, 2)
+            Matrix of zone centroids, row j = (c_x^j, c_y^j).
+        Sigma_eps : ndarray, shape (J, J)
+            Symmetric positive-definite covariance matrix.
         """
         delta0, delta1 = map(float, self.delta)
         centroids_xy = np.array(
@@ -109,8 +196,36 @@ class iSGCP_GibbsSampler:
         return centroids_xy, Sigma_eps
 
     def compute_kernel(self, XY_data, XY_new=None):
-        """
-
+        """Evaluate the squared-exponential GP kernel at given spatial locations.
+ 
+        When only ``XY_data`` is provided, returns the Gram matrix K_{dd}.
+        When ``XY_new`` is also provided, returns the block decomposition
+        (K_{dd}, K_{*d}, K_{**}) needed for GP prediction (kriging).
+ 
+        The kernel is parameterised by self.nu = [v², ℓ]:
+ 
+            k((x,y),(x',y')) = v² · exp(−‖(x,y)−(x',y')‖² / (2ℓ²))
+ 
+        Note: OpenTURNS's SquaredExponential expects (scale, amplitude), where
+        amplitude = √v² and scale = ℓ for each input dimension.
+ 
+        Parameters
+        ----------
+        XY_data : ot.Sample or array_like, shape (N, 2)
+            Training / conditioning locations.
+        XY_new : ot.Sample or array_like, shape (M, 2), optional
+            Prediction locations. If None, only K_{dd} is returned.
+ 
+        Returns
+        -------
+        K_dd : ot.CovarianceMatrix, shape (N, N)
+            Gram matrix at training locations (returned in both cases).
+        K_new_data : ot.Matrix, shape (M, N)
+            Cross-covariance between prediction and training locations
+            (only when XY_new is not None).
+        K_new_new : ot.CovarianceMatrix, shape (M, M)
+            Prior covariance at prediction locations
+            (only when XY_new is not None).
         """
         nu0, nu1 = map(float, self.nu)
         sigma_amp = np.sqrt(nu0)      # OT attend sigma, pas sigma^2
@@ -157,8 +272,24 @@ class iSGCP_GibbsSampler:
         return K_dd, K_new_data, K_new_new
 
     def compute_mu_tilde(self, XY, eps=None):
-        """
-
+        """Evaluate the piecewise-constant baseline intensity μ̃(x,y) = exp(ε_j).
+ 
+        For each query point, the method identifies the enclosing zone S_j via
+        a sequential polygon containment test and returns exp(ε_j). Points that
+        fall outside all zones receive μ̃ = 0.
+ 
+        Parameters
+        ----------
+        XY : ot.Sample or array_like, shape (n, 2)
+            Query locations.
+        eps : array_like, shape (J,), optional
+            Zonal log-intensities. If None, uses the initial values stored in
+            self.epsilons.
+ 
+        Returns
+        -------
+        mu_vals : ndarray, shape (n,)
+            Baseline intensity at each query point.
         """
         if not isinstance(XY, ot.Sample):
             XY = ot.Sample(np.asarray(XY).tolist())
@@ -174,8 +305,21 @@ class iSGCP_GibbsSampler:
         return mu_vals
 
     def sample_candidats(self, N):
-        """
-        
+        """Draw N points uniformly over the rectangular bounding box of the domain.
+ 
+        This is a utility function used for rejection-based spatial sampling.
+        Points may fall outside the actual study domain (union of polygons);
+        the caller is responsible for subsequent containment checks.
+ 
+        Parameters
+        ----------
+        N : int
+            Number of candidate points to draw.
+ 
+        Returns
+        -------
+        candidates : ot.Sample, shape (N, 2)
+            Uniformly distributed points in [x_min, x_max] × [y_min, y_max].
         """
         xmin, xmax = self.X_bounds
         ymin, ymax = self.Y_bounds
@@ -185,8 +329,29 @@ class iSGCP_GibbsSampler:
         return distribution.getSample(int(N))
 
     def _log_posterior_nu(self, nu_vals, f_Df, D_f_sample):
-        """
-        
+        """Evaluate the unnormalised log-posterior of the GP kernel hyperparameters.
+ 
+        The posterior factorises as
+ 
+            log p(ν | f, D_f) ∝ log p(f | ν, D_f) + log p(ν),
+ 
+        where p(f | ν, D_f) = N(f; 0, K_{ff}(ν)) is the GP marginal likelihood
+        and p(ν) = Exp(λ_ν) ⊗ Exp(λ_ν) is the independent exponential prior on
+        each component of ν = (v², ℓ).
+ 
+        Parameters
+        ----------
+        nu_vals : list or ot.Point, shape (2,)
+            Candidate hyperparameters [v², ℓ].
+        f_Df : ot.Point, shape (N_f,)
+            Current GP realization at the augmented data locations D_f = D₀ ∪ π_S.
+        D_f_sample : ot.Sample, shape (N_f, 2)
+            Spatial coordinates of the augmented data locations.
+ 
+        Returns
+        -------
+        log_post : float
+            Unnormalised log-posterior log p(ν | f, D_f) (up to a constant).
         """
         nu0, nu1 = map(float, nu_vals)
         log_prior = -self.lambda_nu * (nu0 + nu1)
@@ -202,8 +367,29 @@ class iSGCP_GibbsSampler:
         return log_likelihood + log_prior
     
     def _log_posterior_eps(self, eps_arr, N_j, M_j):
-        """
-
+        """Evaluate the unnormalised log-conditional-posterior of the zonal log-intensities.
+ 
+        Combines the structured Gaussian prior ε ~ N(0, Σ_ε) with the Poisson
+        likelihood contribution from the augmented data:
+ 
+            log p(ε | ·) ∝ −½ εᵀ Σ_ε⁻¹ ε + Σ_j [(N_j + M_j) ε_j − T |S_j| exp(ε_j)]
+ 
+        where N_j counts observed background events and M_j counts latent thinned
+        events in zone S_j.
+ 
+        Parameters
+        ----------
+        eps_arr : ndarray, shape (J,)
+            Current zonal log-intensities.
+        N_j : ndarray, shape (J,)
+            Number of observed background events per zone.
+        M_j : ndarray, shape (J,)
+            Number of latent marked Poisson process events per zone.
+ 
+        Returns
+        -------
+        log_post : float
+            Unnormalised log-conditional-posterior value.
         """
         Sigma_inv = np.array(self.Sigma_eps_inv)
         areas_j = np.array([self.polygons[j].area for j in range(self.J)])
@@ -214,16 +400,55 @@ class iSGCP_GibbsSampler:
         return prior_term + likelihood_term
 
     def _grad_log_posterior_eps(self, eps_arr, N_j, M_j):
-        """
-
+        """Compute the gradient of the log-conditional-posterior of ε.
+ 
+        The gradient decomposes into a prior contribution and a likelihood
+        contribution:
+ 
+            ∇_ε log p(ε | ·) = (N_j + M_j) − T |S_j| exp(ε_j) − Σ_ε⁻¹ ε
+ 
+        This closed-form gradient is used in the MALA proposal for ε.
+ 
+        Parameters
+        ----------
+        eps_arr : ndarray, shape (J,)
+            Current zonal log-intensities.
+        N_j : ndarray, shape (J,)
+            Number of observed background events per zone.
+        M_j : ndarray, shape (J,)
+            Number of latent marked Poisson process events per zone.
+ 
+        Returns
+        -------
+        grad : ndarray, shape (J,)
+            Gradient vector ∇_ε log p(ε | ·).
         """
         Sigma_inv = np.array(self.Sigma_eps_inv)
         areas_j = np.array([self.polygons[j].area for j in range(self.J)])
         return (N_j + M_j) - self.T * areas_j * np.exp(eps_arr) - Sigma_inv @ eps_arr
 
     def _count_events_per_zone(self, x, y, Z, Pi_S):
-        """
-
+        """Count observed background events and latent thinned events per zone.
+ 
+        Iterates over all observed events and latent Poisson process points,
+        assigning each to its enclosing zone via polygon containment tests.
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events.
+        Z : ot.Point, shape (N,)
+            Branching labels: Z[i] = 0 indicates a background event, Z[i] = j > 0
+            indicates an event triggered by parent j.
+        Pi_S : ot.Sample, shape (M, 3)
+            Latent marked Poisson process realization. Columns are (x, y, ω).
+ 
+        Returns
+        -------
+        N_j : ndarray, shape (J,)
+            Number of observed background events (z_i = 0) in each zone.
+        M_j : ndarray, shape (J,)
+            Number of latent thinned events (from π_S) in each zone.
         """
         N_j = np.zeros(self.J)
         M_j = np.zeros(self.J)
@@ -251,8 +476,43 @@ class iSGCP_GibbsSampler:
     # ==============================================================================================
 
     def update_f(self, x, y, Z, omega_D0, Pi_S):
-        """
-
+        """Sample the latent GP f from its Gaussian conditional posterior.
+ 
+        Thanks to the Pólya-Gamma augmentation, the conditional posterior of f
+        given the auxiliary variables is Gaussian:
+ 
+            f | Ω, κ ~ N(Σ_post · κ,  Σ_post),
+            Σ_post = (K_{ff}⁻¹ + Ω)⁻¹,
+ 
+        where Ω = diag(ω) collects the PG auxiliary variables and κ_k = +½ for
+        observed background events and −½ for latent thinned events.
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of all observed events.
+        Z : ot.Point, shape (N,)
+            Current branching labels (Z[i] = 0 for background events).
+        omega_D0 : ot.Point, shape (N,)
+            Pólya-Gamma auxiliary variables at observed event locations.
+        Pi_S : ot.Sample, shape (M, 3)
+            Current latent marked Poisson process realization (x, y, ω).
+ 
+        Returns
+        -------
+        f_D0 : ot.Point, shape (N₀,)
+            GP draw restricted to observed background event locations.
+        f_Df : ot.Point, shape (N_f,)
+            GP draw at all augmented locations D_f = D₀ ∪ π_S.
+        D_f : ot.Sample, shape (N_f, 2)
+            Spatial coordinates of D_f.
+        K_ff : ot.CovarianceMatrix, shape (N_f, N_f)
+            Prior kernel matrix at D_f (with jitter).
+ 
+        Raises
+        ------
+        ValueError
+            If no background events are found (N₀ = 0).
         """
         idx = [i for i in range(len(Z)) if Z[i] == 0.0]
         N_0 = len(idx)
@@ -327,9 +587,35 @@ class iSGCP_GibbsSampler:
 
         return f_D0, f_Df, D_f, K_ff
 
-    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_ZONES=1000, LIM_CANDIDATES=2000):
-        """
-
+    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
+        """Sample a new realization of the latent marked Poisson process π_S.
+ 
+        The thinning algorithm proceeds in three steps:
+          1. For each zone S_j, propose N_cand ~ Poisson(T |S_j| exp(ε_j))
+             candidate locations uniformly inside S_j.
+          2. Accept each candidate (x_k, y_k) with probability
+             σ(−f(x_k, y_k)), where f is predicted via GP kriging from D₀.
+          3. For each accepted location, sample a PG mark ω ~ PG(1, f(x,y)).
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events (used as GP conditioning set).
+        f_data : ot.Point or array_like, shape (N,)
+            Current GP values at observed event locations.
+        eps : ot.Point or array_like, shape (J,)
+            Current zonal log-intensities.
+        LIM_CANDIDATES_ZONES : int, optional
+            Maximum number of candidate points per zone (default 1000).
+        LIM_CANDIDATES : int, optional
+            Global maximum across all zones (default 2000).
+ 
+        Returns
+        -------
+        Pi_S : ot.Sample, shape (M_accepted, 3)
+            Accepted thinned points. Columns are (x, y, ω), where ω is the
+            Pólya-Gamma mark. Returns an empty Sample (size 0) if no points
+            are accepted.
         """
         N = len(x)
         XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
@@ -344,8 +630,8 @@ class iSGCP_GibbsSampler:
             N_cand_j = int(ot.Poisson(mean_j).getRealization()[0])
             if N_cand_j == 0:
                 continue
-            if N_cand_j > LIM_CANDIDATES_ZONES:
-                N_cand_j = LIM_CANDIDATES_ZONES
+            if N_cand_j > LIM_CANDIDATES_DOMAINS:
+                N_cand_j = LIM_CANDIDATES_DOMAINS
             accepted = []
             while len(accepted) < N_cand_j:
                 pts = ot.ComposedDistribution(
@@ -412,8 +698,34 @@ class iSGCP_GibbsSampler:
         return Pi_S
     
     def update_eps(self, eps, N_j, M_j, step):
-        """
-
+        """Update the zonal log-intensities ε via a MALA proposal.
+ 
+        The Metropolis-Adjusted Langevin Algorithm exploits the closed-form
+        gradient of the log-posterior to construct an informed proposal:
+ 
+            ε* = ε + (h²/2) ∇ log p(ε | ·) + h ξ,   ξ ~ N(0, I_J).
+ 
+        A Metropolis-Hastings correction ensures the correct stationary
+        distribution. The theoretically optimal acceptance rate for MALA
+        targeting a J-dimensional distribution is ≈ 57.4%.
+ 
+        Parameters
+        ----------
+        eps : ot.Point or array_like, shape (J,)
+            Current zonal log-intensities.
+        N_j : ndarray, shape (J,)
+            Number of observed background events per zone.
+        M_j : ndarray, shape (J,)
+            Number of latent thinned events per zone.
+        step : float
+            MALA step size h > 0.
+ 
+        Returns
+        -------
+        eps_out : ndarray, shape (J,)
+            Updated (or unchanged if rejected) zonal log-intensities.
+        accepted : bool
+            True if the proposal was accepted.
         """
         eps_arr = np.array(eps)
 
@@ -443,8 +755,47 @@ class iSGCP_GibbsSampler:
             return eps_arr, False
 
     def update_nu(self, f_Df, D_f_sample, history_log_nu, it, step_nu_init=0.1, t0=50, sd=2.38**2/2, eps_mh=1e-6):
-        """
-
+        """Update GP kernel hyperparameters ν = (v², ℓ) via Adaptive Metropolis.
+ 
+        Implements the AM algorithm of Haario, Saksman & Tamminen (2001). During
+        a warm-up phase (it ≤ t0), an isotropic random walk with variance
+        step_nu_init is used. After warm-up, the proposal covariance adapts to
+        the empirical covariance of the chain history:
+ 
+            Σ_prop = s_d · Cov(log ν^(0), …, log ν^(t−1)) + ε I_d,
+ 
+        where s_d = 2.38² / d is the optimal scaling for d-dimensional Gaussian
+        targets (Roberts et al., 1997) and ε is a small regularisation constant.
+ 
+        The proposal is made on the log scale to enforce positivity: v², ℓ > 0.
+        The Jacobian correction log|J| = Σ(log ν*_k − log ν_k) is included in
+        the acceptance ratio.
+ 
+        Parameters
+        ----------
+        f_Df : ot.Point, shape (N_f,)
+            Current GP realization at augmented data locations.
+        D_f_sample : ot.Sample, shape (N_f, 2)
+            Spatial coordinates of augmented data locations.
+        history_log_nu : list of ndarray
+            Chain history of log ν values, modified in-place by the caller.
+        it : int
+            Current Gibbs iteration index.
+        step_nu_init : float, optional
+            Isotropic proposal variance during warm-up (default 0.1).
+        t0 : int, optional
+            Number of warm-up iterations before adaptation (default 50).
+        sd : float, optional
+            Scaling factor for the empirical covariance (default 2.38²/2).
+        eps_mh : float, optional
+            Regularisation constant added to the proposal covariance (default 1e-6).
+ 
+        Returns
+        -------
+        nu : ot.Point, shape (2,)
+            Updated (or unchanged) hyperparameters.
+        accepted : bool
+            True if the proposal was accepted.
         """
         nu0, nu1     = map(float, self.nu)
         log_nu_cur   = np.log([nu0, nu1])
@@ -494,8 +845,24 @@ class iSGCP_GibbsSampler:
     # ==============================================================================================
     
     def estimate_eps_mle(self, x, y):
-        """
-
+        """Estimate the zonal log-intensities by maximum likelihood.
+ 
+        For each zone S_j, the MLE of ε_j under a homogeneous Poisson model is:
+ 
+            ε̂_j = log(N_j / (T |S_j|))
+ 
+        where N_j is the observed count in zone j. A floor of 1e-6 is applied
+        to the rate to avoid log(0).
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events.
+ 
+        Returns
+        -------
+        eps_mle : ndarray, shape (J,)
+            Maximum likelihood estimates of the zonal log-intensities.
         """
         counts = np.zeros(self.J)
         for i in range(len(x)):
@@ -512,6 +879,38 @@ class iSGCP_GibbsSampler:
         return eps_mle
     
     def calibrate_nu(self, x, y, verbose=True):
+        """Heuristic calibration of GP hyperparameters via linearised sigmoid inversion.
+ 
+        Under the approximation σ(f) ≈ ½ + ¼f (valid for small v), the model
+        can be inverted to yield a Gaussian regression target:
+ 
+            z(x,y) = 2|D| p̂(x,y) − 2 + noise,
+ 
+        where p̂ is a KDE estimate of the spatial density. The hyperparameters
+        (v², ℓ) are then obtained by maximising the marginal likelihood of a
+        GP regression model fitted to z, using scikit-learn's
+        GaussianProcessRegressor.
+ 
+        The variance v² is constrained to remain below 0.58² ≈ 0.34 to ensure
+        the linearisation remains valid at the 99% confidence level (see
+        Appendix B of the paper).
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events.
+        verbose : bool, optional
+            If True, print calibrated values (default True).
+ 
+        Returns
+        -------
+        v : float
+            Calibrated marginal standard deviation of the GP (√v²).
+        l_ot : float
+            Calibrated length-scale in the OpenTURNS convention (ℓ_OT = ℓ_sklearn · √2).
+        eps_mle : ndarray, shape (J,)
+            MLE of zonal log-intensities (computed as a by-product).
+        """
         N_obs = len(x)
         obs_pts = np.array([[float(x[i]), float(y[i])] for i in range(N_obs)])
 
@@ -646,6 +1045,64 @@ class iSGCP_GibbsSampler:
     def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None,grid_nx=30, grid_ny=30, thin=1): 
+        """Run the Gibbs sampler for the SSGC model.
+ 
+        Performs ``n_iter`` iterations of the augmented Gibbs sampler, cycling
+        through the conditional updates of ω, π_S, f, ε, and optionally ν.
+        Optionally computes the per-iteration L² reconstruction error against
+        a known ground-truth intensity.
+ 
+        Parameters
+        ----------
+        t : array_like, shape (N,)
+            Event times (used only for compatibility with the ETAS subclass;
+            not used directly by the SSGC sampler).
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events.
+        mala_step : float, optional
+            MALA step size h for the ε update (default 0.05).
+        n_iter : int, optional
+            Total number of Gibbs iterations (default 1000).
+        learn_nu : bool, optional
+            If True, update GP hyperparameters ν at each iteration using
+            Adaptive Metropolis (default False).
+        t0_nu : int, optional
+            AM warm-up period for ν (default 50).
+        step_nu_init : float, optional
+            Initial isotropic proposal variance for ν during warm-up (default 0.1).
+        verbose : bool, optional
+            If True, print progress messages (default True).
+        verbose_every : int, optional
+            Print interval in iterations (default 100).
+        use_calibration : bool, optional
+            If True, run the heuristic GP hyperparameter calibration before
+            sampling (default True).
+        mu_star_func : callable or None, optional
+            Ground-truth intensity function μ*(x, y) for computing the L²
+            reconstruction error. Signature: mu_star_func(x_arr, y_arr) -> arr.
+            If None, the error is not computed.
+        grid_nx, grid_ny : int, optional
+            Resolution of the evaluation grid for the L² error (default 30×30).
+        thin : int, optional
+            Thinning interval for chain storage (default 1, i.e. no thinning).
+ 
+        Returns
+        -------
+        results : dict
+            Dictionary with keys:
+            - ``'eps'``: ndarray (n_store, J), chain of ε.
+            - ``'nPi'``: ndarray (n_store,), |π_S| at each stored iteration.
+            - ``'f_data'``: ndarray (n_store, N), chain of f at observed locations.
+            - ``'nu'``: ndarray (n_store, 2), chain of ν.
+            - ``'E_mu'``: ndarray (n_iter,), per-iteration L² error (NaN if not computed).
+            - ``'acceptance_eps'``: float, MALA acceptance rate for ε.
+            - ``'acceptance_nu'``: float or None, AM acceptance rate for ν.
+            - ``'last_state'``: dict, final parameter values.
+            - ``'Sigma_eps'``: ndarray (J, J), prior covariance of ε.
+            - ``'centroids'``: ndarray (J, 2), zone centroids.
+            - ``'thin'``: int, thinning factor.
+            - ``'n_iter'``: int, total iterations.
+        """
 
         N = len(t)
         Z = ot.Point([0.0] * N)
@@ -828,7 +1285,24 @@ class iSGCP_GibbsSampler:
     # ================================================================================================
 
     def posterior_summary(self, results, burn_in=0.3):
-        """
+        """Compute posterior mean estimates from MCMC chain output.
+ 
+        Discards the first ``burn_in`` fraction of the chain and averages the
+        remaining samples for each parameter.
+ 
+        Parameters
+        ----------
+        results : dict
+            Output of :meth:`run`.
+        burn_in : float, optional
+            Fraction of the chain to discard as burn-in (default 0.3).
+ 
+        Returns
+        -------
+        summary : dict
+            - ``'eps_hat'``: ndarray (J,), posterior mean of ε.
+            - ``'f_data_hat'``: ndarray (N,), posterior mean of f at data locations.
+            - ``'nu_hat'``: ndarray (2,), posterior mean of ν = (v², ℓ).
         """
         eps_chain = np.asarray(results["eps"])
         f_chain = np.asarray(results["f_data"])
@@ -841,8 +1315,33 @@ class iSGCP_GibbsSampler:
         }
 
     def posterior_gp(self, XY_data, f_data_hat, mesh, eps_hat):
-        """
-
+        """Compute the GP predictive posterior at mesh vertices.
+ 
+        Given the posterior mean of f at the data locations, computes the
+        kriging mean and covariance at the mesh vertices using the standard
+        GP conditional formulas:
+ 
+            μ_* = K_{*d} K_{dd}⁻¹ f̂,
+            Σ_* = K_{**} − K_{*d} K_{dd}⁻¹ K_{*d}ᵀ.
+ 
+        Parameters
+        ----------
+        XY_data : ot.Sample, shape (N, 2)
+            Conditioning locations (observed event positions).
+        f_data_hat : ot.Point or array_like, shape (N,)
+            Posterior mean of the GP at conditioning locations.
+        mesh : ot.Mesh
+            OpenTURNS mesh whose vertices define the prediction locations.
+        eps_hat : ndarray, shape (J,)
+            Posterior mean of the zonal log-intensities (not used in GP
+            prediction but kept in the signature for API consistency).
+ 
+        Returns
+        -------
+        mu_post : ot.Point, shape (M,)
+            Kriging mean at mesh vertices.
+        Sigma_post : ot.CovarianceMatrix, shape (M, M)
+            Kriging covariance at mesh vertices.
         """
         XY_grid = mesh.getVertices()
         N = XY_data.getSize()
@@ -865,22 +1364,58 @@ class iSGCP_GibbsSampler:
         return mu_post, Sigma_post
     
 
-
-
-
-
-    ####################################################################################################
-    ####################################################################################################
-    ####################################################################################################
-    ######################################### CHECKPOINT VERIF #########################################
-    ####################################################################################################
-    ####################################################################################################
-    ####################################################################################################
-
     def plot_posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3,
                              cmap="viridis", savefigure=False, title_savefig="posterior",
                              savefigure_Emu=False, title_savefig_Emu="Emu", color_Emu="steelblue",
                              mu_star_func=None, alpha_ecp=0.95):
+        """Plot the posterior intensity estimate with uncertainty quantification.
+ 
+        Generates Monte Carlo draws from the full GP posterior on a regular mesh,
+        transforms them through μ̃ · σ(f) to obtain posterior intensity samples,
+        and computes point-wise statistics (mean, std, credible intervals).
+ 
+        If a ground-truth intensity ``mu_star_func`` is provided, also computes
+        and displays RMSE, MAE, CRPS (via properscoring), and ECP metrics, along
+        with a pointwise relative error map.
+ 
+        Parameters
+        ----------
+        x, y : array_like, shape (N,)
+            Spatial coordinates of observed events.
+        t : array_like, shape (N,)
+            Event times.
+        results : dict
+            Output of :meth:`run`.
+        nx, ny : int, optional
+            Mesh resolution for posterior evaluation (default 70×70).
+        burn_in : float, optional
+            Burn-in fraction (default 0.3).
+        cmap : str, optional
+            Matplotlib colormap name (default 'viridis').
+        savefigure : bool, optional
+            If True, save the main figure as PDF (default False).
+        title_savefig : str, optional
+            Filename stem for the main figure (default 'posterior').
+        savefigure_Emu : bool, optional
+            If True, save the E_μ trace plot (default False).
+        title_savefig_Emu : str, optional
+            Filename stem for the E_μ figure (default 'Emu').
+        color_Emu : str, optional
+            Line colour for the E_μ trace (default 'steelblue').
+        mu_star_func : callable or None, optional
+            Ground-truth intensity function. If None, only the estimate is plotted.
+        alpha_ecp : float, optional
+            Nominal coverage level for ECP computation (default 0.95).
+ 
+        Returns
+        -------
+        output : dict
+            Dictionary with keys including 'mu_hat', 'mu_star', 'diff',
+            'var_mu_hat', 'std_mu_hat', 'lower_mu_hat', 'upper_mu_hat',
+            'mu_hat_sims' (MC samples), 'mesh', 'eps_hat', 'f_data_hat',
+            'E_mu_bar', 'rmse', 'mae', 'crps', 'ecp', and corresponding
+            OpenTURNS Field objects.
+        """
 
         post_sum = self.posterior_summary(results, burn_in)
         eps_hat = post_sum["eps_hat"]
@@ -1185,24 +1720,26 @@ class iSGCP_GibbsSampler:
             "ecp"                 : ecp,
             "alpha_ecp"           : alpha_ecp,
         }
-    ####################################################################################################
-    ####################################################################################################
-    ####################################################################################################
-    ########################################## FIN CHECKPOINT ##########################################
-    ####################################################################################################
-    ####################################################################################################
-    ####################################################################################################
-
-
-
-
-
-
-
-
-
+    
     
     def plot_chains(self, results, figsize=(9, 5), savefigure=False, title_savefig="traces_eps"):
+        """Plot trace plots and marginal histograms for ε and optionally ν.
+ 
+        Produces a panel of (J + 2) × 2 subplots: for each component of ε and
+        (if learned) ν, the left column shows the chain trace and the right
+        column shows the marginal histogram.
+ 
+        Parameters
+        ----------
+        results : dict
+            Output of :meth:`run`.
+        figsize : tuple of float, optional
+            Figure size (width, height) in inches (default (9, 5)).
+        savefigure : bool, optional
+            If True, save the figure as PDF (default False).
+        title_savefig : str, optional
+            Filename stem (default 'traces_eps').
+        """
         eps_chain = np.asarray(results["eps"])
         nu_chain = np.asarray(results["nu"])
         thin = results.get("thin", 1)
@@ -1269,6 +1806,26 @@ class iSGCP_GibbsSampler:
 
 
     def plot_acf(self, results, burn_in=0.3, max_lag=50, figsize=(8, 6), savefigure=False, title_savefig="trace_acf"):
+        """Plot the autocorrelation function for each parameter chain.
+ 
+        Computes and displays the ACF of the post-burn-in chain for each
+        component of ε and (if learned) ν.
+ 
+        Parameters
+        ----------
+        results : dict
+            Output of :meth:`run`.
+        burn_in : float, optional
+            Fraction of the chain to discard (default 0.3).
+        max_lag : int, optional
+            Maximum lag for ACF computation (default 50).
+        figsize : tuple of float, optional
+            Figure size (default (8, 6)).
+        savefigure : bool, optional
+            If True, save the figure as PDF (default False).
+        title_savefig : str, optional
+            Filename stem (default 'trace_acf').
+        """
         eps_chain = np.asarray(results["eps"])
         nu_chain = np.asarray(results["nu"])
         thin = results.get("thin", 1)
@@ -1439,6 +1996,28 @@ class iSGCP_GibbsSampler:
     #     return out
     
     def compute_diagnostics_multichain(self, results_list, burn_in=0.3):
+        """Compute multi-chain MCMC convergence diagnostics for ε.
+ 
+        Uses ArviZ to compute the Gelman-Rubin R̂ statistic, bulk ESS, and
+        tail ESS from multiple independent chains. Convergence is typically
+        declared when R̂ < 1.05 for all components.
+ 
+        Parameters
+        ----------
+        results_list : list of dict
+            List of M outputs from :meth:`run`, each from an independent chain.
+        burn_in : float, optional
+            Fraction of each chain to discard (default 0.3).
+ 
+        Returns
+        -------
+        r_hat : ndarray, shape (J,)
+            Gelman-Rubin R̂ for each component of ε.
+        ess_bulk : ndarray, shape (J,)
+            Bulk effective sample size for each component.
+        ess_tail : ndarray, shape (J,)
+            Tail effective sample size for each component.
+        """
         M = len(results_list)
         L = results_list[0]["eps"].shape[0]   # n_store (après thinning)
         burn = int(burn_in * L)
@@ -1458,45 +2037,6 @@ class iSGCP_GibbsSampler:
         ess_tail = az.ess(idata, method="tail")["eps"].values
 
         return r_hat, ess_bulk, ess_tail
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
