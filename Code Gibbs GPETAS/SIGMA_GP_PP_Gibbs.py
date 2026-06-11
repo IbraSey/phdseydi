@@ -591,6 +591,10 @@ def py_link_function_Lambda(x, case):
 
 
 
+
+
+
+
 #%%
 
 if __name__ == "__main__":
@@ -631,7 +635,7 @@ if __name__ == "__main__":
     
     GPscaleFactor = 0.5
 
-    case_simu = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l1, l2], nu)
+    mcmc_simu = SGPPI_MCMC(zones, PoissonScales, a, b, Nmax, [l1, l2], nu)
     
     ###################
     # Data generation #
@@ -641,7 +645,7 @@ if __name__ == "__main__":
     N_star = int( ot.Poisson(LambdaMax*T).getRealization()[0] )
     # myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
 
-    XY_star = case_simu.Uniform.getSample(N_star)
+    XY_star = mcmc_simu.Uniform.getSample(N_star)
     mesh = ot.Mesh(XY_star)
 
     # apply trend function to mesh and create Gaussian process
@@ -655,7 +659,7 @@ if __name__ == "__main__":
     field_f = process.getRealization()
     
     # Renormalized Intensity
-    U_star = np.array( case_simu.U_OT(XY_star) )
+    U_star = np.array( mcmc_simu.U_OT(XY_star) )
     p_accept = np.array( field_f.getValues() ) * np.dot( U_star, LambdaTrue ) / LambdaMax
     
     # Use thinning    
@@ -714,248 +718,15 @@ if __name__ == "__main__":
     # Create case for learning #
     ############################
     
-    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l_ot, l_ot], v**2)
-    
-    case.setD(D)
+    mcmc = SGPPI_MCMC(zones, PoissonScales, a, b, Nmax, [l_ot, l_ot], v**2)
+    mcmc.setD(D)
     #%%
-
-    ###################
-    # MCMC parameters # 
-    ###################
-
-    sampleSize=334
-    blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
-    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
-        
-    sparse_gp = case.sparse_gp
-    regressorD = case.regressorD
-    gibbs_indices = case.gibbs_indices
-    
-    # Sparse Gaussian Process update
-    RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(case.sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
-    ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_eps.getParameter()), lambda x:py_link_function_eps(np.array(x), case))
-
-    # Default chain state
-    x = np.zeros(case.gibbs_indices.chain_dim)
-    x[case.gibbs_indices.Pi_indices[-1]] = int(0.5*(case.gibbs_indices.Nmax + case.gibbs_indices.N))
-    x[case.gibbs_indices.lambda_indices] = 1
-    
-    
-    # Latent Poisson Process update
-    PyRV_Pi = PoissonProcess(case, x)
-    RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Pi.getParameter()), PyRV_Pi.py_link_function_Pi)
-
-    # Latent Polya Gamma Process update
-    PyRV_w = PolyaGammaProcess(case, x)
-    RV_w = ot.RandomVector( PyRV_w )
-    ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_w.getParameter()), PyRV_w.py_link_function_w)
-
-    # Latent zone effects update
-    RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*case.J))
-    # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(case, np.array(x)))
-    ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Lambda.getParameter()), lambda x:py_link_function_Lambda(np.array(x), case))
-    
-    # TEST latent GP update
-    RV_eps.getRealization()
-    RV_eps.getParameter()
-    # TEST latent Poisson + GP update
-    RV_Pi.getRealization()
-    RV_Pi.getParameter()
-    # TEST latent Polya-Gamma
-    RV_w.getRealization()
-    RV_w.getParameter()
-    # TEST latent Zone effects
-    RV_Lambda.getRealization()
-    RV_Lambda.getParameter()
-
-    # Learn sparse GP on observed data
-     
-    
-    # # Plot Real sparse GP trajectory on meshgrid over search domain
-    gridsize = 20
-    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
-    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
-
-    # # Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
-    # M_new = sparse_gp.regressorOT( XY_new )
-    # eps_new = np.array( ot.Normal().getSample(sparse_gp.m) ).reshape(-1,1)
-    # Z_True = np.dot( M_new, eps_new )
-    # # Z_True = m( XY_new )
-        
-    # Z_True = np.array(Z_True).reshape(gridsize, gridsize) * T
-    # levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
-
-    # fig = plt.figure()
-    # plt.contourf(xx, yy, Z_True, levels)
-    # plt.colorbar()
-    # plt.scatter( D[:,0], D[:,1], c='r')
-    # # plt.show()
-    # plt.savefig('True_GP_trend.png')
-    #plt.close()
-        
-    #%%
-
 
     ###############
     # Launch MCMC #
     ###############
-
-    samples = []
-    randinits = []
-
-    for i in range(ninits):
-        # break
-        # Random initialization
-        randinit = np.zeros(gibbs_indices.chain_dim)
-        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
-        LambdaMax = max(randinit[gibbs_indices.lambda_indices])
-        Ntot_init = 0
-        while Ntot_init <= N:
-            Ntot_init = int(ot.Poisson(LambdaMax * T).getRealization()[0])
-        randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
-        NPi_init = int(Ntot_init - N)
-        Pi_init = np.zeros(( Nmax - N, 2 ))
-        Pi_init[:NPi_init] = np.array(case.Uniform.getSample(NPi_init))
-        randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
-        randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
-        # # check whether useful:
-        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
-        randinits.append(randinit)
-        # Assemble Gibbs sampler
-        print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
-        eps_sampler = ot.RandomVectorMetropolisHastings( RV_eps, randinits[i], gibbs_indices.epsilon_indices, ot_link_function_eps )
-        Pi_sampler = ot.RandomVectorMetropolisHastings( RV_Pi, randinits[i], gibbs_indices.Pi_indices, ot_link_function_Pi ) 
-        w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], gibbs_indices.Omega_indices, ot_link_function_w )
-        Lambda_sampler = ot.RandomVectorMetropolisHastings( RV_Lambda, randinits[i], gibbs_indices.lambda_indices, ot_link_function_Lambda )
-        Gibbs_sampler = ot.Gibbs([eps_sampler, Pi_sampler, w_sampler, Lambda_sampler])
-        t1=time.time()
-        sample = np.zeros((0,gibbs_indices.chain_dim))
-        # Main loop
-        for j in range((sampleSize)// blockSize):
-            newsample = Gibbs_sampler.getSample(blockSize)
-            sample = np.vstack((sample, np.array(newsample)))
-            t2=time.time()
-            print("%s iterations performed in %s seconds"%( (j+1)*blockSize, np.round(t2-t1)))   
-            rate = (sample[1:] != sample[:-1]).mean(axis=0) 
-            print("componentwise acceptance rate so far: %s"%rate)        
-            print("Current state: %s"%sample[-1])
-        t2=time.time()
-        print("Whole MCMC run took %s seconds"%(t2-t1))    
-        samples.append( sample )
-
-    #%%
-
-
-    ################################
-    # MCMC Convergence diagnostics #
-    ################################
-
-    colors = list(mcolors.BASE_COLORS)[:ninits]
-    burnin=0
-    paramDim = sample.shape[1]
-    # plotDim = 1
-
-    # components = [j for j in range(paramDim-1-J,paramDim)] 
-    components = [gibbs_indices.Pi_indices[-1]] + gibbs_indices.lambda_indices 
-    names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,case.J+1)]
-    true_values = [Ntot] + LambdaTrue.ravel().tolist()
-
-    # MCMC convergence plots
-    fig = plt.figure( figsize=(5*case.J,5) )
-    for i, X, c in zip( range(ninits), samples, colors ):
-        # break
-        for j in range(len(components)):
-            # break
-            plt.subplot(1, len(components), j+1)
-            plt.plot(X[burnin:,components[j]], c=c)
-            if i == 0:
-                plt.ylabel(names[j], fontsize=16)
-                plt.xlabel("Iterations", fontsize=16)    
-            plt.axhline(true_values[j], lw=2, c="k")
-    plt.tight_layout()
-    plt.savefig("traceplots.png")
-    #plt.close()
-
-    #%%
-
-
-    # ACF (MCMC autocorrelation) plot 
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for i, X, c in zip( range(ninits), samples, colors ):
-        for j in range(len(components)):
-            plt.subplot(1, len(components), j+1)
-            plt.plot(stattools.acf(X[burnin:,components[j]], nlags=600), c=c)    
-            if i == 0:
-                plt.ylabel(names[j], fontsize=16)
-                plt.xlabel("Iterations", fontsize=16)  
-    plt.tight_layout()
-    plt.savefig("ACF.png")
-    #plt.close()
-
-
-    #%%
-
-
-    # Gelman-Rubin
-
-    def iterative_mean(X):
-        length = X.shape[1]
-        # on prend les moyennes cumulées suivant le deuxième axe (une par composante de la chaîne)
-        return X.cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1)
-
-    def iterative_var(X):
-        length = X.shape[1]
-        # on prend les variances cumulées suivant le deuxième axe (une par composante de la chaîne)
-        return np.square(X).cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1) - iterative_mean(X)**2
-
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for j in range(len(components)):
-        # remarque : on enlève la première valeur des moyennes / variances cumulés
-        # pour éviter des valeurs de variance égales à zéro...
-        sample_means = np.array([iterative_mean(chain)[:,components[j]] for chain in samples])
-        sample_vars = np.array([iterative_var(chain)[:,components[j]] for chain in samples])
-        
-        B = sampleSize / (ninits - 1) * sample_means.var(axis=0)
-        W = sample_vars.mean(axis=0)
-        V = (sampleSize - 1) / sampleSize * W + (ninits + 1) / (sampleSize * ninits) * B
-        
-        R = V/W
-        
-        print("Gelman-Rubin convergence diagnostic for %s: %s"%(names[j], V/W))
-        
-        # on enlève les premières iterations qui correspondent au temps de chauffe
-        plt.subplot( 1, len(components), j+1)
-        plt.plot(R[10:])
-        
-        plt.xlabel("Iterations")
-        plt.ylabel(r"$\widehat R$")
-    plt.tight_layout()
-    plt.savefig("Gelman_Rubin.png")
-    #plt.close()
-
-    #%%
-
-    # Pool chains
-    sample = np.vstack([sample[burnin:] for sample in samples])
-
-    # Posterior marginals (pooling from both chains)
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for j in range(len(components)):
-        plt.subplot( 1, len(components), j+1)
-        X = sample[burnin:,components[j]]
-        plt.hist(X, int(np.sqrt(len(X))))
-        plt.xlabel(names[j], fontsize=16)
-        plt.axvline(true_values[j], c='r')
-        # plt.xlim(st.mstats.mquantiles(X,.01)[0], st.mstats.mquantiles(X,.99)[0])
-        # plt.xlim(0, 14)
-        print(X.mean())
-        for p in [0.50, .025, .975]:
-            print(st.mstats.mquantiles(X, p)[0])
-
-    plt.tight_layout()
-    plt.savefig("post_density.png")
-    #plt.close()
+    mcmc.run_mcmc(sampleSize=334, blockSize=50, ninits=3)
+    mcmc.plot_results(LambdaTrue=LambdaTrue, Ntot=Ntot)
 
     #%%
 
