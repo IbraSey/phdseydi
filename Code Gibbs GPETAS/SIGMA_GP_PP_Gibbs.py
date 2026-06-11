@@ -498,11 +498,14 @@ class SSGC_Gibbs():
 
         return samples, randinits
 
-    def run(self, D=None):
+    def run(self, D=None, sampleSize=300, blockSize=50, ninits=3):
         """perform Bayesian inference of SGPPI model given dataset
 
         Args:
             D (N,2) (optional): Dataset. Defaults to None
+            sampleSize (int, optional): number of Gibbs iterations. Defaults to 300.
+            blockSize (int, optional): block size for cv messages. Defaults to 50.
+            ninits (int, optional): Number of chains run for Gelman-Rubin convergence diagnostic. Defaults to 3.
 
         returns:
             samples (list of arrays): resulting MCMC chains
@@ -517,8 +520,7 @@ class SSGC_Gibbs():
         l_opt, v_opt = self.calibrate_GP()
         self.setSparseGP(l_opt, v_opt)
         # Launch Gibbs 
-        samples, randinits = self.Gibbs()
-        return samples, randinits
+        self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
 
 
 
@@ -798,14 +800,16 @@ class ConvergenceDiagnosticsMCMC:
         self.names = names
         self.trueValues = trueValues
         self.sampleSize, self.paramDim  = samples[0].shape
-        self.colors = list(mcolors.BASE_COLORS)[:ninits]
+        self.colors = list(mcolors.BASE_COLORS)[:self.ninits]
     
     # MCMC convergence plots
     def convergencePlot(self):
         """trace plots of MCMC chains
         """
+        burnin = self.burnin
+        names = self.names
         fig = plt.figure( figsize=(5*self.paramDim, 5) )
-        for i, X, c in zip( range(ninits), self.samples, self.colors ):
+        for i, X, c in zip( range(self.ninits), self.samples, self.colors ):
             # break
             for j in range(self.paramDim):
                 # break
@@ -814,8 +818,8 @@ class ConvergenceDiagnosticsMCMC:
                 if i == 0:
                     plt.ylabel(names[j], fontsize=16)
                     plt.xlabel("Iterations", fontsize=16)    
-                if not self.true_values is None:
-                    plt.axhline(self.true_values[j], lw=2, c="k")
+                if not self.trueValues is None:
+                    plt.axhline(self.trueValues[j], lw=2, c="k")
         plt.tight_layout()
         plt.savefig("traceplots.png")
         #plt.close()
@@ -827,9 +831,14 @@ class ConvergenceDiagnosticsMCMC:
             nlags (int, optional): maximum lag considered. Defaults to 600.
         """
         #  
+        burnin = self.burnin
+        names = self.names
+        colors = self.colors
         fig = plt.figure( figsize=(5*self.paramDim, 5) )
-        for i, X, c in zip( range(ninits), self.samples, colors ):
+        for i, X, c in zip( range(self.ninits), self.samples, colors ):
+            # break
             for j in range(self.paramDim):
+                # break
                 plt.subplot(1, self.paramDim, j+1)
                 plt.plot(stattools.acf(X[burnin:,j], nlags=nlags), c=c)    
                 if i == 0:
@@ -842,6 +851,8 @@ class ConvergenceDiagnosticsMCMC:
     def GelmanRubinPlot(self):
         """Evolution of Gelman-Rubin cv statistic
         """
+        names = self.names
+        sampleSize = self.sampleSize
         fig = plt.figure( figsize=(5*self.paramDim, 5) )
         for j in range(self.paramDim):
             # remarque : on enlève la première valeur des moyennes / variances cumulés
@@ -849,15 +860,14 @@ class ConvergenceDiagnosticsMCMC:
             sample_means = np.array([iterative_mean(chain)[:,j] for chain in self.samples])
             sample_vars = np.array([iterative_var(chain)[:,j] for chain in self.samples])
             
-            B = sampleSize / (ninits - 1) * sample_means.var(axis=0)
+            B = sampleSize / (self.ninits - 1) * sample_means.var(axis=0)
             W = sample_vars.mean(axis=0)
-            V = (sampleSize - 1) / sampleSize * W + (ninits + 1) / (sampleSize * ninits) * B
+            V = (sampleSize - 1) / sampleSize * W + (self.ninits + 1) / (sampleSize * self.ninits) * B
             
             R = V/W
             
             print("Gelman-Rubin convergence diagnostic for %s: %s"%(names[j], V/W))
             
-            # on enlève les premières iterations qui correspondent au temps de chauffe
             plt.subplot( 1, self.paramDim, j+1)
             plt.plot(R[10:])
             
@@ -874,6 +884,8 @@ class ConvergenceDiagnosticsMCMC:
             self.sample (array): pooled samples, with burnin removed
         """
         # Pool chains
+        burnin = self.burnin
+        names = self.names
         self.sample = np.vstack([sample[burnin:] for sample in self.samples])
 
         # Posterior marginals (pooling from both chains)
@@ -883,8 +895,8 @@ class ConvergenceDiagnosticsMCMC:
             X = self.sample[burnin:,j]
             plt.hist(X, int(np.sqrt(len(X))))
             plt.xlabel(names[j], fontsize=16)
-            if not self.true_values is None:
-                plt.axvline(self.true_values[j], c='r')
+            if not self.trueValues is None:
+                plt.axvline(self.trueValues[j], c='r')
             # plt.xlim(st.mstats.mquantiles(X,.01)[0], st.mstats.mquantiles(X,.99)[0])
             # plt.xlim(0, 14)
             print(X.mean())

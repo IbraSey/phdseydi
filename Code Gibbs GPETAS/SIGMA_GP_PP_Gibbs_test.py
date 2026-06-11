@@ -89,19 +89,21 @@ plt.savefig("Data.png")
 #####################
 
 gibbs.setD(D)
-samples, randinits = gibbs.run()
+gibbs.run(sampleSize=50, blockSize=10,ninits=3)
 
 #%%
-################################
+############(####################
 # MCMC Convergence diagnostics #
 ################################
+
+burnin = 5
 
 # components = [j for j in range(paramDim-1-J,paramDim)] 
 components = [gibbs.gibbs_indices.Pi_indices[-1]] + gibbs.gibbs_indices.lambda_indices 
 names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,gibbs.J+1)]
 true_values = [Ntot] + LambdaTrue.ravel().tolist()
 
-cv_diag_mcmc = ConvergenceDiagnosticsMCMC([sample[:,components] for sample in samples], burnin, names, true_values)    
+cv_diag_mcmc = ConvergenceDiagnosticsMCMC([sample[:,components] for sample in gibbs.samples], burnin, names, true_values)    
 
 cv_diag_mcmc.run()
 
@@ -110,21 +112,28 @@ cv_diag_mcmc.run()
 # Predict SIGMA-GP with zone effects throughout search domain #
 ###############################################################
 
+sample = np.vstack([ s[burnin:] for s in gibbs.samples ])
+
+import seaborn as sns
+import pandas as pd
+
+sns.pairplot( pd.DataFrame( data=sample[:,components], columns=names) )
+plt.savefig("pairplot.png")
+
 # # Plot Real sparse GP trajectory on meshgrid over search domain
 gridsize = 20
 xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
 XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
 
-
 Z_new = np.zeros((len(sample), len(XY_new))) 
-U_new = np.array(case.U_OT(XY_new))
+U_new = np.array(gibbs.U_OT(XY_new))
 intensity_new = np.zeros((len(sample), len(XY_new))) 
-M = np.array(case.sparse_gp.regressorOT( XY_new ))
+M = np.array(gibbs.sparse_gp.regressorOT( XY_new ))
 for i in range(len(sample)):
     # break
     sample_i =sample[i]
     # GP conditional on values at augmented Poisson process
-    epsilon_i = sample_i[gibbs..epsilon_indices]
+    epsilon_i = sample_i[gibbs.gibbs_indices.epsilon_indices]
     # Ntot_i = sample_i[gibbs_indice.Pi_indices[-1]]
     # Pi_i = np.array(sample_i[gibbs_indice.Pi_indices[:-1]]).reshape(-1,2)
     Z_new[i] = np.dot( M, epsilon_i ).ravel()
@@ -132,7 +141,7 @@ for i in range(len(sample)):
     # Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new )
     # sigmoid transformation
     sigm_i = np.array(sigmoid(ot.Sample(Z_new[i].reshape(-1,1)))).ravel()
-    Lambda_i = (sample_i[gibbs..lambda_indices] * U_new).sum(axis=1)
+    Lambda_i = (sample_i[gibbs.gibbs_indices.lambda_indices] * U_new).sum(axis=1)
     intensity_new[i] = sigm_i * Lambda_i
     
 intensity_mean = intensity_new.mean(axis=0).reshape(gridsize, gridsize) * T
@@ -157,3 +166,5 @@ plt.title("Poisson intensity Posterior std vs Data")
 plt.savefig("intensity_post_std.png")
 #plt.close()
 
+
+# %%
