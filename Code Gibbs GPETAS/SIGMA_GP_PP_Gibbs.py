@@ -271,7 +271,7 @@ def py_link_function_eps(x, case):
     # invert 
     K = ot.CovarianceMatrix(Q).computeCholesky()
     Kinv = K.inverse()
-    V = Kinv.transpose()*Kinv
+    V = Kinv.transpose()*Kinv0
     # # posterior mean 
     mean = V*ot.Matrix(M.T)*u
     # extract parameters in correct order (coherent with getParameter() method of RV_epsilon)
