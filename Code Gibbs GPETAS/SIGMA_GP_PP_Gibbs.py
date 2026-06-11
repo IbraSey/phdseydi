@@ -188,7 +188,7 @@ class SSGC_Gibbs():
             self.nu = nu
         self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
         # bounding box for uniform sampling of the data
-        self.Domain = shapely.union_all(self.zones)
+        self.Domain = shapely.union_all(self.zones).buffer(1e-6)
         coords = np.array(self.Domain.boundary.coords)
         self.lower = coords.min(axis=0)
         self.upper = coords.max(axis=0)
