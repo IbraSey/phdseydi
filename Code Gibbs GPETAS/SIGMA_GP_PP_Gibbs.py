@@ -157,13 +157,12 @@ class NormalCholesky(ot.PythonRandomVector):
 class SSGC_Gibbs():
     """Use-Case Class, collecting all necessary inputs for SGPPI case study
     """
-    def __init__(self, zones, PoissonScales, a, b, Nmax, l=None, nu=None, D=None ):
+    def __init__(self, zones, T, a, b, Nmax, l=None, nu=None, D=None ):
         """Specifying data and priors for 2D SGPP model
 
         Args:
             zones (list): list of J shapely.Polygons
-            PoissonScales (J,): 
-                list of J scale factors for Poisson distribution
+            T (float): time horizon
             a (J,): prior gamma shapes
             b (J,): prior gamma rates
             Nmax (int): Max allowed space to represent latent PP
@@ -177,7 +176,8 @@ class SSGC_Gibbs():
         
         """
         self.zones = zones
-        self.PoissonScales = PoissonScales
+        self.T = T
+        self.PoissonScales = T * np.array([zone.area for zone in zones])
         self.a = a
         self.b = b
         self.J = len(zones)
@@ -211,7 +211,7 @@ class SSGC_Gibbs():
         # Define GP and sparse GP hyperparams
         c1, c2 = 0.5*(self.lower + self.upper)
         s1, s2 = 0.5*(self.upper - self.lower)
-        l1, l2 = l
+        l1, l2 = l, l
         hypers = (l1, l2, c1, c2, s1, s2, nu)
         self.sparse_gp = sparseGP(hypers)
         if hasattr(self, "D"):
@@ -255,7 +255,7 @@ class SSGC_Gibbs():
         sampler = SSGC_GibbsSampler(
             X_bounds  = (0, 1),
             Y_bounds  = (0, 1),
-            T         = T,
+            T         = self.T,
             Areas     = Areas,
             polygons  = self.zones,
             lambda_nu = 1.,
@@ -266,9 +266,6 @@ class SSGC_Gibbs():
         )
 
         v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
-        
-        print(f"True l :{l}, estimated l :{l_ot}")
-        print(f"True nu :{nu}, estimated nu :{v**2}")
         return [l_ot, v**2]
     
     def U(self, x):
@@ -423,18 +420,18 @@ class SSGC_Gibbs():
         
         
         # Latent Poisson Process update
-        PyRV_Pi = PoissonProcess(case, x)
+        PyRV_Pi = PoissonProcess(self, x)
         RV_Pi = ot.RandomVector(PyRV_Pi)
         ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Pi.getParameter()), PyRV_Pi.py_link_function_Pi)
 
         # Latent Polya Gamma Process update
-        PyRV_w = PolyaGammaProcess(case, x)
+        PyRV_w = PolyaGammaProcess(self, x)
         RV_w = ot.RandomVector( PyRV_w )
         ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_w.getParameter()), PyRV_w.py_link_function_w)
 
         # Latent zone effects update
         RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*self.J))
-        # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(case, np.array(x)))
+        # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(self, np.array(x)))
         ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Lambda.getParameter()), lambda x:self.py_link_function_Lambda(np.array(x)))
         
         # TEST latent GP update
@@ -456,24 +453,26 @@ class SSGC_Gibbs():
 
         samples = []
         randinits = []
+        
+        N = self.gibbs_indices.N
 
         for i in range(ninits):
             # break
             # Random initialization
             randinit = np.zeros(gibbs_indices.chain_dim)
-            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
+            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
             LambdaMax = max(randinit[gibbs_indices.lambda_indices])
             Ntot_init = 0
             while Ntot_init <= N:
-                Ntot_init = int(ot.Poisson(LambdaMax * T).getRealization()[0])
+                Ntot_init = int(ot.Poisson(LambdaMax * self.T).getRealization()[0])
             randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
             NPi_init = int(Ntot_init - N)
-            Pi_init = np.zeros(( Nmax - N, 2 ))
-            Pi_init[:NPi_init] = np.array(case.Uniform.getSample(NPi_init))
+            Pi_init = np.zeros(( self.Nmax - N, 2 ))
+            Pi_init[:NPi_init] = np.array(self.Uniform.getSample(NPi_init))
             randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
             randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
             # # check whether useful:
-            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
+            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
             randinits.append(randinit)
             # Assemble Gibbs sampler
             print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
@@ -558,7 +557,7 @@ class PoissonProcess(ot.PythonRandomVector):
         # Internal parameters (numpy arrays)
         self.J = case.gibbs_indices.J
         self.m = case.sparse_gp.m
-        if self.m != gibbs_indices.m:
+        if self.m != case.gibbs_indices.m:
             print("sparseGP and gibbsIndices objects have different m values")
             raise ValueError
         self.U = case.U_OT
@@ -724,6 +723,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         gibbs_indices : GibbsIndices
             provides parameter indices within Markov chain
         """     
+        N = self.gibbs_indices.N
         Nmax = self.gibbs_indices.Nmax
         Ntot = int(self.Ntot)
         w = np.zeros(Nmax)
@@ -757,7 +757,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         Ntot corresponds to the last component of Pi
         """
         epsilon = np.array(x)[self.gibbs_indices.epsilon_indices]
-        Pi = np.array(x)[gibbs_indices.Pi_indices]
+        Pi = np.array(x)[self.gibbs_indices.Pi_indices]
         return np.hstack(( epsilon, Pi ))
 
 #%%
@@ -903,6 +903,3 @@ class ConvergenceDiagnosticsMCMC:
         self.GelmanRubinPlot()
         self.poolChains()
         
-
-
-

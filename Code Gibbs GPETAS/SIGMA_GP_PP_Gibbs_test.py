@@ -36,7 +36,7 @@ Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
 
 GPscaleFactor = 0.5
 
-gibbs = SSGC_Gibbs(zones, PoissonScales, a, b, Nmax)
+gibbs = SSGC_Gibbs(zones, T, a, b, Nmax)
 
 #%%
 ###################
