@@ -12,6 +12,8 @@ import os, sys
 ROOT = Path.cwd().parent
 sys.path.insert(0, str(ROOT))
 import openturns as ot
+import openturns.experimental as otexp
+from openturns.viewer import View
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 import numpy as np
@@ -878,7 +880,7 @@ class SSGC_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, verbose=True):
+    def calibrate_nu(self, x, y, verbose=True, pictose=True, scikit_learn=False):
         """Heuristic calibration of GP hyperparameters via linearised sigmoid inversion.
  
         Under the approximation σ(f) ≈ ½ + ¼f (valid for small v), the model
@@ -901,6 +903,10 @@ class SSGC_GibbsSampler:
             Spatial coordinates of observed events.
         verbose : bool, optional
             If True, print calibrated values (default True).
+        pictose : bool, optional
+            If True, plot KDE (default False).
+        scikit_learn : bool, optional
+            default False
  
         Returns
         -------
@@ -919,6 +925,14 @@ class SSGC_GibbsSampler:
         ks = ot.KernelSmoothing()
         kde = ks.build(sample_ot)
         p_hat = np.array(kde.computePDF(sample_ot)).flatten()
+        
+        if pictose:
+            graph = kde.drawPDF([self.X_bounds[0], self.Y_bounds[0]], [self.X_bounds[1], self.Y_bounds[1]]) 
+            graph.add(ot.Cloud( np.vstack((x, y)).T ))
+            view = View(graph)
+            view.show()
+            view.save("kde.png")
+
 
         # # KDE leave-one-out aux points observés
         # sample_ot = ot.Sample(obs_pts)
@@ -942,26 +956,39 @@ class SSGC_GibbsSampler:
         z = 2.0 * D_area * p_hat - 2.0
 
         # GP regression
-        kernel = (
-            C(0.1, (1e-3, 0.58 ** 2))
-            #C(0.1, (1e-3, 2.0))
-            * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
-            + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
-        )
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-        gp.fit(obs_pts, z)
+        if scikit_learn:
+            kernel = (
+                C(0.1, (1e-3, 0.58 ** 2))
+                #C(0.1, (1e-3, 2.0))
+                * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
+                + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
+            )
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+            gp.fit(obs_pts, z)
 
-        k_params = gp.kernel_.get_params()
-        v_sq = float(k_params["k1__k1__constant_value"])
-        l = float(k_params["k1__k2__length_scale"])
-        v = np.sqrt(v_sq)
-        l_ot = l * np.sqrt(2.0)
-        self.nu = ot.Point([v_sq, l_ot])
-
+            k_params = gp.kernel_.get_params()
+            v_sq = float(k_params["k1__k1__constant_value"])
+            l = float(k_params["k1__k2__length_scale"])
+            v = np.sqrt(v_sq)
+            l_ot = l * np.sqrt(2.0)
+            self.nu = ot.Point([v_sq, l_ot])
+        else:
+            dimension = 2
+            basis = ot.ConstantBasisFactory(dimension).build()
+            covarianceModel = ot.SquaredExponential( [1.]*dimension, [1.])
+            # covarianceModel =  ot.IsotropicCovarianceModel(ot.SquaredExponential( [1.], [1.]), dimension)
+            fitter_algo = otexp.GaussianProcessFitter(sample_ot, z.reshape(-1, 1),covarianceModel, basis)
+            # fitter_algo.setOptimizationAlgorithm(ot.NLopt("LN_COBYLA"))
+            fitter_algo.run()
+            fitter_result = fitter_algo.getResult().getCovarianceModel()
+            l_ot = min(fitter_result.getScale())
+            v_sq = fitter_result.getAmplitude()[0]
+            self.nu = ot.Point([v_sq, l_ot])
+        
         if verbose:
-            print(f"[calibrate_nu] v = {np.round(v, 4)} ; l_ot = {l_ot:.4f}")
+            print(f"[calibrate_nu] v_sq = {np.round(v_sq, 4)} ; l_ot = {l_ot:.4f}")
 
-        return v, l_ot, eps_mle
+        return v_sq, l_ot, eps_mle
     
     
     # def calibrate_nu(self, x, y, grid_size=50, verbose=True):

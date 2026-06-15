@@ -1,53 +1,38 @@
+#%% Imports
 
 from SIGMA_GP_PP_Gibbs import *
 
+import sys, os
+sys.path.append( os.getenv("PHEBUS_PATH")) # for importing phebus
+import phebus
+from phebus.pybus.frclass import FrenchDomainsSourceModel
+
 import pandas as pd
+
 
 #%%
 #############
-# Load Data #
+# Load Case #
 #############
 
-data_path = os.path.join( os.pardir, "use_case" )
+SM = FrenchDomainsSourceModel(Mmin=3.)
 
-# Seismic catalog
-catalog = pd.read_csv( os.path.join( data_path, "catalog.csv" ) )
-# restrict to complete observation period
-catalog = catalog[catalog.year >= 1962]
-catalog = catalog[catalog.magnitude >= 3.0]
-D = np.vstack([catalog.longitude, catalog.latitude]).T
+catalog = SM.catalog[SM.catalog.year >= 1965]
 
-
-# Plot the data
-fig = plt.figure()
-plt.scatter( D[:,0], D[:,1])
-# plt.show()
-plt.savefig("Data.png")
-#plt.close()
+D = np.vstack((catalog.X, catalog.Y, catalog.magnitude)).T
 
 T = max(catalog.year) - min(catalog.year)
+
 # Domains
-domains = pd.read_csv( os.path.join( data_path, "domaines_xy.csv" ) )
-domain_names = domains['CODE_GTR'].unique()
-domain_polygons = []
-for name in domain_names:
-    coords = domains[['X', 'Y']].loc[domains['CODE_GTR']==name]
-    polygon = shapely.geometry.Polygon(coords.values)
-    domain_polygons.append(polygon)
+zones = [zone.get_polygon_xy() for zone in SM.zones]
+areas = np.array([zone.get_area_km2() for zone in SM.zones])
+zone_names = [zone.name for zone in SM.zones]
 
-# merge into the six final domains (which we name zones)
-domain_short_names = np.array([name[:3] for name in domain_names])
-zones = []
 
-unique, inverse = np.unique(domain_short_names, return_inverse=True)
+values = areas
 
-for i in range(len(unique)):
-    # break
-    index = np.argwhere(inverse == i).ravel()
-    zone = shapely.union_all([domain_polygons[i] for i in index])
-    zones.append(zone)
+# SM.plot_values_map( values, FIGURE_PATH=os.getcwd(),  FIGURE_NAME="data_and_domains", catalog=catalog, coastline=SM.coastlines_xy, scale=5., xticks= zone_names)
 
-areas = np.array([zone.area for zone in zones])
 
 #%%
 ####################################
@@ -57,20 +42,43 @@ areas = np.array([zone.area for zone in zones])
 # prior on zone effects
 T0 = 0.1*T
 lambda0 = 10.
-a = T0 * areas * lambda0
-b = T0 * areas
+a = T0 * lambda0 / areas
+b = T0 / areas
 
 # Upper bound on size of augmented Poisson process
-Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
+Nmax = 5000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
 
-gibbs = SSGC_Gibbs(zones, T, a, b, Nmax)
+gibbs = SSGC_Gibbs(zones, T)
+
+# Restrict to data inside domain
+select = [gibbs.Domain.contains(shapely.Point(x)) for x in D[:,:2]]
+
+D_select = D[select]
+
+# Check colors on this graph, not coherent with barplot
+SM.plot_values_map( values, FIGURE_PATH=os.getcwd(),  FIGURE_NAME="data_and_domains", catalog=pd.DataFrame(data=D_select, columns=["X", "Y", "magnitude"]), coastline=SM.coastlines_xy, scale=5., xticks= zone_names)
+
+# Empirical Bayes approach (aka Modular):  
+# Pre-calibrate l,a, b
+
+gibbs.setD(D_select[:,:2])
+l_opt, v_opt, eps_opt = gibbs.calibrate_GP()
+
+a = np.exp(eps_opt) * T0
+b = T0
+
+gibbs.setPrior(a, b, Nmax, l=l_opt, nu=v_opt)
+
+
+gibbs.setSparseGP(l_opt, v_opt**2)
 
 #%%
 #####################
 # Perform inference #
 #####################
 
-gibbs.setD(D)
+gibbs.setD(D_select[:,:2])
+
 gibbs.run(sampleSize=50, blockSize=10,ninits=3)
 
 #%%

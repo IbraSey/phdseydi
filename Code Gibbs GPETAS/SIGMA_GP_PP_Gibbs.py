@@ -157,46 +157,61 @@ class NormalCholesky(ot.PythonRandomVector):
 class SSGC_Gibbs():
     """Use-Case Class, collecting all necessary inputs for SGPPI case study
     """
-    def __init__(self, zones, T, a, b, Nmax, l=None, nu=None, D=None ):
+    def __init__(self, zones, T, a=None, b=None, Nmax=None, l=None, nu=None, D=None ):
         """Specifying data and priors for 2D SGPP model
 
         Args:
             zones (list): list of J shapely.Polygons
-            T (float): time horizon
-            a (J,): prior gamma shapes
-            b (J,): prior gamma rates
-            Nmax (int): Max allowed space to represent latent PP
-            l (2,) (optional):  correlation lengths
+            T (float): time range.
+            a (J, optional): prior gamma shapes, default is None.
+            b (J, optional): prior gamma rates, default is None.
+            Nmax (int optional): Max allowed space to represent latent PP, default is None.
+            l (2,optional):  correlation lengths
             nu (float) (optional): marginal GP variance
-            D (N,2) (optional): dataset (seismic catalog)
+            D ((N,2), optional): dataset (seismic catalog)
             
         Notes
             - Nmax must be >= Ntot (Size of latent PP) or an exception is raised
             - /!\ realizations are zero-padded to reach size Nmax
         
         """
+        # Mandatory args
         self.zones = zones
         self.T = T
+        # Pre-treatments
         self.PoissonScales = T * np.array([zone.area for zone in zones])
-        self.a = a
-        self.b = b
         self.J = len(zones)
-        self.Nmax = Nmax
-        if not l is None:
-            self.l = l
-        if not nu is None:
-            self.nu = nu
         self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
         # bounding box for uniform sampling of the data
-        self.Domain = shapely.union_all(self.zones).buffer(1e-6)
+        self.Domain = shapely.union_all(self.zones).buffer(1e-2)
         coords = np.array(self.Domain.boundary.coords)
         self.lower = coords.min(axis=0)
         self.upper = coords.max(axis=0)
         self.Uniform = ot.ComposedDistribution([ot.Uniform(self.lower[j], self.upper[j]) for j in range(2)])
-        if not D is None:
-            self.setD(D)
-        if not l is None:
+        ###############
+        # Optional args        
+        # Data
+        if not D is None: self.setD(D)
+        # Prior 
+        # Gamma Hyperparameters
+        if not a is None: self.a = a
+        if not b is None: self.b = b
+        # Poisson max value
+        if not Nmax is None: self.Nmax = Nmax
+        # GP correlation length + marginal variance
+        if not l is None: self.l = l
+        if not nu is None: self.nu = nu
+        if (not l is None) & (not nu is None):
             self.setSparseGP(l, nu)
+    
+    def setPrior(self, a, b, Nmax, l, nu):
+        self.a = a
+        self.b = b
+        self.Nmax = Nmax
+        self.l = l
+        self.nu = nu
+        self.setSparseGP(l, nu)
+        
     
     def setSparseGP(self, l, nu):
         """Define sparse GP approximation
@@ -227,7 +242,7 @@ class SSGC_Gibbs():
         self.D = D
         if hasattr(self, "sparse_gp"):
             self.regressorD = self.sparse_gp.regressorOT(D)
-            self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D), self.J)
+            self.gibbs_indices = GibbsIndices(self.sparse_gp.m, self.Nmax, len(D), self.J)
     
     ################################
     # Estimate correlation lengths #   
@@ -253,20 +268,20 @@ class SSGC_Gibbs():
         Areas      = [(zp, 0.0) for zp in zones_prep]
 
         sampler = SSGC_GibbsSampler(
-            X_bounds  = (0, 1),
-            Y_bounds  = (0, 1),
+            X_bounds  = (self.lower[0], self.upper[0]),
+            Y_bounds  = (self.lower[1], self.upper[1]),
             T         = self.T,
             Areas     = Areas,
             polygons  = self.zones,
             lambda_nu = 1.,
             nu        = [0.5, 0.5],
-            delta     = [0.5, 0.5],
+            delta     = [1., 1.],
             jitter    = 1e-5,
             rng_seed  = 15,
         )
 
         v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
-        return [l_ot, v**2]
+        return [l_ot, v**2, eps_mle]
     
     def U(self, x):
         """zones indicators
@@ -511,14 +526,15 @@ class SSGC_Gibbs():
             samples (list of arrays): resulting MCMC chains
             randinits (list of vectors): initial points
         """
+        # Set dataset
         if not D is None:
             self.setD(D)
+            # calibrate GP
+            l_opt, v_opt, eps_opt = self.calibrate_GP()
+            self.setSparseGP(l_opt, v_opt)
         elif not hasattr(self, "D"):
             print("No data for inference!")
             raise ValueError
-        # calibrate GP
-        l_opt, v_opt = self.calibrate_GP()
-        self.setSparseGP(l_opt, v_opt)
         # Launch Gibbs 
         self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
 
