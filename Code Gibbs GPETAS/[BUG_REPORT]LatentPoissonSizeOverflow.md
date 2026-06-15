@@ -9,7 +9,7 @@ There are at least three reasons expaining this overflow:
 
 2. The above problem can be amplified by the the lack of identifiability of the spatially informed Sigmoid GP intensity. More precisely, one can multiply the zones' effects by an arbitrary factor > 1, and re-define the latent GP trajectory to obtain an identical intensity function (exercise). Thus, in practice, nothing prevents the zone's effects to diverge during the MCMC iterations, leading to the said overflow.
 
-3. Another possible reason, could be that the Gamma prior on the latent Poisson process size is too vague. Because the MCMC is initialized using prior draws, this could lead to unrealistically large draws of the Poisson mean parameter. So another possible response would be to used better-contrained priors, or 
+3. Another possible reason, could be that the Gamma prior on the latent Poisson process size is too vague. Because the MCMC is initialized using prior draws, this could lead to unrealistically large draws of the Poisson mean parameter. So another possible response would be to used better-contrained priors, even possibly imposing a prior upper bound on the latent PP size.
 
 
 
