@@ -17,6 +17,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import time
+import geopandas
 import scipy.stats as st
 import statsmodels.tsa.stattools as stattools
 from polyagamma import random_polyagamma
@@ -155,7 +156,7 @@ class NormalCholesky(ot.PythonRandomVector):
 ########################################################################
 
 class SSGC_Gibbs():
-    """Use-Case Class, collecting all necessary inputs for SGPPI case study
+    """Use-Case Class, collecting all necessary inputs for SSGC case study, as well as Gibbs method 
     """
     def __init__(self, zones, T, a=None, b=None, Nmax=None, l=None, nu=None, D=None ):
         """Specifying data and priors for 2D SGPP model
@@ -538,6 +539,32 @@ class SSGC_Gibbs():
         # Launch Gibbs 
         self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
 
+    def simulateZoneHomogeneousPP(self, Lambda):
+        """
+        Simulates a piecewise homogeneous Poisson process, constant on each zone.
+
+        Args:
+            Lambda (J,): Intensity for each zone.
+
+        Returns:
+            (N_new, 2) numpy array: The coordinates of the simulated points.
+        """
+        points = []
+        geoseries_zones = geopandas.GeoSeries(self.zones)
+        for j in range(self.J):
+            # Number of points to generate in zone j
+            n_points = int(ot.Poisson(self.T * Lambda[j]).getRealization()[0])
+            if n_points > 0:
+                # Sample points uniformly in the zone
+                sampled_points = geoseries_zones.iloc[j:j+1].sample_points(size=n_points, ignore_index=True)
+                points.extend(list(zip(sampled_points.x, sampled_points.y)))
+
+        if not points:
+            return np.empty((0, 2))
+        return np.array(points)
+        # Launch Gibbs 
+        self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
+
 
 
 
@@ -637,18 +664,17 @@ class PoissonProcess(ot.PythonRandomVector):
         """
         Nmax=int(self.gibbs_indices.Nmax)
         N = self.gibbs_indices.N
-        # Step 2: Generate candidate points uniformly over search domain
-        LambdaMax = self.Lambda.max()
-        N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
-        XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
-        # Step 3: Simulate GP trajectories
+        
+        # Simulate points from the piecewise homogeneous PP
+        XY_star = self.case.simulateZoneHomogeneousPP(self.Lambda)
+        N_star = XY_star.shape[0]
+
+        # Simulate GP trajectories at candidate points
         M = self.sparse_gp.regressorOT(XY_star)
-        # epsilon = np.array( ot.Normal(self.m).getRealization() ).reshape(-1,1)
         f_star = np.dot( M, self.epsilon )
+
         # Step 4: Thinning
-        U_star = np.array( self.U(XY_star) )
-        Lambda_star = np.dot( U_star, self.Lambda).reshape(-1,1)
-        p_accept = np.array( sigmoid(-f_star.reshape(-1,1)) * Lambda_star / LambdaMax )
+        p_accept = np.array(sigmoid(-f_star.reshape(-1,1)))
         accept = np.array( ot.Uniform().getSample(N_star) ) <= p_accept 
         NPi_new = np.array(accept).sum()
         Ntot_new = N + NPi_new
