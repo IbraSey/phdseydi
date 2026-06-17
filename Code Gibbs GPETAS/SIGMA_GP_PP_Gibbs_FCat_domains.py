@@ -46,7 +46,7 @@ a = T0 * lambda0 / areas
 b = T0 / areas
 
 # Upper bound on size of augmented Poisson process
-Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
+Nmax = 15000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
 
 gibbs = SSGC_Gibbs(zones, T, Nmax=Nmax)
 
@@ -65,14 +65,14 @@ plt.show()
 #####################
 
 gibbs.setD(D_select[:,:2])
-gibbs.run(sampleSize=50, blockSize=10,ninits=3)
+gibbs.run(sampleSize=300, blockSize=10,ninits=3)
 
 #%%
 ############(####################
 # MCMC Convergence diagnostics #
 ################################
 
-burnin = 5
+burnin = 10
 
 # components = [j for j in range(paramDim-1-J,paramDim)] 
 components = [gibbs.gibbs_indices.Pi_indices[-1]] + gibbs.gibbs_indices.lambda_indices 
@@ -95,9 +95,9 @@ import pandas as pd
 sns.pairplot( pd.DataFrame( data=sample[:,components], columns=names) )
 plt.savefig("pairplot.png")
 
-# # Plot Real sparse GP trajectory on meshgrid over search domain
-gridsize = 20
-xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
+##% # Plot Real sparse GP trajectory on meshgrid over search domain
+gridsize = 100
+xx, yy = np.meshgrid( np.linspace(gibbs.lower[0], gibbs.upper[0], gridsize), np.linspace(gibbs.lower[1], gibbs.upper[1], gridsize) )
 XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
 
 Z_new = np.zeros((len(sample), len(XY_new))) 
@@ -107,7 +107,7 @@ M = np.array(gibbs.sparse_gp.regressorOT( XY_new ))
 for i in range(len(sample)):
     # break
     sample_i =sample[i]
-    # GP conditional on values at augmented Poisson process
+    # sparse GP conditional on augmented Poisson process
     epsilon_i = sample_i[gibbs.gibbs_indices.epsilon_indices]
     # Ntot_i = sample_i[gibbs_indice.Pi_indices[-1]]
     # Pi_i = np.array(sample_i[gibbs_indice.Pi_indices[:-1]]).reshape(-1,2)
@@ -128,7 +128,7 @@ levels_std = np.linspace( intensity_std.min(), intensity_std.max(), gridsize)
 fig = plt.figure()
 plt.contourf(xx, yy, intensity_mean, levels_mean)
 plt.colorbar()
-plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
+plt.scatter( D[:,0], D[:,1], s=D[:,2]*10, c='r', marker='+' )
 plt.title("Poisson intensity posterior mean vs Data")
 plt.savefig("intensity_post_mean.png")
 #plt.close()
@@ -136,7 +136,7 @@ plt.savefig("intensity_post_mean.png")
 fig = plt.figure()
 plt.contourf(xx, yy, intensity_std, levels_std)
 plt.colorbar()
-plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
+plt.scatter( D[:,0], D[:,1], s=D[:,2]*10, c='r', marker='+' )
 plt.title("Poisson intensity Posterior std vs Data")
 plt.savefig("intensity_post_std.png")
 #plt.close()

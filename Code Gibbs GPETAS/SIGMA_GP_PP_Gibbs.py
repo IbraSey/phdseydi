@@ -540,7 +540,7 @@ class SSGC_Gibbs():
         # set prior mean of zone effects to calibrated value
         m = np.exp(eps_opt)
         # give it the same weight as the data
-        T0 = self.T*1.0
+        T0 = self.T*0.1
         v = m**2/T0
         a, b = np.repeat(T0, self.J), T0/m
         self.setPrior(a, b, self.Nmax, l_opt, v_opt)
