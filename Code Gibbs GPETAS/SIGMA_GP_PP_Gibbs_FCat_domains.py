@@ -120,25 +120,30 @@ for i in range(len(sample)):
     intensity_new[i] = sigm_i * Lambda_i
     
 intensity_mean = intensity_new.mean(axis=0).reshape(gridsize, gridsize) * T
-levels_mean = np.linspace( intensity_mean.min(), intensity_mean.max(), gridsize )
+# levels_mean = np.linspace( intensity_mean.min(), intensity_mean.max(), gridsize )
 
 intensity_std = intensity_new.std(axis=0).reshape(gridsize, gridsize) * T
-levels_std = np.linspace( intensity_std.min(), intensity_std.max(), gridsize)
+# levels_std = np.linspace( intensity_std.min(), intensity_std.max(), gridsize)
 
-fig = plt.figure()
-plt.contourf(xx, yy, intensity_mean, levels_mean)
+levels_joint = np.linspace( min(intensity_mean.min(), intensity_std.min()), max(intensity_mean.max(), intensity_std.max()), gridsize)
+
+fig = plt.figure(figsize=(20, 20))
+plt.subplot(2,1,1)
+# plt.contourf(xx, yy, intensity_mean, levels_mean)
+plt.contourf(xx, yy, intensity_mean, levels_joint)
 plt.colorbar()
-plt.scatter( D[:,0], D[:,1], s=D[:,2]*10, c='r', marker='+' )
-plt.title("Poisson intensity posterior mean vs Data")
-plt.savefig("intensity_post_mean.png")
+plt.scatter( D[:,0], D[:,1], s=np.sqrt(D[:,2]), c='r', marker='o', alpha=(1./D[:,2])/max(1./D[:,2]) )
+plt.title("Posterior mean", fontsize=20)
+# plt.savefig("intensity_post_mean.png")
 #plt.close()
 
-fig = plt.figure()
-plt.contourf(xx, yy, intensity_std, levels_std)
+# fig = plt.figure()
+plt.subplot(2,1,2)
+plt.contourf(xx, yy, intensity_std, levels_joint)
 plt.colorbar()
-plt.scatter( D[:,0], D[:,1], s=D[:,2]*10, c='r', marker='+' )
-plt.title("Poisson intensity Posterior std vs Data")
-plt.savefig("intensity_post_std.png")
+plt.scatter( D[:,0], D[:,1], s=np.sqrt(D[:,2])*10, c='r', marker='o' )
+plt.title("Posterior std", fontsize=20)
+plt.savefig("intensity_post_mean_std.png")
 #plt.close()
 
 
