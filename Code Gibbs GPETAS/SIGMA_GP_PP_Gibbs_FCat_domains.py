@@ -2,8 +2,31 @@
 
 from SIGMA_GP_PP_Gibbs import *
 
-import sys, os
-sys.path.append( os.getenv("PHEBUS_PATH")) # for importing phebus
+
+import os
+import sys
+
+phebus_path = os.getenv("PHEBUS_PATH")
+if not phebus_path or not os.path.isdir(phebus_path):
+    raise EnvironmentError(
+        "PHEBUS_PATH must be set to the directory containing the phebus package."
+    )
+
+sys.path.insert(0, phebus_path)
+
+try:
+    import phebus
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        f"Could not import phebus from PHEBUS_PATH={phebus_path!r}. "
+        "Ensure that directory contains a `phebus` package."
+    ) from exc
+
+
+
+
+# import sys, os
+# sys.path.append( os.getenv("PHEBUS_PATH")) # for importing phebus
 import phebus
 from phebus.pybus.frclass import FrenchDomainsSourceModel
 
@@ -15,7 +38,19 @@ import pandas as pd
 # Load Case #
 #############
 
-SM = FrenchDomainsSourceModel(Mmin=3.)
+import os
+from phebus.pybus.frclass import FrenchDomainsSourceModel
+
+phebus_root = "/home/g80884/Documents/phebus"
+demo_path = os.path.join(phebus_root, "demos", "FrenchDomainsAnalysis")
+
+SM = FrenchDomainsSourceModel(
+    Mmin=3.7,
+    PWD=demo_path,
+    FILE_DOMAINS=os.path.join(demo_path, "data", "domains", "domaines_xy.csv")
+)
+
+# SM = FrenchDomainsSourceModel(Mmin=3.)
 
 catalog = SM.catalog[SM.catalog.year >= 1965]
 
