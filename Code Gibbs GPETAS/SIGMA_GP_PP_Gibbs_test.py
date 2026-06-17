@@ -107,18 +107,33 @@ cv_diag_mcmc = ConvergenceDiagnosticsMCMC([sample[:,components] for sample in gi
 
 cv_diag_mcmc.run()
 
-#%%     
-###############################################################
-# Predict SIGMA-GP with zone effects throughout search domain #
-###############################################################
-
 sample = np.vstack([ s[burnin:] for s in gibbs.samples ])
 
 import seaborn as sns
 import pandas as pd
 
 sns.pairplot( pd.DataFrame( data=sample[:,components], columns=names) )
+
+# ncols = len(components)
+
+# # add true values
+# for i in range(ncols):
+#     for j in range(ncols):
+#         plt.subplot(ncols, ncols, ncols*i+j+1)
+#         if i == j:
+#             plt.axvline(true_values[j], lw=2, c='r')
+#         else:
+#             plt.scatter( [true_values[i]], [true_values[j]], c='r', marker='+' )
+        
+
 plt.savefig("pairplot.png")
+
+
+#%%     
+###############################################################
+# Predict SIGMA-GP with zone effects throughout search domain #
+###############################################################
+
 
 # # Plot Real sparse GP trajectory on meshgrid over search domain
 gridsize = 20

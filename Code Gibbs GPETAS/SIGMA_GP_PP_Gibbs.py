@@ -148,6 +148,7 @@ class NormalCholesky(ot.PythonRandomVector):
         # indices = [i for i in range(int(self.Ntot))]
         output[:Ntot] = np.array(ot.Matrix(self.Chol[:Ntot,:Ntot])*Z + self.mu[:Ntot]).ravel()
         # output[indices] = np.array(self.Chol[indices][:,indices]*Z + self.mu[indices]).ravel()
+        print(f'Normal variate: {output}')
         return output
 
 ########################################################################
@@ -428,10 +429,10 @@ class SSGC_Gibbs():
         RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(self.sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
         ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_eps.getParameter()), lambda x:self.py_link_function_eps(np.array(x)))
 
-        # Default chain state
+        #  chain state: prior draw for test
         x = np.zeros(self.gibbs_indices.chain_dim)
         x[self.gibbs_indices.Pi_indices[-1]] = int(0.5*(self.gibbs_indices.Nmax + self.gibbs_indices.N))
-        x[self.gibbs_indices.lambda_indices] = 1
+        x[self.gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
         
         
         # Latent Poisson Process update
@@ -477,16 +478,15 @@ class SSGC_Gibbs():
             randinit = np.zeros(gibbs_indices.chain_dim)
             randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
             LambdaMax = max(randinit[gibbs_indices.lambda_indices])
-            Ntot_init = 0
-            while Ntot_init <= N:
-                Ntot_init = int(ot.Poisson(LambdaMax * self.T).getRealization()[0])
+            Ntot_init = self.Nmax+1
+            while Ntot_init > self.Nmax:
+                Ntot_init = int(ot.Poisson(LambdaMax * self.PoissonScales.sum()).getRealization()[0])
             randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
             NPi_init = int(Ntot_init - N)
             Pi_init = np.zeros(( self.Nmax - N, 2 ))
             Pi_init[:NPi_init] = np.array(self.Uniform.getSample(NPi_init))
             randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
             randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
-            # # check whether useful:
             randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
             randinits.append(randinit)
             # Assemble Gibbs sampler
@@ -500,6 +500,7 @@ class SSGC_Gibbs():
             sample = np.zeros((0,gibbs_indices.chain_dim))
             # Main loop
             for j in range((sampleSize)// blockSize):
+                # break
                 newsample = Gibbs_sampler.getSample(blockSize)
                 sample = np.vstack((sample, np.array(newsample)))
                 t2=time.time()
@@ -527,14 +528,26 @@ class SSGC_Gibbs():
             randinits (list of vectors): initial points
         """
         # Set dataset
-        if not D is None:
-            self.setD(D)
-            # calibrate GP
-            l_opt, v_opt, eps_opt = self.calibrate_GP()
-            self.setSparseGP(l_opt, v_opt)
-        elif not hasattr(self, "D"):
-            print("No data for inference!")
-            raise ValueError
+        if D is None:
+            try:
+                D = self.D
+            except:
+                print("No data for inference!")
+                raise ValueError
+        self.setD(D)
+        # calibrate GP
+        l_opt, v_opt, eps_opt = self.calibrate_GP()
+        # set prior mean of zone effects to calibrated value
+        m = np.exp(eps_opt)
+        # give it the same weight as the data
+        T0 = self.T*1.0
+        v = m**2/T0
+        a, b = np.repeat(T0, self.J), T0/m
+        self.setPrior(a, b, self.Nmax, l_opt, v_opt)
+        # self.setSparseGP(l_opt, v_opt)
+        # elif not hasattr(self, "D"):
+        #     print("No data for inference!")
+        #     raise ValueError
         # Launch Gibbs 
         self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
 
@@ -635,11 +648,14 @@ class PoissonProcess(ot.PythonRandomVector):
             - There is no guaranty that New Ntot <= Nmax
             - New Ntot > Nmax may cause a crash
         """
-        Nmax=int(self.gibbs_indices.Nmax)
+        Nmax = int(self.gibbs_indices.Nmax)
         N = self.gibbs_indices.N
         # Step 2: Generate candidate points uniformly over search domain
         LambdaMax = self.Lambda.max()
-        N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
+        N_star = self.case.Nmax + 1
+        while N_star > self.case.Nmax: 
+            N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
+            print(f"Conditional latent Poisson Process size: {N_star}")
         XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
         # Step 3: Simulate GP trajectories
         M = self.sparse_gp.regressorOT(XY_star)
@@ -748,6 +764,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         M = np.vstack([ self.regressorD, self.sparse_gp.regressorOT( self.Pi[:Ntot-N] ) ])
         ftot = np.dot( M, self.epsilon )
         w[:Ntot] = np.abs( random_polyagamma(z=np.array(ftot)[:,0]) )
+        print(f'conditional latent Polya-Gamma: {w}')
         return w
 
     def py_link_function_w(self, x):

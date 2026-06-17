@@ -46,9 +46,9 @@ a = T0 * lambda0 / areas
 b = T0 / areas
 
 # Upper bound on size of augmented Poisson process
-Nmax = 5000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
+Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
 
-gibbs = SSGC_Gibbs(zones, T)
+gibbs = SSGC_Gibbs(zones, T, Nmax=Nmax)
 
 # Restrict to data inside domain
 select = [gibbs.Domain.contains(shapely.Point(x)) for x in D[:,:2]]
@@ -57,20 +57,7 @@ D_select = D[select]
 
 # Check colors on this graph, not coherent with barplot
 SM.plot_values_map( values, FIGURE_PATH=os.getcwd(),  FIGURE_NAME="data_and_domains", catalog=pd.DataFrame(data=D_select, columns=["X", "Y", "magnitude"]), coastline=SM.coastlines_xy, scale=5., xticks= zone_names)
-
-# Empirical Bayes approach (aka Modular):  
-# Pre-calibrate l,a, b
-
-gibbs.setD(D_select[:,:2])
-l_opt, v_opt, eps_opt = gibbs.calibrate_GP()
-
-a = np.exp(eps_opt) * T0
-b = T0
-
-gibbs.setPrior(a, b, Nmax, l=l_opt, nu=v_opt)
-
-
-gibbs.setSparseGP(l_opt, v_opt**2)
+plt.show()
 
 #%%
 #####################
@@ -78,7 +65,6 @@ gibbs.setSparseGP(l_opt, v_opt**2)
 #####################
 
 gibbs.setD(D_select[:,:2])
-
 gibbs.run(sampleSize=50, blockSize=10,ninits=3)
 
 #%%
@@ -91,9 +77,8 @@ burnin = 5
 # components = [j for j in range(paramDim-1-J,paramDim)] 
 components = [gibbs.gibbs_indices.Pi_indices[-1]] + gibbs.gibbs_indices.lambda_indices 
 names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,gibbs.J+1)]
-true_values = [Ntot] + LambdaTrue.ravel().tolist()
 
-cv_diag_mcmc = ConvergenceDiagnosticsMCMC([sample[:,components] for sample in gibbs.samples], burnin, names, true_values)    
+cv_diag_mcmc = ConvergenceDiagnosticsMCMC([sample[:,components] for sample in gibbs.samples], burnin, names )    
 
 cv_diag_mcmc.run()
 
