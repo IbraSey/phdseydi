@@ -22,6 +22,10 @@ import statsmodels.tsa.stattools as stattools
 from polyagamma import random_polyagamma
 from sparseGP import sparseGP
 import shapely 
+import sys, os
+sys.path.append( os.path.join( os.pardir, "spatial_density_estimation", "gp_spatial" ) )
+from gp.gibbs_sampler import SSGC_GibbsSampler
+from shapely.prepared import prep
 
 ot.RandomGenerator.SetSeed(0) # Make results reproducible by freezing Open TURNS's random generator's seed
 np.random.seed(0) # Make results reproducible by freezing Numpy's random generator's seed
@@ -144,58 +148,91 @@ class NormalCholesky(ot.PythonRandomVector):
         # indices = [i for i in range(int(self.Ntot))]
         output[:Ntot] = np.array(ot.Matrix(self.Chol[:Ntot,:Ntot])*Z + self.mu[:Ntot]).ravel()
         # output[indices] = np.array(self.Chol[indices][:,indices]*Z + self.mu[indices]).ravel()
+        print(f'Normal variate: {output}')
         return output
 
 ########################################################################
 # Use-Case Class, collecting all necessary inputs for SGPPI case study # 
 ########################################################################
 
-class SGPPIUseCase():
+class SSGC_Gibbs():
     """Use-Case Class, collecting all necessary inputs for SGPPI case study
     """
-    def __init__(self, zones, PoissonScales, a, b, Nmax, l, nu, D=None ):
+    def __init__(self, zones, T, a=None, b=None, Nmax=None, l=None, nu=None, D=None ):
         """Specifying data and priors for 2D SGPP model
 
         Args:
             zones (list): list of J shapely.Polygons
-            PoissonScales (J,): 
-                list of J scale factors for Poisson distribution
-            a (J,): prior gamma shapes
-            b (J,): prior gamma rates
-            Nmax (int): Max allowed space to represent latent PP
-            GPscaleFactor (2,):  correlation lengths
-            nu (float): marginal GP variance
-            D (N,2) (optional): dataset (seismic catalog)
+            T (float): time range.
+            a (J, optional): prior gamma shapes, default is None.
+            b (J, optional): prior gamma rates, default is None.
+            Nmax (int optional): Max allowed space to represent latent PP, default is None.
+            l (2,optional):  correlation lengths
+            nu (float) (optional): marginal GP variance
+            D ((N,2), optional): dataset (seismic catalog)
             
         Notes
             - Nmax must be >= Ntot (Size of latent PP) or an exception is raised
             - /!\ realizations are zero-padded to reach size Nmax
         
         """
+        # Mandatory args
         self.zones = zones
-        self.PoissonScales = PoissonScales
+        self.T = T
+        # Pre-treatments
+        self.PoissonScales = T * np.array([zone.area for zone in zones])
+        self.J = len(zones)
+        self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
+        # bounding box for uniform sampling of the data
+        self.Domain = shapely.union_all(self.zones).buffer(1e-2)
+        coords = np.array(self.Domain.boundary.coords)
+        self.lower = coords.min(axis=0)
+        self.upper = coords.max(axis=0)
+        self.Uniform = ot.ComposedDistribution([ot.Uniform(self.lower[j], self.upper[j]) for j in range(2)])
+        ###############
+        # Optional args        
+        # Data
+        if not D is None: self.setD(D)
+        # Prior 
+        # Gamma Hyperparameters
+        if not a is None: self.a = a
+        if not b is None: self.b = b
+        # Poisson max value
+        if not Nmax is None: self.Nmax = Nmax
+        # GP correlation length + marginal variance
+        if not l is None: self.l = l
+        if not nu is None: self.nu = nu
+        if (not l is None) & (not nu is None):
+            self.setSparseGP(l, nu)
+    
+    def setPrior(self, a, b, Nmax, l, nu):
         self.a = a
         self.b = b
-        self.J = len(zones)
         self.Nmax = Nmax
         self.l = l
         self.nu = nu
-        self.U_OT = ot.MemoizeFunction( ot.PythonFunction( 2, self.J, self.U ) )     
-        # bounding box for uniform sampling of the data
-        self.Domain = shapely.union_all(self.zones)
-        coords = np.array(self.Domain.boundary.coords)
-        lower = coords.min(axis=0)
-        upper = coords.max(axis=0)
-        self.Uniform = ot.ComposedDistribution([ot.Uniform(lower[j], upper[j]) for j in range(2)])
-        # Define GP and sparse GP hyperparams
-        c1, c2 = 0.5*(lower + upper)
-        s1, s2 = 0.5*(upper - lower)
-        l1, l2 = l
-        hypers = (l1, l2, c1, c2, s1, s2, nu)
+        self.setSparseGP(l, nu)
+        
+    
+    def setSparseGP(self, l, nu):
+        """Define sparse GP approximation
 
+        Args:
+            l (2,):  correlation lengths
+            nu (float): marginal GP variance
+        
+        Returns:
+            self.sparseGP object
+        """
+        # Define GP and sparse GP hyperparams
+        c1, c2 = 0.5*(self.lower + self.upper)
+        s1, s2 = 0.5*(self.upper - self.lower)
+        l1, l2 = l, l
+        hypers = (l1, l2, c1, c2, s1, s2, nu)
         self.sparse_gp = sparseGP(hypers)
-        if not D is None:
-            self.setD(D)
+        if hasattr(self, "D"):
+            self.regressorD = self.sparse_gp.regressorOT(self.D)
+            self.gibbs_indices = GibbsIndices(self.sparse_gp.m, self.Nmax, len(self.D), self.J)
     
     def setD(self, D):
         """Set dataset for case-study
@@ -204,8 +241,48 @@ class SGPPIUseCase():
             D (N,2) : dataset (seismic catalog)
         """
         self.D = D
-        self.regressorD = self.sparse_gp.regressorOT(D)
-        self.gibbs_indices = GibbsIndices(self.sparse_gp.m, Nmax, len(D),self.J)
+        if hasattr(self, "sparse_gp"):
+            self.regressorD = self.sparse_gp.regressorOT(D)
+            self.gibbs_indices = GibbsIndices(self.sparse_gp.m, self.Nmax, len(D), self.J)
+    
+    ################################
+    # Estimate correlation lengths #   
+    ################################
+    def calibrate_GP(self, D=None):
+        """_summary_
+
+        Args:
+            D (N,2) (optional): Dataset. Defaults to None.
+
+        Returns:
+            list: correlations lengths + marginal GP variance
+        """
+        
+        if D is None:
+            try:
+                D = self.D
+            except:
+                print("No data for calibration!")
+                raise ValueError
+        
+        zones_prep = [prep(p) for p in self.zones]
+        Areas      = [(zp, 0.0) for zp in zones_prep]
+
+        sampler = SSGC_GibbsSampler(
+            X_bounds  = (self.lower[0], self.upper[0]),
+            Y_bounds  = (self.lower[1], self.upper[1]),
+            T         = self.T,
+            Areas     = Areas,
+            polygons  = self.zones,
+            lambda_nu = 1.,
+            nu        = [0.5, 0.5],
+            delta     = [1., 1.],
+            jitter    = 1e-5,
+            rng_seed  = 15,
+        )
+
+        v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
+        return [l_ot, v**2, eps_mle]
     
     def U(self, x):
         """zones indicators
@@ -226,60 +303,257 @@ class SGPPIUseCase():
             if j == self.J: break
         return u
 
-##################################
-# Latent Gaussian process update # 
-##################################
+    ##################################
+    # Latent Gaussian process update # 
+    ##################################
 
-def py_link_function_eps(x, case):
-    """
-    Given the current state of the MCMC chain,
-    output parameters of the conditional density of
-    the truncated GP, as required by the NormalCholesky class
+    def py_link_function_eps(self, x):
+        """
+        Given the current state of the MCMC chain,
+        output parameters of the conditional density of
+        the truncated GP, as required by the NormalCholesky class
 
-    Parameters
-    ----------
-    x : array / list
-        Current MCMC chain state
-    case : SGPPIUseCase
-        contains data and priors for 2D SGPP model
+        Parameters
+        ----------
+        x : array / list
+            Current MCMC chain state
+            
+        Returns
+        -------
+        param : list
+            Mean + Cholesky precision matrix + Ntot value
+            in the order required by NormalCholesky class
+            Size : m*(m+1)+1
+            with m the sparse GP truncation order 
         
-    Returns
-    -------
-    param : list
-        Mean + Cholesky precision matrix + Ntot value
-        in the order required by NormalCholesky class
-        Size : m*(m+1)+1
-        with m the sparse GP truncation order 
+        """
+        gibbs_indices = self.gibbs_indices
+        sparse_gp = self.sparse_gp
+        regressorD = self.regressorD
+        # Check that gibbs_indices has same "m" attribute as sparse_gp
+        if gibbs_indices.m != sparse_gp.m:
+            raise ValueError
+        m = sparse_gp.m
+        # Extract current state of conditioning variables
+        N = gibbs_indices.N
+        Ntot = int(x[gibbs_indices.Pi_indices[-1]])
+        Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
+        Omega = np.array(x[gibbs_indices.Omega_indices[:Ntot]]).reshape(-1,1)
+        u = ot.Sample(np.array([[0.5]]*N + [[-0.5]]*(Ntot-N)))
+        M = np.vstack([ regressorD, sparse_gp.regressorOT( Pi ) ])
+        # precision matrix
+        Q = np.eye(m) + np.dot( M.T, Omega*M )
+        # invert 
+        K = ot.CovarianceMatrix(Q).computeCholesky()
+        Kinv = K.inverse()
+        V = Kinv.transpose()*Kinv
+        # # posterior mean 
+        mean = V*ot.Matrix(M.T)*u
+        # extract parameters in correct order (coherent with getParameter() method of RV_epsilon)
+        parameter = [0]*( m*(m+1)+1 )
+        parameter[:m] = np.array(mean).ravel()
+        parameter[m:m*(m+1)] = np.array(Kinv).ravel()
+        parameter[-1] = m
+        return parameter
+
+    ###############################
+    # Latent zones effects update # 
+    ###############################
+
+    def py_link_function_Lambda(self, x):
+        """
+        Given the current state of the MCMC chain,
+        output parameters of the conditional density of
+        Lambda, as required by the RV_Lambda class
+
+        Parameters
+        ----------
+        case : SGPPI
+            contains data and priors for 2D SGPP model
+        x : array / list
+            Current MCMC chain state
+            Size : 4*Nmax - 2*N + J + 1
+
+        Returns
+        -------
+        param : list
+            posterior shape and rate parameters for Gamma distribution of Lambdas
+            in the order required by the RV_Lambdas class
+            Size : J*3
+        """
+        D = self.D
+        U = self.U_OT 
+        PoissonScales = self.PoissonScales
+        a, b = self.a, self.b
+        gibbs_indices = self.gibbs_indices
+        # Extract current state of conditioning variables
+        Nmax = gibbs_indices.Nmax
+        N = gibbs_indices.N
+        J = gibbs_indices.J
+        Ntot = int(x[gibbs_indices.Pi_indices[-1]])
+        Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
+        # total (augmented) data
+        Dtot = ot.Sample(Ntot, 2)
+        Dtot[:N] = D
+        Dtot[N:] = Pi
+        # Compute number of points in each zone
+        U_Dtot = np.array(self.U_OT(Dtot))
+        Nk = U_Dtot.sum(axis=0).reshape(-1,1)
+        # extract parameters in correct order (coherent with getParameter() method of RV_Lambdas)
+        parameter = np.zeros( J*3 )
+        parameter[::3] = a + Nk.ravel() # shape parameters
+        parameter[1::3] = b + PoissonScales  # rate parameters
+        return parameter
     
-    """
-    gibbs_indices = case.gibbs_indices
-    sparse_gp = case.sparse_gp
-    regressorD = case.regressorD
-    # Check that gibbs_indices has same "m" attribute as sparse_gp
-    if gibbs_indices.m != sparse_gp.m:
-        raise ValueError
-    m = sparse_gp.m
-    # Extract current state of conditioning variables
-    N = gibbs_indices.N
-    Ntot = int(x[gibbs_indices.Pi_indices[-1]])
-    Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
-    Omega = np.array(x[gibbs_indices.Omega_indices[:Ntot]]).reshape(-1,1)
-    u = ot.Sample(np.array([[0.5]]*N + [[-0.5]]*(Ntot-N)))
-    M = np.vstack([ regressorD, sparse_gp.regressorOT( Pi ) ])
-    # precision matrix
-    Q = np.eye(m) + np.dot( M.T, Omega*M )
-    # invert 
-    K = ot.CovarianceMatrix(Q).computeCholesky()
-    Kinv = K.inverse()
-    V = Kinv.transpose()*Kinv0
-    # # posterior mean 
-    mean = V*ot.Matrix(M.T)*u
-    # extract parameters in correct order (coherent with getParameter() method of RV_epsilon)
-    parameter = [0]*( m*(m+1)+1 )
-    parameter[:m] = np.array(mean).ravel()
-    parameter[m:m*(m+1)] = np.array(Kinv).ravel()
-    parameter[-1] = m
-    return parameter
+    def Gibbs(self, sampleSize=300, blockSize=50, ninits=3):
+        """Posterior sampling using blocked Gibbs sampler
+
+        Args:
+            sampleSize (int, optional): number of Gibbs iterations. Defaults to 300.
+            blockSize (int, optional): block size for cv messages. Defaults to 50.
+            ninits (int, optional): Number of chains run for Gelman-Rubin convergence diagnostic. Defaults to 3.
+
+        Returns:
+            samples (list of arrays): resulting MCMC chains
+            randinits (list of vectors): initial points
+        """
+        ###################
+        # MCMC parameters # 
+        ###################
+        
+        sparse_gp = self.sparse_gp
+        regressorD = self.regressorD
+        gibbs_indices = self.gibbs_indices
+        
+        # Sparse Gaussian Process update
+        RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(self.sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
+        ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_eps.getParameter()), lambda x:self.py_link_function_eps(np.array(x)))
+
+        #  chain state: prior draw for test
+        x = np.zeros(self.gibbs_indices.chain_dim)
+        x[self.gibbs_indices.Pi_indices[-1]] = int(0.5*(self.gibbs_indices.Nmax + self.gibbs_indices.N))
+        x[self.gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
+        
+        
+        # Latent Poisson Process update
+        PyRV_Pi = PoissonProcess(self, x)
+        RV_Pi = ot.RandomVector(PyRV_Pi)
+        ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Pi.getParameter()), PyRV_Pi.py_link_function_Pi)
+
+        # Latent Polya Gamma Process update
+        PyRV_w = PolyaGammaProcess(self, x)
+        RV_w = ot.RandomVector( PyRV_w )
+        ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_w.getParameter()), PyRV_w.py_link_function_w)
+
+        # Latent zone effects update
+        RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*self.J))
+        # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(self, np.array(x)))
+        ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Lambda.getParameter()), lambda x:self.py_link_function_Lambda(np.array(x)))
+        
+        # TEST latent GP update
+        RV_eps.getRealization()
+        RV_eps.getParameter()
+        # TEST latent Poisson + GP update
+        RV_Pi.getRealization()
+        RV_Pi.getParameter()
+        # TEST latent Polya-Gamma
+        RV_w.getRealization()
+        RV_w.getParameter()
+        # TEST latent Zone effects
+        RV_Lambda.getRealization()
+        RV_Lambda.getParameter()
+        
+        ###############
+        # Launch MCMC #
+        ###############
+
+        samples = []
+        randinits = []
+        
+        N = self.gibbs_indices.N
+
+        for i in range(ninits):
+            # break
+            # Random initialization
+            randinit = np.zeros(gibbs_indices.chain_dim)
+            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
+            LambdaMax = max(randinit[gibbs_indices.lambda_indices])
+            Ntot_init = self.Nmax+1
+            while Ntot_init > self.Nmax:
+                Ntot_init = int(ot.Poisson(LambdaMax * self.PoissonScales.sum()).getRealization()[0])
+            randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
+            NPi_init = int(Ntot_init - N)
+            Pi_init = np.zeros(( self.Nmax - N, 2 ))
+            Pi_init[:NPi_init] = np.array(self.Uniform.getSample(NPi_init))
+            randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
+            randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
+            randinit[gibbs_indices.lambda_indices] = [ot.Gamma(self.a[j], self.b[j]).getRealization()[0] for j in range(self.J)]
+            randinits.append(randinit)
+            # Assemble Gibbs sampler
+            print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
+            eps_sampler = ot.RandomVectorMetropolisHastings( RV_eps, randinits[i], gibbs_indices.epsilon_indices, ot_link_function_eps )
+            Pi_sampler = ot.RandomVectorMetropolisHastings( RV_Pi, randinits[i], gibbs_indices.Pi_indices, ot_link_function_Pi ) 
+            w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], gibbs_indices.Omega_indices, ot_link_function_w )
+            Lambda_sampler = ot.RandomVectorMetropolisHastings( RV_Lambda, randinits[i], gibbs_indices.lambda_indices, ot_link_function_Lambda )
+            Gibbs_sampler = ot.Gibbs([eps_sampler, Pi_sampler, w_sampler, Lambda_sampler])
+            t1=time.time()
+            sample = np.zeros((0,gibbs_indices.chain_dim))
+            # Main loop
+            for j in range((sampleSize)// blockSize):
+                # break
+                newsample = Gibbs_sampler.getSample(blockSize)
+                sample = np.vstack((sample, np.array(newsample)))
+                t2=time.time()
+                print("%s iterations performed in %s seconds"%( (j+1)*blockSize, np.round(t2-t1)))   
+                rate = (sample[1:] != sample[:-1]).mean(axis=0) 
+                print("componentwise acceptance rate so far: %s"%rate)        
+                print("Current state: %s"%sample[-1])
+            t2=time.time()
+            print("Whole MCMC run took %s seconds"%(t2-t1))    
+            samples.append( sample )
+
+        return samples, randinits
+
+    def run(self, D=None, sampleSize=300, blockSize=50, ninits=3):
+        """perform Bayesian inference of SGPPI model given dataset
+
+        Args:
+            D (N,2) (optional): Dataset. Defaults to None
+            sampleSize (int, optional): number of Gibbs iterations. Defaults to 300.
+            blockSize (int, optional): block size for cv messages. Defaults to 50.
+            ninits (int, optional): Number of chains run for Gelman-Rubin convergence diagnostic. Defaults to 3.
+
+        returns:
+            samples (list of arrays): resulting MCMC chains
+            randinits (list of vectors): initial points
+        """
+        # Set dataset
+        if D is None:
+            try:
+                D = self.D
+            except:
+                print("No data for inference!")
+                raise ValueError
+        self.setD(D)
+        # calibrate GP
+        l_opt, v_opt, eps_opt = self.calibrate_GP()
+        # set prior mean of zone effects to calibrated value
+        m = np.exp(eps_opt)
+        # give it the same weight as the data
+        T0 = self.T*0.1
+        v = m**2/T0
+        a, b = np.repeat(T0, self.J), T0/m
+        self.setPrior(a, b, self.Nmax, l_opt, v_opt)
+        # self.setSparseGP(l_opt, v_opt)
+        # elif not hasattr(self, "D"):
+        #     print("No data for inference!")
+        #     raise ValueError
+        # Launch Gibbs 
+        self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
+
+
+
+
 
 
 #%%
@@ -297,7 +571,7 @@ class PoissonProcess(ot.PythonRandomVector):
         """
         Parameters
         ----------
-        case : SGPPIUseCase
+        case : SGPPI
             contains data and priors for 2D SGPP model
         x : array / list, optional
             Current MCMC chain state
@@ -314,7 +588,7 @@ class PoissonProcess(ot.PythonRandomVector):
         # Internal parameters (numpy arrays)
         self.J = case.gibbs_indices.J
         self.m = case.sparse_gp.m
-        if self.m != gibbs_indices.m:
+        if self.m != case.gibbs_indices.m:
             print("sparseGP and gibbsIndices objects have different m values")
             raise ValueError
         self.U = case.U_OT
@@ -374,11 +648,14 @@ class PoissonProcess(ot.PythonRandomVector):
             - There is no guaranty that New Ntot <= Nmax
             - New Ntot > Nmax may cause a crash
         """
-        Nmax=int(self.gibbs_indices.Nmax)
+        Nmax = int(self.gibbs_indices.Nmax)
         N = self.gibbs_indices.N
         # Step 2: Generate candidate points uniformly over search domain
         LambdaMax = self.Lambda.max()
-        N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
+        N_star = self.case.Nmax + 1
+        while N_star > self.case.Nmax: 
+            N_star = int(ot.Poisson(self.PoissonScales.sum()*LambdaMax).getRealization()[0]) # Poisson candidate number
+            print(f"Conditional latent Poisson Process size: {N_star}")
         XY_star =  self.Uniform.getSample(N_star) # Uniformly sampled candidates
         # Step 3: Simulate GP trajectories
         M = self.sparse_gp.regressorOT(XY_star)
@@ -438,7 +715,7 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         """
         Parameters
         ----------
-        case : SGPPIUseCase
+        case : SGPPI
             contains data and priors for 2D SGPP model
         x : array / list, optional
             Current MCMC chain state
@@ -480,12 +757,14 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         gibbs_indices : GibbsIndices
             provides parameter indices within Markov chain
         """     
+        N = self.gibbs_indices.N
         Nmax = self.gibbs_indices.Nmax
         Ntot = int(self.Ntot)
         w = np.zeros(Nmax)
         M = np.vstack([ self.regressorD, self.sparse_gp.regressorOT( self.Pi[:Ntot-N] ) ])
         ftot = np.dot( M, self.epsilon )
         w[:Ntot] = np.abs( random_polyagamma(z=np.array(ftot)[:,0]) )
+        print(f'conditional latent Polya-Gamma: {w}')
         return w
 
     def py_link_function_w(self, x):
@@ -513,511 +792,159 @@ class PolyaGammaProcess(ot.PythonRandomVector):
         Ntot corresponds to the last component of Pi
         """
         epsilon = np.array(x)[self.gibbs_indices.epsilon_indices]
-        Pi = np.array(x)[gibbs_indices.Pi_indices]
+        Pi = np.array(x)[self.gibbs_indices.Pi_indices]
         return np.hstack(( epsilon, Pi ))
 
 #%%
 
-###############################
-# Latent zones effects update # 
-###############################
-
-def py_link_function_Lambda(x, case):
-    """
-    Given the current state of the MCMC chain,
-    output parameters of the conditional density of
-    Lambda, as required by the RV_Lambda class
-
-    Parameters
-    ----------
-    case : SGPPIUseCase
-        contains data and priors for 2D SGPP model
-    x : array / list
-        Current MCMC chain state
-        Size : 4*Nmax - 2*N + J + 1
-
-    Returns
-    -------
-    param : list
-        posterior shape and rate parameters for Gamma distribution of Lambdas
-        in the order required by the RV_Lambdas class
-        Size : J*3
-    """
-    D = case.D
-    U = case.U_OT 
-    PoissonScales = case.PoissonScales
-    a, b = case.a, case.b
-    gibbs_indices = case.gibbs_indices
-    # Extract current state of conditioning variables
-    Nmax = gibbs_indices.Nmax
-    N = gibbs_indices.N
-    J = gibbs_indices.J
-    Ntot = int(x[gibbs_indices.Pi_indices[-1]])
-    Pi = np.array(x[gibbs_indices.Pi_indices[:2*(Ntot-N)]]).reshape(-1,2)
-    # total (augmented) data
-    Dtot = ot.Sample(Ntot, 2)
-    Dtot[:N] = D
-    Dtot[N:] = Pi
-    # Compute number of points in each zone
-    U_Dtot = np.array(case.U_OT(Dtot))
-    Nk = U_Dtot.sum(axis=0).reshape(-1,1)
-    # extract parameters in correct order (coherent with getParameter() method of RV_Lambdas)
-    parameter = np.zeros( J*3 )
-    parameter[::3] = a + Nk.ravel() # shape parameters
-    parameter[1::3] = b + PoissonScales  # rate parameters
-    return parameter
+######################################
+# MCMC Convergence diagnostics Class #
+######################################
 
 
 
+# Helper functions
+def iterative_mean(X):
+    length = X.shape[1]
+    # on prend les moyennes cumulées suivant le deuxième axe (une par composante de la chaîne)
+    return X.cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1)
 
+def iterative_var(X):
+    length = X.shape[1]
+    # on prend les variances cumulées suivant le deuxième axe (une par composante de la chaîne)
+    return np.square(X).cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1) - iterative_mean(X)**2
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#%%
-
-if __name__ == "__main__":
-
-
-    #%%
-    #############################
-    # Build case for simulation #
-    #############################
+class ConvergenceDiagnosticsMCMC:
     
-    T = 50
-    cube = np.array([[0,0], [0,1], [1,1], [1,0], [0,0]])
-    zone00 = shapely.Polygon(cube*0.5)
-    zone11 = shapely.Polygon((1+cube)*0.5)
-    zone0 = shapely.union_all((zone00, zone11))
-    zone01 = shapely.Polygon(cube*0.5 + np.array([[0.5, 0]]))
-    zone10 = shapely.Polygon(cube*0.5 + np.array([[0, 0.5]]))
-    zone1 = shapely.union_all((zone01, zone10))
-    zones = [zone0, zone1]
+    def __init__(self, samples, burnin=0, names=None, trueValues=None):
+        """Convergence plots for MCMC output
+
+        Args:
+            samples (list of arrays): list of MCMC chains
+                chains must all have the same shape
+            burnin (int, optional): Remove first iterations prior to analysis. Defaults to 0.
+            names (list of strs, optional): Names attached to each component. Defaults to None.
+            trueValues (list of floats, optional): true values for each component. Defaults to None.
+
+        """
+        self.samples = samples
+        self.burnin = burnin
+        self.ninits = len(samples)
+        self.names = names
+        self.trueValues = trueValues
+        self.sampleSize, self.paramDim  = samples[0].shape
+        self.colors = list(mcolors.BASE_COLORS)[:self.ninits]
     
-    PoissonScales = T * np.array([0.5, 0.5]) # lambda parameters for Poisson process in each zone
-    LambdaTrue = np.array([[0.2],[4.]]) # true zones effects  
-    LambdaMax = LambdaTrue.max() 
-
-    # prior on zone effects
-    a = 2*PoissonScales 
-    b = PoissonScales 
-
-    # GP model specification (True values)
-    l = 0.5
-    l1, l2, nu = l, l, 0.5**2
-    covarianceModel = ot.SquaredExponential([l1, l2], [np.sqrt(nu)])
-    
-    m = ot.PythonFunction(2, 1, lambda x:[0])
-        
-    # Upper bound on size of augmented Poisson process
-    Nmax = 10000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
-    
-    GPscaleFactor = 0.5
-
-    case_simu = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l1, l2], nu)
-    
-    ###################
-    # Data generation #
-    ###################
-0
-    # Simulate according to homogogeneous Poisson process over search domain
-    N_star = int( ot.Poisson(LambdaMax*T).getRealization()[0] )
-    # myUniform = ot.ComposedDistribution([ot.Uniform(0, 1)]*2)
-
-    XY_star = case_simu.Uniform.getSample(N_star)
-    mesh = ot.Mesh(XY_star)
-
-    # apply trend function to mesh and create Gaussian process
-    mTrend = ot.TrendTransform(m, mesh)
-    Ftot = ot.GaussianProcess(mTrend, covarianceModel, mesh)
-
-    # Sigma GP process
-    field_function = ot.PythonFieldFunction(mesh, 1, mesh, 1, sigmoid)
-    process = ot.CompositeProcess(field_function, Ftot) 
-
-    field_f = process.getRealization()
-    
-    # Renormalized Intensity
-    U_star = np.array( case_simu.U_OT(XY_star) )
-    p_accept = np.array( field_f.getValues() ) * np.dot( U_star, LambdaTrue ) / LambdaMax
-    
-    # Use thinning    
-    accepted = np.array( ot.Uniform(0, 1).getSample(N_star) ) <= p_accept 
-    accepted = accepted.ravel()
-    N = accepted.sum()
-    Ntot = N_star
-    NPi = Ntot - N
-
-    # Assemble Augmented (Obs + Latent) Poisson process
-    # /!\ Zero-padded to reach Nmax length
-    D = np.array( XY_star )[accepted]
-
-    # Plot the data
-    fig = plt.figure()
-    plt.scatter( D[:,0], D[:,1])
-    plt.colorbar()
-    # plt.show()
-    plt.savefig("Data.png")
-    #plt.close()
-
-    
-    #%%
-    ###################################################
-    # Use Ibra's code to estimate correlation lengths    
-    
-    import sys, os
-    sys.path.append( os.path.join( os.pardir, "spatial_density_estimation", "gp_spatial" ) )
-    from gp.gibbs_sampler import iSGCP_GibbsSampler
-    from shapely.prepared import prep
-
-    zones_prep = [prep(p) for p in zones]
-    Areas      = [(zp, 0.0) for zp in zones_prep]
-
-    sampler = iSGCP_GibbsSampler(
-        X_bounds  = (0, 1),
-        Y_bounds  = (0, 1),
-        T         = T,
-        Areas     = Areas,
-        polygons  = zones,
-        lambda_nu = 1.,
-        nu        = [0.5, 0.5],
-        delta     = [0.5, 0.5],
-        jitter    = 1e-5,
-        rng_seed  = 15,
-    )
-
-    v, l_ot, eps_mle = sampler.calibrate_nu( D[:,0], D[:,1] )
-    
-    print(f"True l :{l}, estimated l :{l_ot}")
-    print(f"True nu :{nu}, estimated nu :{v**2}")
-
-    #%%
-
-    ############################
-    # Create case for learning #
-    ############################
-    
-    case = SGPPIUseCase(zones, PoissonScales, a, b, Nmax, [l_ot, l_ot], v**2)
-    
-    case.setD(D)
-    #%%
-
-    ###################
-    # MCMC parameters # 
-    ###################
-
-    sampleSize=334
-    blockSize=50 # Display convergence messages after every block of iterations with size: blockSize
-    ninits = 3 # Number of chains run for Gelman-Rubin convergence diagnostic
-        
-    sparse_gp = case.sparse_gp
-    regressorD = case.regressorD
-    gibbs_indices = case.gibbs_indices
-    
-    # Sparse Gaussian Process update
-    RV_eps = ot.RandomVector(NormalCholesky(mu=np.zeros(case.sparse_gp.m), Chol=np.diag([1]*sparse_gp.m), Ntot=sparse_gp.m))
-    ot_link_function_eps = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_eps.getParameter()), lambda x:py_link_function_eps(np.array(x), case))
-
-    # Default chain state
-    x = np.zeros(case.gibbs_indices.chain_dim)
-    x[case.gibbs_indices.Pi_indices[-1]] = int(0.5*(case.gibbs_indices.Nmax + case.gibbs_indices.N))
-    x[case.gibbs_indices.lambda_indices] = 1
-    
-    
-    # Latent Poisson Process update
-    PyRV_Pi = PoissonProcess(case, x)
-    RV_Pi = ot.RandomVector(PyRV_Pi)
-    ot_link_function_Pi = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Pi.getParameter()), PyRV_Pi.py_link_function_Pi)
-
-    # Latent Polya Gamma Process update
-    PyRV_w = PolyaGammaProcess(case, x)
-    RV_w = ot.RandomVector( PyRV_w )
-    ot_link_function_w = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_w.getParameter()), PyRV_w.py_link_function_w)
-
-    # Latent zone effects update
-    RV_Lambda = ot.RandomVector(ot.JointDistribution([ot.Gamma()]*case.J))
-    # ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, J*3, lambda x:py_link_function_Lambda(case, np.array(x)))
-    ot_link_function_Lambda = ot.PythonFunction(gibbs_indices.chain_dim, len(RV_Lambda.getParameter()), lambda x:py_link_function_Lambda(np.array(x), case))
-    
-    # TEST latent GP update
-    RV_eps.getRealization()
-    RV_eps.getParameter()
-    # TEST latent Poisson + GP update
-    RV_Pi.getRealization()
-    RV_Pi.getParameter()
-    # TEST latent Polya-Gamma
-    RV_w.getRealization()
-    RV_w.getParameter()
-    # TEST latent Zone effects
-    RV_Lambda.getRealization()
-    RV_Lambda.getParameter()
-
-    # Learn sparse GP on observed data
-     
-    
-    # # Plot Real sparse GP trajectory on meshgrid over search domain
-    gridsize = 20
-    xx, yy = np.meshgrid( np.linspace(0, 1, gridsize), np.linspace(0, 1, gridsize) )
-    XY_new = np.vstack(( xx.ravel(), yy.ravel() )).T
-
-    # # Z_True = PyRV_Pi.SimulateSigmaGP( XY_new )
-    # M_new = sparse_gp.regressorOT( XY_new )
-    # eps_new = np.array( ot.Normal().getSample(sparse_gp.m) ).reshape(-1,1)
-    # Z_True = np.dot( M_new, eps_new )
-    # # Z_True = m( XY_new )
-        
-    # Z_True = np.array(Z_True).reshape(gridsize, gridsize) * T
-    # levels = np.linspace( Z_True.min(), Z_True.max(), gridsize )
-
-    # fig = plt.figure()
-    # plt.contourf(xx, yy, Z_True, levels)
-    # plt.colorbar()
-    # plt.scatter( D[:,0], D[:,1], c='r')
-    # # plt.show()
-    # plt.savefig('True_GP_trend.png')
-    #plt.close()
-        
-    #%%
-
-
-    ###############
-    # Launch MCMC #
-    ###############
-
-    samples = []
-    randinits = []
-
-    for i in range(ninits):
-        # break
-        # Random initialization
-        randinit = np.zeros(gibbs_indices.chain_dim)
-        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
-        LambdaMax = max(randinit[gibbs_indices.lambda_indices])
-        Ntot_init = 0
-        while Ntot_init <= N:
-            Ntot_init = int(ot.Poisson(LambdaMax * T).getRealization()[0])
-        randinit[gibbs_indices.Pi_indices[-1]] = Ntot_init
-        NPi_init = int(Ntot_init - N)
-        Pi_init = np.zeros(( Nmax - N, 2 ))
-        Pi_init[:NPi_init] = np.array(case.Uniform.getSample(NPi_init))
-        randinit[gibbs_indices.Pi_indices[:-1]] = Pi_init.ravel()
-        randinit[gibbs_indices.Omega_indices[:Ntot_init]] = random_polyagamma(size=Ntot_init)
-        # # check whether useful:
-        randinit[gibbs_indices.lambda_indices] = [ot.Gamma(a[j], b[j]).getRealization()[0] for j in range(case.J)]
-        randinits.append(randinit)
-        # Assemble Gibbs sampler
-        print("random init %s out of %s: %s"%(str(i+1),str(ninits),str(randinits[i])))
-        eps_sampler = ot.RandomVectorMetropolisHastings( RV_eps, randinits[i], gibbs_indices.epsilon_indices, ot_link_function_eps )
-        Pi_sampler = ot.RandomVectorMetropolisHastings( RV_Pi, randinits[i], gibbs_indices.Pi_indices, ot_link_function_Pi ) 
-        w_sampler = ot.RandomVectorMetropolisHastings( RV_w, randinits[i], gibbs_indices.Omega_indices, ot_link_function_w )
-        Lambda_sampler = ot.RandomVectorMetropolisHastings( RV_Lambda, randinits[i], gibbs_indices.lambda_indices, ot_link_function_Lambda )
-        Gibbs_sampler = ot.Gibbs([eps_sampler, Pi_sampler, w_sampler, Lambda_sampler])
-        t1=time.time()
-        sample = np.zeros((0,gibbs_indices.chain_dim))
-        # Main loop
-        for j in range((sampleSize)// blockSize):
-            newsample = Gibbs_sampler.getSample(blockSize)
-            sample = np.vstack((sample, np.array(newsample)))
-            t2=time.time()
-            print("%s iterations performed in %s seconds"%( (j+1)*blockSize, np.round(t2-t1)))   
-            rate = (sample[1:] != sample[:-1]).mean(axis=0) 
-            print("componentwise acceptance rate so far: %s"%rate)        
-            print("Current state: %s"%sample[-1])
-        t2=time.time()
-        print("Whole MCMC run took %s seconds"%(t2-t1))    
-        samples.append( sample )
-
-    #%%
-
-
-    ################################
-    # MCMC Convergence diagnostics #
-    ################################
-
-    colors = list(mcolors.BASE_COLORS)[:ninits]
-    burnin=0
-    paramDim = sample.shape[1]
-    # plotDim = 1
-
-    # components = [j for j in range(paramDim-1-J,paramDim)] 
-    components = [gibbs_indices.Pi_indices[-1]] + gibbs_indices.lambda_indices 
-    names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$"%j for j in range(1,case.J+1)]
-    true_values = [Ntot] + LambdaTrue.ravel().tolist()
-
     # MCMC convergence plots
-    fig = plt.figure( figsize=(5*case.J,5) )
-    for i, X, c in zip( range(ninits), samples, colors ):
-        # break
-        for j in range(len(components)):
+    def convergencePlot(self):
+        """trace plots of MCMC chains
+        """
+        burnin = self.burnin
+        names = self.names
+        fig = plt.figure( figsize=(5*self.paramDim, 5) )
+        for i, X, c in zip( range(self.ninits), self.samples, self.colors ):
             # break
-            plt.subplot(1, len(components), j+1)
-            plt.plot(X[burnin:,components[j]], c=c)
-            if i == 0:
-                plt.ylabel(names[j], fontsize=16)
-                plt.xlabel("Iterations", fontsize=16)    
-            plt.axhline(true_values[j], lw=2, c="k")
-    plt.tight_layout()
-    plt.savefig("traceplots.png")
-    #plt.close()
+            for j in range(self.paramDim):
+                # break
+                plt.subplot(1, self.paramDim, j+1)
+                plt.plot(X[burnin:,j], c=c)
+                if i == 0:
+                    plt.ylabel(names[j], fontsize=16)
+                    plt.xlabel("Iterations", fontsize=16)    
+                if not self.trueValues is None:
+                    plt.axhline(self.trueValues[j], lw=2, c="k")
+        plt.tight_layout()
+        plt.savefig("traceplots.png")
+        #plt.close()
 
-    #%%
+    def autocorrelationPlot(self, nlags=600):
+        """ACF (MCMC autocorrelation) plot
 
+        Args:
+            nlags (int, optional): maximum lag considered. Defaults to 600.
+        """
+        #  
+        burnin = self.burnin
+        names = self.names
+        colors = self.colors
+        fig = plt.figure( figsize=(5*self.paramDim, 5) )
+        for i, X, c in zip( range(self.ninits), self.samples, colors ):
+            # break
+            for j in range(self.paramDim):
+                # break
+                plt.subplot(1, self.paramDim, j+1)
+                plt.plot(stattools.acf(X[burnin:,j], nlags=nlags), c=c)    
+                if i == 0:
+                    plt.ylabel(names[j], fontsize=16)
+                    plt.xlabel("Iterations", fontsize=16)  
+        plt.tight_layout()
+        plt.savefig("ACF.png")
+        #plt.close()
+    
+    def GelmanRubinPlot(self):
+        """Evolution of Gelman-Rubin cv statistic
+        """
+        names = self.names
+        sampleSize = self.sampleSize
+        fig = plt.figure( figsize=(5*self.paramDim, 5) )
+        for j in range(self.paramDim):
+            # remarque : on enlève la première valeur des moyennes / variances cumulés
+            # pour éviter des valeurs de variance égales à zéro...
+            sample_means = np.array([iterative_mean(chain)[:,j] for chain in self.samples])
+            sample_vars = np.array([iterative_var(chain)[:,j] for chain in self.samples])
+            
+            B = sampleSize / (self.ninits - 1) * sample_means.var(axis=0)
+            W = sample_vars.mean(axis=0)
+            V = (sampleSize - 1) / sampleSize * W + (self.ninits + 1) / (sampleSize * self.ninits) * B
+            
+            R = V/W
+            
+            print("Gelman-Rubin convergence diagnostic for %s: %s"%(names[j], V/W))
+            
+            plt.subplot( 1, self.paramDim, j+1)
+            plt.plot(R[10:])
+            
+            plt.xlabel("Iterations")
+            plt.ylabel(r"$\widehat R$")
+        plt.tight_layout()
+        plt.savefig("Gelman_Rubin.png")
+        #plt.close()        
 
-    # ACF (MCMC autocorrelation) plot 
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for i, X, c in zip( range(ninits), samples, colors ):
-        for j in range(len(components)):
-            plt.subplot(1, len(components), j+1)
-            plt.plot(stattools.acf(X[burnin:,components[j]], nlags=600), c=c)    
-            if i == 0:
-                plt.ylabel(names[j], fontsize=16)
-                plt.xlabel("Iterations", fontsize=16)  
-    plt.tight_layout()
-    plt.savefig("ACF.png")
-    #plt.close()
+    def poolChains(self):
+        """final pool chains, with histograms
 
+        Returns:
+            self.sample (array): pooled samples, with burnin removed
+        """
+        # Pool chains
+        burnin = self.burnin
+        names = self.names
+        self.sample = np.vstack([sample[burnin:] for sample in self.samples])
 
-    #%%
+        # Posterior marginals (pooling from both chains)
+        fig = plt.figure( figsize=(5*self.paramDim, 5))
+        for j in range(self.paramDim):
+            plt.subplot( 1, self.paramDim, j+1)
+            X = self.sample[burnin:,j]
+            plt.hist(X, int(np.sqrt(len(X))))
+            plt.xlabel(names[j], fontsize=16)
+            if not self.trueValues is None:
+                plt.axvline(self.trueValues[j], c='r')
+            # plt.xlim(st.mstats.mquantiles(X,.01)[0], st.mstats.mquantiles(X,.99)[0])
+            # plt.xlim(0, 14)
+            print(X.mean())
+            for p in [0.50, .025, .975]:
+                print(st.mstats.mquantiles(X, p)[0])
 
-
-    # Gelman-Rubin
-
-    def iterative_mean(X):
-        length = X.shape[1]
-        # on prend les moyennes cumulées suivant le deuxième axe (une par composante de la chaîne)
-        return X.cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1)
-
-    def iterative_var(X):
-        length = X.shape[1]
-        # on prend les variances cumulées suivant le deuxième axe (une par composante de la chaîne)
-        return np.square(X).cumsum(axis=1) / np.linspace(1, length, length).reshape(1,-1) - iterative_mean(X)**2
-
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for j in range(len(components)):
-        # remarque : on enlève la première valeur des moyennes / variances cumulés
-        # pour éviter des valeurs de variance égales à zéro...
-        sample_means = np.array([iterative_mean(chain)[:,components[j]] for chain in samples])
-        sample_vars = np.array([iterative_var(chain)[:,components[j]] for chain in samples])
+        plt.tight_layout()
+        plt.savefig("post_density.png")
+        #plt.close()
+    
+    def run (self, **kwargs):
+        """Perform complete MCMC convergence analysis 
+        """
+        self.convergencePlot()
+        self.autocorrelationPlot(**kwargs)
+        self.GelmanRubinPlot()
+        self.poolChains()
         
-        B = sampleSize / (ninits - 1) * sample_means.var(axis=0)
-        W = sample_vars.mean(axis=0)
-        V = (sampleSize - 1) / sampleSize * W + (ninits + 1) / (sampleSize * ninits) * B
-        
-        R = V/W
-        
-        print("Gelman-Rubin convergence diagnostic for %s: %s"%(names[j], V/W))
-        
-        # on enlève les premières iterations qui correspondent au temps de chauffe
-        plt.subplot( 1, len(components), j+1)
-        plt.plot(R[10:])
-        
-        plt.xlabel("Iterations")
-        plt.ylabel(r"$\widehat R$")
-    plt.tight_layout()
-    plt.savefig("Gelman_Rubin.png")
-    #plt.close()
-
-    #%%
-
-    # Pool chains
-    sample = np.vstack([sample[burnin:] for sample in samples])
-
-    # Posterior marginals (pooling from both chains)
-    fig = plt.figure( figsize=(5*case.J, 5))
-    for j in range(len(components)):
-        plt.subplot( 1, len(components), j+1)
-        X = sample[burnin:,components[j]]
-        plt.hist(X, int(np.sqrt(len(X))))
-        plt.xlabel(names[j], fontsize=16)
-        plt.axvline(true_values[j], c='r')
-        # plt.xlim(st.mstats.mquantiles(X,.01)[0], st.mstats.mquantiles(X,.99)[0])
-        # plt.xlim(0, 14)
-        print(X.mean())
-        for p in [0.50, .025, .975]:
-            print(st.mstats.mquantiles(X, p)[0])
-
-    plt.tight_layout()
-    plt.savefig("post_density.png")
-    #plt.close()
-
-    #%%
-
-
-    ###############################################################
-    # Predict SIGMA-GP with zone effects throughout search domain #
-    ###############################################################
-
-    Z_new = np.zeros((len(sample), len(XY_new))) 
-    U_new = np.array(case.U_OT(XY_new))
-    intensity_new = np.zeros((len(sample), len(XY_new))) 
-    M = np.array(case.sparse_gp.regressorOT( XY_new ))
-    for i in range(len(sample)):
-        # break
-        sample_i =sample[i]
-        # GP conditional on values at augmented Poisson process
-        epsilon_i = sample_i[gibbs_indices.epsilon_indices]
-        # Ntot_i = sample_i[gibbs_indice.Pi_indices[-1]]
-        # Pi_i = np.array(sample_i[gibbs_indice.Pi_indices[:-1]]).reshape(-1,2)
-        Z_new[i] = np.dot( M, epsilon_i ).ravel()
-        # PyRV_Pi.setParameter(py_link_function_Pi(sample[i], Nmax, J))
-        # Z_new[i] = PyRV_Pi.SimulateSigmaGP( XY_new )
-        # sigmoid transformation
-        sigm_i = np.array(sigmoid(ot.Sample(Z_new[i].reshape(-1,1)))).ravel()
-        Lambda_i = (sample_i[gibbs_indices.lambda_indices] * U_new).sum(axis=1)
-        intensity_new[i] = sigm_i * Lambda_i
-        
-    intensity_mean = intensity_new.mean(axis=0).reshape(gridsize, gridsize) * T
-    levels_mean = np.linspace( intensity_mean.min(), intensity_mean.max(), gridsize )
-
-    intensity_std = intensity_new.std(axis=0).reshape(gridsize, gridsize) * T
-    levels_std = np.linspace( intensity_std.min(), intensity_std.max(), gridsize)
-
-    fig = plt.figure()
-    plt.contourf(xx, yy, intensity_mean, levels_mean)
-    plt.colorbar()
-    plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
-    plt.title("Poisson intensity posterior mean vs Data")
-    plt.savefig("intensity_post_mean.png")
-    #plt.close()
-
-    fig = plt.figure()
-    plt.contourf(xx, yy, intensity_std, levels_std)
-    plt.colorbar()
-    plt.scatter( D[:,0], D[:,1], s=100, c='r', marker='+' )
-    plt.title("Poisson intensity Posterior std vs Data")
-    plt.savefig("intensity_post_std.png")
-    #plt.close()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# %%
