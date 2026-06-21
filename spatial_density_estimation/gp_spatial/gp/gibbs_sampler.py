@@ -9,8 +9,15 @@
 # =================================================================================================
 from pathlib import Path
 import os, sys
-ROOT = Path.cwd().parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path.cwd().parent.parent.parent
+sparseGP_path = ROOT / "Code Gibbs GPETAS"
+visualizations_path = ROOT / "spatial_density_estimation" / "gp_spatial"
+sys.path.insert(0, str(sparseGP_path) )
+import sparseGP
+from sparseGP import sparseGP
+sys.path.insert(0, str(visualizations_path) )
+from visualizations.plot import plot_field
+
 import openturns as ot
 import openturns.experimental as otexp
 from openturns.viewer import View
@@ -23,11 +30,9 @@ from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
 import arviz as az
 import properscoring as ps
-from visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-
 
 
 # %%
