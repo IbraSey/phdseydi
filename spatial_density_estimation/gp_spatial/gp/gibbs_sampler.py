@@ -668,10 +668,12 @@ class SSGC_GibbsSampler:
         Kinv = K.inverse()
         V = Kinv.transpose() * Kinv
         # posterior mean
-        mean = V * (ot.Matrix(M.T) * u)
+        mean = np.array(V * (ot.Matrix(M.T) * u)).ravel()
 
+        myNormal = ot.Normal(mean, ot.CovarianceMatrix(V))
+        
         # Return one realization of a multivariate Normal
-        return ot.Normal(mean, V).getRealization()
+        return myNormal.getRealization()
 
     def sample_Pi_S(self, x, y, eps, sparse_gp, gp_coeffs, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
         """Sample a new realization of the latent marked Poisson process π_S.
