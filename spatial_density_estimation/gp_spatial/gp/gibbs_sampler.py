@@ -9,7 +9,9 @@
 # =================================================================================================
 from pathlib import Path
 import os, sys
-ROOT = Path.cwd().parent.parent.parent
+file_path = Path(__file__).resolve()
+print(str(file_path)) 
+ROOT = file_path.parent.parent.parent.parent
 sparseGP_path = ROOT / "Code Gibbs GPETAS"
 visualizations_path = ROOT / "spatial_density_estimation" / "gp_spatial"
 sys.path.insert(0, str(sparseGP_path) )
