@@ -9,8 +9,17 @@
 # =================================================================================================
 from pathlib import Path
 import os, sys
-ROOT = Path.cwd().parent
-sys.path.insert(0, str(ROOT))
+file_path = Path(__file__).resolve()
+print(str(file_path)) 
+ROOT = file_path.parent.parent.parent.parent
+sparseGP_path = ROOT / "Code Gibbs GPETAS"
+visualizations_path = ROOT / "spatial_density_estimation" / "gp_spatial"
+sys.path.insert(0, str(sparseGP_path) )
+import sparseGP
+from sparseGP import sparseGP
+sys.path.insert(0, str(visualizations_path) )
+from visualizations.plot import plot_field
+
 import openturns as ot
 import openturns.experimental as otexp
 from openturns.viewer import View
@@ -23,11 +32,9 @@ from shapely.geometry import Polygon, Point as ShapelyPoint
 from shapely.prepared import prep
 import arviz as az
 import properscoring as ps
-from visualizations.plot import plot_field
 ot.RandomGenerator.SetSeed(42)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-
 
 
 # %%
@@ -37,19 +44,19 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 
 class SSGC_GibbsSampler:
     """Gibbs sampler for the informative Spatially Structured sigmoidal Gaussian Cox process (SSGC)
- 
+    
     The SSGC models the spatial intensity of a Cox process as the product of a piecewise-constant zonal 
     baseline μ̃(x,y) = exp(ε_j) for (x,y) ∈ S_j and a sigmoidal transformation of a latent GP :
  
         μ(x,y) = μ̃(x,y) · σ(f(x,y)),   f ~ GP(0, k(·,· | v², ℓ)).
- 
+    
     The sampler alternates between :
       1. Pólya-Gamma auxiliary variables ω | f,
       2. latent marked Poisson thinned process π_S | f, ε,
       3. GP realization f | ω, π_S  (conjugate Gaussian update),
       4. zonal log-intensities ε | f, π_S  (MALA),
       5. (optional) kernel hyperparameters ν = (v², ℓ) | f  (Adaptive MH).
- 
+    
     Parameters
     ----------
     X_bounds : tuple of float
@@ -90,7 +97,7 @@ class SSGC_GibbsSampler:
     Sigma_eps_inv : ot.CovarianceMatrix
         Regularised inverse of Sigma_eps.
     """
-
+    
     def __init__(
         self,
         X_bounds,
@@ -589,7 +596,86 @@ class SSGC_GibbsSampler:
 
         return f_D0, f_Df, D_f, K_ff
 
-    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
+    def update_sparseGP_params(self, x, y, Z, omega_D0, Pi_S, sparse_gp):
+        """
+        Update sparse GP parameters using a sparse approximation based on Fourier decomposition.
+
+        This method implements the logic described in 'sparseGPupdateInstructions.md',
+        combining data preparation from the 'update_f' method with the posterior
+        computation from 'SIGMA_GP_PP_Gibbs.py'.
+
+        Parameters
+        ----------
+        x, y : array_like
+            Coordinates of observed events.
+        Z : ot.Point
+            Branching labels (0 for background).
+        omega_D0 : ot.Point
+            Pólya-Gamma variables for observed events.
+        Pi_S : ot.Sample
+            Latent marked Poisson process realization.
+        sparse_gp : sparseGP
+            An instance of the sparseGP class.
+
+        Returns
+        -------
+        gp_coeffs : ot.Point
+            A realization from the posterior distribution of the sparse GP coefficients.
+        """
+        # Start with lines 517 to 542 of "gibbs_sampler.py" (beginning of "update_f")
+        idx = [i for i in range(len(Z)) if Z[i] == 0.0]
+        N_0 = len(idx)
+        if N_0 == 0:
+            raise ValueError("N_0 = 0 : pas de background events.")
+
+        # 1) D_0
+        D_0 = ot.Sample(N_0, 2)
+        omega_D_0 = ot.Point(N_0)
+        for k, i in enumerate(idx):
+            D_0[k, 0] = x[i]
+            D_0[k, 1] = y[i]
+            omega_D_0[k] = omega_D0[i]
+
+        # 2) Pi_S
+        N_Pi = Pi_S.getSize()
+        if N_Pi > 0:
+            PiS_xy = ot.Sample(N_Pi, 2)
+            omega_Pi = ot.Point(N_Pi)
+            for i in range(N_Pi):
+                PiS_xy[i, 0] = Pi_S[i, 0]
+                PiS_xy[i, 1] = Pi_S[i, 1]
+        else:
+            PiS_xy = ot.Sample(0, 2)
+            omega_Pi = ot.Point(0)
+
+        # Combine logic from lines 267-276 of SIGMA_GP_PP_Gibbs.py
+        N = N_0
+        Ntot = N_0 + N_Pi
+        m = sparse_gp.m
+        
+        regressorD = sparse_gp.regressorOT(D_0)
+        Pi = PiS_xy
+
+        u = ot.Sample(np.array([[0.5]]*N + [[-0.5]]*(Ntot-N)))
+        M = np.vstack([regressorD, sparse_gp.regressorOT(Pi)])
+        
+        Omega = np.diag(np.concatenate([np.array(omega_D_0), np.array(omega_Pi)]))
+
+        # precision matrix
+        Q = np.eye(m) + np.dot(M.T, Omega @ M)
+        # invert
+        K = ot.CovarianceMatrix(Q).computeCholesky()
+        Kinv = K.inverse()
+        V = Kinv.transpose() * Kinv
+        # posterior mean
+        mean = np.array(V * (ot.Matrix(M.T) * u)).ravel()
+
+        myNormal = ot.Normal(mean, ot.CovarianceMatrix(V))
+        
+        # Return one realization of a multivariate Normal
+        return myNormal.getRealization()
+
+    def sample_Pi_S(self, x, y, eps, sparse_gp, gp_coeffs, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
         """Sample a new realization of the latent marked Poisson process π_S.
  
         The thinning algorithm proceeds in three steps:
@@ -602,9 +688,11 @@ class SSGC_GibbsSampler:
         Parameters
         ----------
         x, y : array_like, shape (N,)
-            Spatial coordinates of observed events (used as GP conditioning set).
-        f_data : ot.Point or array_like, shape (N,)
-            Current GP values at observed event locations.
+            Spatial coordinates of observed events.
+        sparse_gp : sparseGP
+            An instance of the sparseGP class.
+        gp_coeffs : ot.Point
+            Current realization of the sparse GP coefficients.
         eps : ot.Point or array_like, shape (J,)
             Current zonal log-intensities.
         LIM_CANDIDATES_ZONES : int, optional
@@ -655,24 +743,8 @@ class SSGC_GibbsSampler:
         N_cand = len(XY_cand_list)
         XY_cand = ot.Sample(XY_cand_list)
 
-        # Prédiction GP conditionnelle sur D_0
-        K_dd, K_star_d, K_star_star = self.compute_kernel(XY_data, XY_cand)
-        K_dd_reg = ot.CovarianceMatrix(K_dd)
-        for i in range(N):
-            K_dd_reg[i, i] += self.jitter
-        K_inv = K_dd_reg.inverse()
-
-        f_data_pt = f_data if isinstance(f_data, ot.Point) else ot.Point(list(f_data))
-        mu_star = K_star_d * (K_inv * f_data_pt)
-
-        Sigma_arr = (
-            np.array(K_star_star)
-            - np.array(K_star_d) @ np.array(K_inv) @ np.array(K_star_d).T
-        )
-        Sigma_arr = 0.5 * (Sigma_arr + Sigma_arr.T) + self.jitter * np.eye(N_cand)
-        Sigma_star = ot.CovarianceMatrix(Sigma_arr.tolist())
-
-        f_star = ot.Normal(mu_star, Sigma_star).getRealization()
+        # Compute f_star using sparse GP
+        f_star = np.dot(np.array(sparse_gp.regressorOT(XY_cand)), np.array(gp_coeffs))
 
         # Thinning 
         accept_probs = expit(ot.Point([-float(f_star[i]) for i in range(N_cand)]))
@@ -1144,15 +1216,26 @@ class SSGC_GibbsSampler:
                 print(f"[Pre-run] Using provided nu_init = {list(self.nu)}")
             eps_mle = self.estimate_eps_mle(x, y)
 
+        # Create sparse_gp instance
+        coords = np.vstack([x, y]).T
+        lower = coords.min(axis=0)
+        upper = coords.max(axis=0)
+        c1, c2 = 0.5 * (lower + upper)
+        s1, s2 = 0.5 * (upper - lower)
+        v_sq, l_ot = self.nu
+        hypers = (l_ot, l_ot, c1, c2, s1, s2, v_sq)
+        sparse_gp = sparseGP(hypers)
+
         if learn_nu and verbose:
            print("[Pre-run] nu will be updated at each iteration (Adaptive MH).")
         elif verbose:
            print(f"[Pre-run] nu fixed at : {np.round(np.array(self.nu), 4)} [v^2, l]")
 
         eps = ot.Point(eps_mle.tolist())
-        f_data = ot.Point([0.0] * N)
+        gp_coeffs = ot.Point([0.0] * sparse_gp.m)
 
         if verbose:
+            print(f"[Initialisation] Sparse GP model with {sparse_gp.m} basis functions.")
             print(f"[Initialisation] Using eps_mle as eps_init : {np.round(eps_mle, 4)}")
             print(f"[Initialisation] Initialise f to zero (zero-mean prior)")
 
@@ -1197,19 +1280,15 @@ class SSGC_GibbsSampler:
         for it in range(n_iter):
             try:
                 # Step 1 : omega_D0 | f ~ PG(1, f(x_i, y_i)) 
-                f_data_np = np.array(f_data)
+                f_data_np = np.dot(np.array(sparse_gp.regressorOT(ot.Sample(np.vstack([x, y]).T))), np.array(gp_coeffs))
                 omega_D0 = ot.Point(random_polyagamma(1.0, f_data_np))
 
                 # Step 2 : pi_S | f, eps ~ PP(...)
-                Pi_S = self.sample_Pi_S(x, y, f_data, eps)
+                Pi_S = self.sample_Pi_S(x, y, eps, sparse_gp, gp_coeffs)
 
                 # Step 3 : f | omega_D0, pi_S ~ N(mu_post, Sigma_post) 
-                f_D0, f_Df, D_f_xy, K_ff = self.update_f(x, y, Z, omega_D0, Pi_S)
-                # f_data = f_D0    # restriction à D_0 déjà faite dans update_f, re-réfléchis bien
-
-                # Extract f at observed locations D_0 (first N_0 entries of D_f)
-                idx_D0 = [i for i in range(N) if Z[i] == 0.0]
-                f_data = ot.Point([float(f_Df[k]) for k, i in enumerate(idx_D0)])
+                # With sparse GP, we update the coefficients, not the field directly
+                gp_coeffs = self.update_sparseGP_params(x, y, Z, omega_D0, Pi_S, sparse_gp)
 
                 # Step 4 : eps | f, pi_S (MALA) 
                 # M_j changes at each iteration as pi_S is resampled
@@ -1220,9 +1299,12 @@ class SSGC_GibbsSampler:
 
                 # Step 5 (optional) : nu | f  (Adaptive MH)
                 if learn_nu:
+                    # To update nu, we need f_Df, which is not computed in the sparse version.
+                    # This part needs to be adapted for the sparse GP model.
+                    # For now, this will raise an error if learn_nu=True.
                     history_log_nu.append(np.log(np.array(self.nu)))
                     _, accepted_nu = self.update_nu(
-                        f_Df, D_f_xy, history_log_nu, it, step_nu_init=step_nu_init, t0=t0_nu
+                        None, None, history_log_nu, it, step_nu_init=step_nu_init, t0=t0_nu
                     )
                     acc_nu += int(accepted_nu)
 
@@ -1245,22 +1327,12 @@ class SSGC_GibbsSampler:
                 # ---------- Calcul de Eps_mu^(t) ----------
                 # Calcul de Eps_mu toutes les X itérations seulement
                 if mu_star_func is not None and (it % 10 == 0):
-                    XY_data_ot = ot.Sample([[x[i], y[i]] for i in range(N)])
                     XY_grid = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
 
-                    K_dd, K_gd, K_gg = self.compute_kernel(XY_data_ot, XY_grid)
-                    K_dd_reg = ot.CovarianceMatrix(K_dd)
-                    for ii in range(N):
-                        K_dd_reg[ii, ii] += self.jitter
-                    K_inv = K_dd_reg.inverse()
-
-                    f_data_pt = ot.Point(list(f_data))
-                    mu_g = np.array(K_gd * (K_inv * f_data_pt)).flatten()
-                    Sigma_g = (np.array(K_gg) - np.array(K_gd) @ np.array(K_inv) @ np.array(K_gd).T)
-                    Sigma_g = 0.5 * (Sigma_g + Sigma_g.T) + self.jitter * np.eye(M_grid)
-
-                    # Tirage via Cholesky
-                    L_g = np.linalg.cholesky(Sigma_g)
+                    # In sparse GP, f is a deterministic function of the coefficients
+                    M_grid_reg = np.array(sparse_gp.regressorOT(XY_grid))
+                    mu_g = np.dot(M_grid_reg, np.array(gp_coeffs))
+                    L_g = np.zeros((M_grid, M_grid)) # No stochastic part in f given coeffs
                     f_draw_g = mu_g + L_g @ np.random.randn(M_grid)
 
                     #XY_full_ot   = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
@@ -1273,7 +1345,7 @@ class SSGC_GibbsSampler:
                 if it % thin == 0:
                     eps_chain[store_idx, :] = eps_arr
                     nPi_chain[store_idx] = Pi_S.getSize()
-                    fdata_chain[store_idx, :] = np.array(f_data)
+                    fdata_chain[store_idx, :] = f_data_np # Store f at data locations
                     nu_chain[store_idx, :] = np.array(self.nu)
                     store_idx += 1
 
@@ -2442,7 +2514,3 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
 
 # %%
-
-
-
-

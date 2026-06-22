@@ -24,11 +24,11 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from polyagamma import random_polyagamma
 
-from gp.gibbs_sampler import iSGCP_GibbsSampler
+from gp.gibbs_sampler import SSGC_GibbsSampler
 from gp.data_generation import generate_voronoi_cells, simulate_process
 from visualizations.plot import plot_voronoi_cells, plot_process_dashboard
 
-
+#%%
 # ===================
 # Paramètres globaux
 # ===================
@@ -83,6 +83,7 @@ T_BY_PROFILE = {
 GRID_RES_BY_SETTING = {"A": 100,  "B": 300,  "C": 300}
 
 
+#%%
 # ====================
 # Fonctions latentes
 # ====================
@@ -148,6 +149,7 @@ def f_star_C(x, y):
     return (step + ridge).reshape(np.shape(x))
 
 
+#%%
 # =====================
 # Helpers picklables
 # =====================
@@ -170,6 +172,7 @@ def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
 
     return (mu_tilde * expit(f_func(x_flat, y_flat))).reshape(np.shape(x))
 
+#%%
 
 def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
               Xb, Yb, nu_init, lambda_nu, delta, jitter,
@@ -185,7 +188,7 @@ def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
     y_pt = ot.Point(y_arr.tolist())
     t_pt = ot.Point(t_arr.tolist())
 
-    sampler_k = iSGCP_GibbsSampler(
+    sampler_k = SSGC_GibbsSampler(
         X_bounds=Xb,
         Y_bounds=Yb,
         T=T,
@@ -222,7 +225,7 @@ def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
 
     return results_k, list(sampler_k.nu)
 
-
+#%%
 # ===========================
 # Affichage des diagnostics
 # ===========================
@@ -348,7 +351,7 @@ def run_setting(setting_name, f_star_func, profile_name, savefigure,
         print(f"Analyse chaîne {k+1}/{N_CHAINS} — Setting {setting_name}")
         print(f"{'='*35}")
 
-        sampler_k = iSGCP_GibbsSampler(
+        sampler_k = SSGC_GibbsSampler(
             X_bounds=XB,
             Y_bounds=YB,
             T=T,
@@ -387,17 +390,21 @@ def run_setting(setting_name, f_star_func, profile_name, savefigure,
 
     return all_results, all_outputs, all_nu_finals
 
+#%%
 
 # ================
 # ----- Main -----
 # ================
 if __name__ == "__main__":
 
+    #%%
     SAVEFIGURE = True
     F_STAR = {"A": f_star_A, "B": f_star_B, "C": f_star_C}
 
     for profile_name in ["1", "2", "3"]:
+        # break
         for setting_name in ["A", "B", "C"]:
+            # break
             run_setting(
                 setting_name=setting_name,
                 f_star_func=F_STAR[setting_name],
