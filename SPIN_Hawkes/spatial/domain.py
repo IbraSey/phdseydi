@@ -1,6 +1,4 @@
-"""
-Spatial-domain objects shared by SPIN-H models and inference engines.
-"""
+"""Spatial-domain objects shared by SPIN-H models and inference engines."""
 
 from dataclasses import dataclass
 from typing import Iterable, Sequence

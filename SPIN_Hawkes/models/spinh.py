@@ -1,10 +1,7 @@
-"""
-SPIN-H model: SSGC background plus marked ETAS triggering.
-"""
+"""SPIN-H model: SSGC background plus marked ETAS triggering."""
 
 from dataclasses import dataclass, field
 import numpy as np
-
 from ..config import ETASParameters
 from ..data.catalog import EventCatalog
 from .kernels import ETASKernel

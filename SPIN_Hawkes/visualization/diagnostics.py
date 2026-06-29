@@ -1,6 +1,4 @@
-"""
-Diagnostic plots for simulations, partitions and posterior outputs.
-"""
+"""Diagnostic plots for simulations, partitions and posterior outputs."""
 
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -24,6 +22,7 @@ def plot_process_dashboard(
     simulation,
     grids=None,
     cmap="viridis",
+    latent_cmap="coolwarm",
     title: str = "Spatial process simulation",
     savefigure: bool = False,
     title_savefig: str = "process_dashboard.pdf",
@@ -45,7 +44,7 @@ def plot_process_dashboard(
 
     latent_ax = axes[0, 0]
     latent_image = latent_ax.contourf(
-        grid_x, grid_y, grid_data["f_star"], levels=50, cmap="coolwarm"
+        grid_x, grid_y, grid_data["f_star"], levels=50, cmap=latent_cmap
     )
     latent_divider = make_axes_locatable(latent_ax)
     fig.colorbar(

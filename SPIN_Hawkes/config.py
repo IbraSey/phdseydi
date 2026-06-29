@@ -50,7 +50,7 @@ class MCMCConfig:
     thin: int = 1
     mala_step: float = 0.25
     learn_nu: bool = False
-    calibration_method: str = "sklearn"
+    calibration_method: str = "openturns"
     use_calibration: bool = True
     verbose: bool = True
     verbose_every: int = 100
