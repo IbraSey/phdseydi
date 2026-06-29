@@ -1,12 +1,10 @@
-"""
-Visualisation helpers for OpenTURNS fields.
-"""
+"""Visualisation helpers for OpenTURNS fields."""
 
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-DEFAULT_FIGURES_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "figures"
+DEFAULT_FIGURES_DIR = Path(__file__).resolve().parents[1] / "artifacts" / "figures"
 FIGURE_DPI = 50
 
 
@@ -16,7 +14,7 @@ def save_figure(
     output_dir: str | Path | None = None,
     dpi: int = FIGURE_DPI,
 ) -> Path:
-    """Save a figure below ``artifacts/figures`` at 50 dpi by default.
+    """Save a figure below ``spin_h/artifacts/figures`` at 50 dpi by default.
 
     A ``.pdf`` extension is added when ``filename`` has no suffix. Nested
     paths are supported, which lets each experiment own a dedicated folder.

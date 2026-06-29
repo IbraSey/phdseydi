@@ -1,11 +1,8 @@
-"""
-Spatially structured sigmoidal Gaussian Cox-process model.
-"""
+"""Spatially structured sigmoidal Gaussian Cox-process model."""
 
 from dataclasses import dataclass, field
 import numpy as np
 from scipy.special import expit
-
 from ..config import GPParameters
 from ..data.catalog import EventCatalog
 from ..spatial.domain import DomainPartition
@@ -46,9 +43,7 @@ class SSGCModel:
         **kwargs,
     ) -> "SSGCModel":
         return cls(
-            domains=DomainPartition.from_polygons(
-                polygons, initial_log_intensities
-            ),
+            domains=DomainPartition.from_polygons( polygons, initial_log_intensities ),
             duration=duration,
             x_bounds=x_bounds,
             y_bounds=y_bounds,
@@ -91,12 +86,7 @@ class SSGCModel:
 
     def sampler_geometry(self):
         """Return the geometry arguments required by the Gibbs sampler."""
-        areas = list(
-            zip(
-                self.domains.prepared_domains,
-                self.domains.initial_log_intensities,
-            )
-        )
+        areas = list( zip(self.domains.prepared_domains, self.domains.initial_log_intensities) )
         return areas, list(self.domains.polygons)
 
 

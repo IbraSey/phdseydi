@@ -4,7 +4,7 @@ from .config import ETASInferenceConfig, ETASParameters, GPParameters, MCMCConfi
 from .data import EventCatalog
 from .inference import (
     ExactGPBackend, FourierSparseGPBackend, GPBackend, GibbsResults, GibbsState,
-    InferenceMethod, SPINHGibbsInference, SPIN_H_GibbsSampler,
+    InferenceMethod, PosteriorAnalysis, SPINHGibbsInference, SPIN_H_GibbsSampler,
     SSGCGibbsInference, SSGC_GibbsSampler, SparseGP,
 )
 from .models import (
@@ -25,7 +25,7 @@ __all__ = [
     "DomainPartition", "ETASInferenceConfig", "ETASKernel", "ETASParameters",
     "EventCatalog", "ExactGPBackend", "FIGURE_DPI", "FourierSparseGPBackend",
     "GPBackend", "GPParameters", "GibbsResults", "GibbsState",
-    "InferenceMethod", "MCMCConfig", "OmoriKernel", "ProductivityKernel",
+    "InferenceMethod", "MCMCConfig", "PosteriorAnalysis", "OmoriKernel", "ProductivityKernel",
     "SPINHGibbsInference", "SPINHModel", "SPIN_H_GibbsSampler",
     "SSGCGibbsInference", "SSGCModel", "SSGC_GibbsSampler",
     "HawkesProcessSimulation", "SimulationGrid",

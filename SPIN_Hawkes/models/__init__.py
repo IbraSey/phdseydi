@@ -1,4 +1,4 @@
-"""SSGC and SPIN-H models."""
+"""Deterministic SSGC and SPIN-H probability models."""
 
 from .kernels import ETASKernel, OmoriKernel, ProductivityKernel, SpatialPowerLawKernel
 from .spinh import SPINHModel

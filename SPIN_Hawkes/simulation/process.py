@@ -1,9 +1,8 @@
-"""
-Simulation of spatial sigmoidal Cox and marked Hawkes processes.
-"""
+"""Simulation of spatial sigmoidal Cox and marked Hawkes processes."""
 
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
+
 import numpy as np
 import openturns as ot
 from scipy.special import expit
@@ -158,14 +157,14 @@ def simulate_hawkes_process(
 
     Background events are first drawn from the spatial sigmoidal Cox process.
     Each observed event then produces a Poisson number of offspring with mean
-    given by the ETAS productivity kernel. Offspring are drawn from the
+    given by the ETAS productivity kernel.  Offspring are drawn from the
     normalized Omori-Utsu and spatial power-law kernels, then discarded when
-    they fall beyond ``T`` or outside the union of the spatial domains. The
+    they fall beyond ``T`` or outside the union of the spatial domains.  The
     returned parent indices are the simulation ground truth for declustering.
 
     The construction starts from background events inside the observation
     window; it therefore does not include clusters whose immigrant lies outside
-    that window. This is the same finite-window convention used by the Gibbs
+    that window.  This is the same finite-window convention used by the Gibbs
     smoke tests.
     """
     if not isinstance(etas_parameters, ETASParameters):

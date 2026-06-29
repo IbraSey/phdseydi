@@ -1,10 +1,9 @@
-"""ETAS kernel components."""
+"""Deterministic ETAS kernel components."""
 
 from dataclasses import dataclass
 import numpy as np
 from shapely import contains_xy
 from shapely.geometry import box
-
 from ..config import ETASParameters
 
 
