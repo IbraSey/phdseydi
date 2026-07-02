@@ -1,26 +1,17 @@
 import math
-from dataclasses import dataclass, field
 
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
-import openturns.experimental as otexp
 from polyagamma import random_polyagamma
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 
-from ..data.catalog import EventCatalog
-from ..config import ETASInferenceConfig, ETASParameters, GPParameters, MCMCConfig
-from ..spatial.domain import DomainPartition
-from ..models import SPINHModel, SSGCModel
+from ..models import SSGCModel
 
-from .backends import ExactGPBackend, GPBackend, SparseGP
-from .base import InferenceMethod
-from .results import GibbsResults
-
-from ..visualization import plot_field, save_figure
+from .backends import SparseGP
 
 class SSGC_GibbsSampler:
     """Gibbs sampler for the spatially structured sigmoidal Gaussian Cox process.
@@ -37,25 +28,9 @@ class SSGC_GibbsSampler:
     
     Parameters
     ----------
-    X_bounds, Y_bounds : tuple of float
-        Bounds ``(minimum, maximum)`` of the rectangular observation window.
-    T : float
-        Duration of the temporal observation window. Intensities are interpreted
-        per unit area and per unit time.
-    Areas : sequence of tuple
-        Pairs ``(prepared_polygon, eps_init)`` defining the spatial partition and
-        initial zonal log-intensities.
-    lambda_nu : float
-        Rate of the independent exponential priors on ``nu = (v_squared, ell)``.
-    nu : array_like, shape (2,)
-        Initial GP marginal variance and OpenTURNS length scale.
-    delta : array_like, shape (2,)
-        Parameters ``(delta_0, delta_1)`` of the Gaussian prior covariance of
-        ``eps``: marginal variance and centroid correlation length.
-    polygons : sequence of shapely.geometry.Polygon
-        Unprepared polygons corresponding one-to-one with ``Areas``.
-    jitter : float, optional
-        Diagonal numerical regularization, by default ``1e-5``.
+    model : SSGCModel
+        Configured SSGC model defining the spatial domains, observation window,
+        GP prior and epsilon prior.
     rng_seed : int or None, optional
         Seed passed to the OpenTURNS random generator.
     
@@ -73,41 +48,22 @@ class SSGC_GibbsSampler:
 
     def __init__(
         self,
-        X_bounds,
-        Y_bounds,
-        T,
-        Areas,
-        lambda_nu,
-        nu,
-        delta,                  # [delta0, delta1] : variance and length-scale de Sigma_eps
-        polygons,               # list of shapely polygons, même format que Areas
-        jitter=1e-5,
+        model,
         rng_seed=None,
     ):
         """Initialize the SSGC sampler; see the class docstring for parameters."""
-        self.X_bounds = tuple(X_bounds)
-        self.Y_bounds = tuple(Y_bounds)
-        self.T = float(T)
-        self.lambda_nu = lambda_nu
-        self.nu = ot.Point(nu)
-        self.delta = ot.Point(delta)
-        self.jitter = jitter
-        if len(Areas) != len(polygons):
-            raise ValueError("Areas and polygons must have the same length.")
+        if not isinstance(model, SSGCModel):
+            raise TypeError("model must be an SSGCModel instance.")
 
-        initial_eps = [float(area[1]) for area in Areas]
-        self.domain_partition = DomainPartition.from_polygons(polygons, initial_eps)
-        self.model = SSGCModel(
-            domains=self.domain_partition,
-            duration=self.T,
-            x_bounds=self.X_bounds,
-            y_bounds=self.Y_bounds,
-            gp_prior=GPParameters(float(nu[0]), float(nu[1])),
-            eps_prior_variance=float(delta[0]),
-            eps_prior_length_scale=float(delta[1]),
-            nu_prior_rate=float(lambda_nu),
-            jitter=float(jitter),
-        )
+        self.model = model
+        self.X_bounds = tuple(model.x_bounds)
+        self.Y_bounds = tuple(model.y_bounds)
+        self.T = float(model.duration)
+        self.lambda_nu = float(model.nu_prior_rate)
+        self.nu = ot.Point([model.gp_prior.variance, model.gp_prior.length_scale])
+        self.delta = ot.Point([model.eps_prior_variance, model.eps_prior_length_scale])
+        self.jitter = float(model.jitter)
+        self.domain_partition = model.domains
 
         self.domains = list(self.domain_partition.polygons)
         self.prepared_domains = list(self.domain_partition.prepared_domains)
@@ -115,12 +71,10 @@ class SSGC_GibbsSampler:
         self.eps_init = self.domain_partition.initial_log_intensities
         self.n_domains = len(self.domain_partition)
 
-        # Backward-compatible aliases used by existing notebooks.
+        # Compact internal aliases retained by the numerical implementation.
         self.polygons = self.domains
         self.areas = self.prepared_domains
-        self.epsilons = self.eps_init.tolist()
         self.J = self.n_domains
-        self.Areas = list(zip(self.prepared_domains, self.epsilons))
 
         if rng_seed is not None:
             ot.RandomGenerator.SetSeed(int(rng_seed))
@@ -131,48 +85,6 @@ class SSGC_GibbsSampler:
             (self.Sigma_eps + self.jitter * np.eye(self.J)).tolist()
         )
         self.Sigma_eps_cov = Sigma_eps_reg
-
-
-    # =============================================================================================
-    # ----------------------------------------- Outillage -----------------------------------------
-    # =============================================================================================
-
-    @staticmethod
-    def _acf(x, max_lag):
-        """Compute the empirical autocorrelation function of a univariate chain.
- 
-        Uses the biased normalisation (dividing by n rather than n−k) which is
-        standard for MCMC diagnostics and guarantees a positive-semidefinite
-        estimate.
- 
-        Parameters
-        ----------
-        x : array_like, shape (n,)
-            Univariate time series (typically a post-burn-in MCMC chain).
-        max_lag : int
-            Maximum lag at which to evaluate the ACF. Clamped to n−1 if larger.
- 
-        Returns
-        -------
-        acf_vals : ndarray, shape (min(max_lag, n−1) + 1,)
-            Autocorrelation values from lag 0 (always 1.0) to lag max_lag.
-        """
-        x = np.asarray(x)
-        x = x - x.mean()
-        n = len(x)
-
-        max_lag = min(max_lag, n - 1)       # max_lag ne peut pas dépasser n-1
-        if max_lag < 0:
-            return np.array([1.0])
-
-        var = np.dot(x, x) / n
-        if var == 0.0:
-            return np.zeros(max_lag + 1)
-
-        acf_vals = np.empty(max_lag + 1)
-        for k in range(max_lag + 1):
-            acf_vals[k] = np.dot(x[:n - k], x[k:]) / (n * var)
-        return acf_vals
 
     def compute_Sigma_eps(self):
         """Build the structured Gaussian prior covariance Σ_ε for the zonal log-intensities.
@@ -1002,7 +914,7 @@ class SSGC_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, verbose=True, method="openturns", plot_kde=False,
+    def calibrate_nu(self, x, y, verbose=True, method="sklearn", plot_kde=False,
                      kde_cmap="viridis"):
         """Calibrate GP hyperparameters from a linearized sigmoid target.
 
@@ -1075,7 +987,7 @@ class SSGC_GibbsSampler:
         else:
             basis = ot.ConstantBasisFactory(2).build()
             covariance = ot.SquaredExponential([0.3, 0.3], [0.3])
-            fitter = otexp.GaussianProcessFitter(
+            fitter = ot.GaussianProcessFitter(
                 sample_ot, ot.Sample(target.reshape(-1, 1).tolist()), covariance, basis
             )
             fitter.setOptimizationBounds(ot.Interval([1e-2, 1e-2], [5.0, 5.0]))
@@ -1486,489 +1398,6 @@ class SSGC_GibbsSampler:
         return mu_post, Sigma_post
     
 
-    def posterior_intensity(self, x, y, t, results, nx=70, ny=70, burn_in=0.3,
-                             cmap="viridis", event_cmap="plasma",
-                             savefigure=False, title_savefig="posterior",
-                             savefigure_Emu=False, title_savefig_Emu="Emu", color_Emu="steelblue",
-                             mu_star_func=None, alpha_ecp=0.95):
-        """Plot the posterior intensity estimate with uncertainty quantification.
- 
-        Generates Monte Carlo draws from the full GP posterior on a regular mesh,
-        transforms them through μ̃ · σ(f) to obtain posterior intensity samples,
-        and computes point-wise statistics (mean, std, credible intervals).
- 
-        If a ground-truth intensity ``mu_star_func`` is provided, also computes
-        and displays RMSE, MAE, CRPS (via properscoring), and ECP metrics, along
-        with a pointwise relative error map.
- 
-        Parameters
-        ----------
-        x, y : array_like, shape (N,)
-            Spatial coordinates of observed events.
-        t : array_like, shape (N,)
-            Event times.
-        results : dict
-            Output of :meth:`run`.
-        nx, ny : int, optional
-            Mesh resolution for posterior evaluation (default 70×70).
-        burn_in : float, optional
-            Burn-in fraction (default 0.3).
-        cmap : str or Colormap, optional
-            Colormap used for intensity fields (default 'viridis').
-        event_cmap : str or Colormap, optional
-            Colormap used for event times in the observation panel.
-        savefigure : bool, optional
-            If True, save the main figure as PDF (default False).
-        title_savefig : str, optional
-            Filename stem for the main figure (default 'posterior').
-        savefigure_Emu : bool, optional
-            If True, save the E_μ trace plot (default False).
-        title_savefig_Emu : str, optional
-            Filename stem for the E_μ figure (default 'Emu').
-        color_Emu : str, optional
-            Line colour for the E_μ trace (default 'steelblue').
-        mu_star_func : callable or None, optional
-            Ground-truth intensity function. If None, only the estimate is plotted.
-        alpha_ecp : float, optional
-            Nominal coverage level for ECP computation (default 0.95).
- 
-        Returns
-        -------
-        output : dict
-            Dictionary with keys including 'mu_hat', 'mu_star', 'diff',
-            'var_mu_hat', 'std_mu_hat', 'lower_mu_hat', 'upper_mu_hat',
-            'mu_hat_sims' (MC samples), 'mesh', 'eps_hat', 'f_data_hat',
-            'E_mu_bar', 'rmse', 'mae', 'crps', 'ecp', and corresponding
-            OpenTURNS Field objects.
-        """
-
-        post_sum = self.posterior_summary(results, burn_in)
-        eps_hat = post_sum["eps_hat"]
-        f_data_hat = post_sum["f_data_hat"]
-        nu_hat = post_sum["nu_hat"]
-        self.nu = ot.Point(nu_hat)
-
-        N = len(t)
-        XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
-
-        xmin, xmax = self.X_bounds
-        ymin, ymax = self.Y_bounds
-        interval = ot.Interval([xmin, ymin], [xmax, ymax])
-        mesher = ot.IntervalMesher([nx - 1, ny - 1])
-        mesh = mesher.build(interval)
-
-        XY_grid = mesh.getVertices()
-        M = XY_grid.getSize()
-
-        if M > 10000:
-            raise ValueError(f"Mesh too large : {M} points")
-
-        ### Évaluation des marginales (suppose que les évaluations du GP sont indépendantes)
-        # mu_post_grid, Sigma_post_grid = self.posterior_gp(
-        #     XY_data, ot.Point(list(f_data_hat)), mesh, eps_hat
-        # )
-
-        # means = np.array(mu_post_grid).flatten()
-        # std_devs = np.sqrt(np.diagonal(np.array(Sigma_post_grid)))
-        # # n_mc = 1000
-        # n_mc = 500
-
-        # f_sims = means[:, None] + std_devs[:, None] * noise
-        # XY_grid = mesh.getVertices()
-        # mu_tilde_grid = self.compute_mu_tilde(XY_grid, eps=eps_hat)
-        # sig_sims = expit(f_sims)
-        # mu_hat_sims = mu_tilde_grid[:, None] * sig_sims   # shape (M, n_mc)
-        # mu_hat = mu_hat_sims.mean(axis=1)
-        # squared_mu_hat = (mu_hat_sims ** 2).mean(axis=1)
-
-        # mu_hat_sample = ot.Sample([[val] for val in mu_hat])
-        # mu_hat_field  = ot.Field(mesh, mu_hat_sample)
-
-        # ---------- Simulation posterior complète du champ GP ----------
-        mu_post_grid, Sigma_post_grid = self.posterior_gp(
-            XY_data, ot.Point(list(f_data_hat)), mesh, eps_hat
-        )
-
-        means = np.asarray(mu_post_grid).reshape(-1)
-        Sigma = np.asarray(Sigma_post_grid)
-
-        if means.shape[0] != M:
-            raise ValueError(
-                f"Inconsistent posterior mean size: means has size {means.shape[0]}, "
-                f"but mesh has {M} vertices"
-            )
-
-        if Sigma.shape != (M, M):
-            raise ValueError(
-                f"Inconsistent posterior covariance shape: Sigma has shape {Sigma.shape}, "
-                f"but expected {(M, M)}"
-            )
-
-        # n_mc = 1000
-        n_mc = 500
-
-        # Symétrisation numérique de la covariance
-        Sigma = 0.5 * (Sigma + Sigma.T)
-
-        # Cholesky robuste avec augmentation progressive du jitter
-        base_jitter = getattr(self, "jitter", 1e-8)
-        jitter_values = [
-            base_jitter,
-            1e-8,
-            1e-7,
-            1e-6,
-            1e-5,
-            1e-4
-        ]
-
-        f_sample = None
-        last_error = None
-
-        for jitter in jitter_values:
-            try:
-                Sigma_cov = ot.CovarianceMatrix((Sigma + jitter * np.eye(M)).tolist())
-                f_sample = ot.Normal(ot.Point(means.tolist()), Sigma_cov).getSample(n_mc)
-                break
-            except Exception as e:
-                last_error = e
-
-        if f_sample is None:
-            raise RuntimeError(
-                f"OpenTURNS Normal sampling failed even with jitter up to {jitter_values[-1]}"
-            ) from last_error
-
-        # Simulation du processus GP complet : chaque colonne de f_sims est une réalisation spatiale corrélée du champ
-        f_sims = np.asarray(f_sample).T
-
-        # Intensité de base mu_tilde
-        mu_tilde_grid = np.asarray(self.compute_mu_tilde(XY_grid, eps=eps_hat)).reshape(-1)
-
-        if mu_tilde_grid.shape[0] != M:
-            raise ValueError(
-                f"Inconsistent mu_tilde size : mu_tilde_grid has size {mu_tilde_grid.shape[0]}, "
-                f"but mesh has {M} vertices"
-            )
-
-        sig_sims = expit(f_sims)
-
-        # Simulations de l'intensité posterior complète
-        mu_hat_sims = mu_tilde_grid[:, None] * sig_sims  # shape (M, n_mc)
-
-        # Moyenne, moment d'ordre 2, variance et intervalles crédibles point par point
-        mu_hat = mu_hat_sims.mean(axis=1)
-        squared_mu_hat = (mu_hat_sims ** 2).mean(axis=1)
-
-        var_mu_hat = squared_mu_hat - mu_hat**2
-        std_mu_hat = np.sqrt(np.maximum(var_mu_hat, 0.0))
-
-        lower_mu_hat = np.quantile(mu_hat_sims, 0.025, axis=1)
-        upper_mu_hat = np.quantile(mu_hat_sims, 0.975, axis=1)
-
-        # Conversion OpenTURNS
-        mu_hat_sample = ot.Sample([[val] for val in mu_hat])
-        mu_hat_field = ot.Field(mesh, mu_hat_sample)
-
-        std_mu_hat_sample = ot.Sample([[val] for val in std_mu_hat])
-        std_mu_hat_field = ot.Field(mesh, std_mu_hat_sample)
-
-        lower_mu_hat_sample = ot.Sample([[val] for val in lower_mu_hat])
-        lower_mu_hat_field = ot.Field(mesh, lower_mu_hat_sample)
-
-        upper_mu_hat_sample = ot.Sample([[val] for val in upper_mu_hat])
-        upper_mu_hat_field = ot.Field(mesh, upper_mu_hat_sample)
-
-        # ---------- Calcul de E_mu ----------
-        domain_area = (xmax - xmin) * (ymax - ymin)
-        E_mu_full = results["E_mu"]
-        mask = ~np.isnan(E_mu_full)
-        E_mu_post = E_mu_full[mask]
-        iters_post = np.where(mask)[0]
-
-        E_mu_bar = None
-        if len(E_mu_post) > 0:
-            E_mu_bar = E_mu_post.mean()
-
-            fig_err, ax_err = plt.subplots(figsize=(9, 3))
-            ax_err.plot(iters_post, E_mu_post, linewidth=0.8, color=color_Emu)
-            ax_err.set_xlabel("Iteration")
-            ax_err.set_ylabel(r"$\mathcal{E}_\mu^{(t)}$")
-            ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$" + "\n")
-            ax_err.grid(alpha=0.3)
-            plt.tight_layout()
-
-            if savefigure_Emu:
-                try:
-                    save_path = save_figure(fig_err, title_savefig_Emu)
-                    print(f"Figure E_mu sauvegardée : {save_path}")
-                except Exception as e:
-                    print(f"Erreur lors de la sauvegarde E_mu : {e}")
-
-            plt.show()
-
-        # ---------- Vraie intensité + métriques (si fournie) ----------
-        mu_star_grid = None
-        rmse = mae = ecp = crps_bar = diff = None
-
-        if mu_star_func is not None:
-            import properscoring as ps
-
-            grid_xy = np.array(XY_grid)
-            mu_star_grid = mu_star_func(grid_xy[:, 0], grid_xy[:, 1])
-
-            mu_star_sample = ot.Sample([[val] for val in mu_star_grid])
-            mu_star_field = ot.Field(mesh, mu_star_sample)
-
-            diff = np.abs(mu_hat - mu_star_grid) / (mu_star_grid + self.jitter)
-            diff_sample = ot.Sample([[val] for val in diff])
-            diff_field = ot.Field(mesh, diff_sample)
-
-            # --- RMSE ---
-            rmse = np.sqrt(np.mean((mu_hat - mu_star_grid) ** 2))
-
-            # --- MAE ---
-            mae = np.mean(np.abs(mu_hat - mu_star_grid))
-
-            # --- CRPS ---
-            # ps.crps_ensemble attend (observations, forecasts)
-            # observations : shape (M,)
-            # forecasts : shape (M, n_mc) 
-            crps_pointwise = ps.crps_ensemble(mu_star_grid, mu_hat_sims)  # shape (M,)
-            crps_bar = float(crps_pointwise.mean())
-
-            # --- ECP(alpha) ---
-            q_lo = np.quantile(mu_hat_sims, (1 - alpha_ecp) / 2, axis=1)
-            q_hi = np.quantile(mu_hat_sims, 1 - (1 - alpha_ecp) / 2, axis=1)
-            ecp = np.mean((mu_star_grid >= q_lo) & (mu_star_grid <= q_hi))
-
-            print(f"\n{'='*45}")
-            print(f"  Métriques (grille {nx}x{ny}, n_mc={n_mc})")
-            print(f"{'='*45}")
-            print(f"  RMSE          : {rmse:.4f}")
-            print(f"  MAE           : {mae:.4f}")
-            print(f"  CRPS          : {crps_bar:.4f}")
-            print(f"  ECP({alpha_ecp:.2f})   : {ecp:.4f}  (cible : {alpha_ecp:.2f})")
-            print(f"{'='*45}\n")
-
-        # ---------- Figure ----------
-        if mu_star_func is not None:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
-
-            ax = axes[0]
-            plot_field(mu_star_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Vraie intensité $\mu^\star(s)$" + "\n")
-            ax.set_xlim(self.X_bounds)
-            ax.set_ylim(self.Y_bounds)
-            ax.grid(alpha=0.3, color="white", linewidth=0.5)
-
-            ax = axes[1]
-            plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
-            ax.set_xlim(self.X_bounds)
-            ax.set_ylim(self.Y_bounds)
-            ax.grid(alpha=0.3, color="white", linewidth=0.5)
-
-            ax = axes[2]
-            plot_field(diff_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Erreur relative $\frac{|\hat{\mu}(s) - \mu^\star(s)|}{\mu^\star(s)}$" + "\n")
-            ax.set_xlim(self.X_bounds)
-            ax.set_ylim(self.Y_bounds)
-            ax.grid(alpha=0.3, color="white", linewidth=0.5)
-
-        else:
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-
-            ax = axes[0]
-            ax.scatter(x, y, c=t, s=12, alpha=0.7, edgecolors="black", cmap=event_cmap)
-            ax.set_title(f"Données observées (N={N})" + "\n")
-            ax.set_xlim(self.X_bounds)
-            ax.set_ylim(self.Y_bounds)
-            ax.set_aspect("equal", adjustable="box")
-            ax.grid(alpha=0.3)
-
-            ax = axes[1]
-            plot_field(mu_hat_field, mode="subplot", ax=ax, cmap=cmap, add_colorbar=True)
-            ax.set_title(r"Intensité estimée $\hat{\mu}(s)$" + "\n")
-            ax.set_xlim(self.X_bounds)
-            ax.set_ylim(self.Y_bounds)
-            ax.grid(alpha=0.3, color="white", linewidth=0.5)
-
-        plt.tight_layout()
-
-        if savefigure:
-            try:
-                save_path = save_figure(fig, title_savefig)
-                print(f"Figure sauvegardée : {save_path}")
-            except Exception as e:
-                print(f"Erreur lors de la sauvegarde : {e}")
-
-        plt.show()
-
-        return {
-            "mu_hat"              : mu_hat,
-            "mu_star"             : mu_star_grid,
-            "diff"                : diff,
-            "squared_mu_hat"      : squared_mu_hat,
-            "var_mu_hat"          : var_mu_hat,
-            "std_mu_hat"          : std_mu_hat,
-            "lower_mu_hat"        : lower_mu_hat,
-            "upper_mu_hat"        : upper_mu_hat,
-            "mu_hat_sims"         : mu_hat_sims,
-            "mu_field"            : mu_hat_field,
-            "std_mu_field"        : std_mu_hat_field,
-            "lower_mu_field"      : lower_mu_hat_field,
-            "upper_mu_field"      : upper_mu_hat_field,
-            "mesh"                : mesh,
-            "mu_post_gp"          : mu_post_grid,
-            "Sigma_post_gp"       : Sigma_post_grid,
-            "eps_hat"             : eps_hat,
-            "f_data_hat"          : f_data_hat,
-            "E_mu_bar"            : E_mu_bar,
-            "E_mu_chain"          : E_mu_post,
-            "rmse"                : rmse,
-            "mae"                 : mae,
-            "crps"                : crps_bar,
-            "ecp"                 : ecp,
-            "alpha_ecp"           : alpha_ecp,
-        }
-    
-    
-    def plot_chains(self, results, figsize=(9, 5), burn_in=0.3,
-                    savefigure=False, title_savefig="traces_eps",
-                    trace_color=None, hist_color="steelblue", burn_in_color="red"):
-        """Plot full traces and post-burn-in histograms for ε and optionally ν.
- 
-        Produces a panel of (J + 2) × 2 subplots: for each component of ε and
-        (if learned) ν, the left column shows the chain trace and the right
-        column shows the marginal histogram.
- 
-        Parameters
-        ----------
-        results : dict
-            Output of :meth:`run`.
-        figsize : tuple of float, optional
-            Figure size (width, height) in inches (default (9, 5)).
-        burn_in : float, optional
-            Fraction excluded from histograms; full traces remain visible.
-        savefigure : bool, optional
-            If True, save the figure as PDF (default False).
-        title_savefig : str, optional
-            Filename stem (default 'traces_eps').
-        trace_color : color-like, optional
-            Trace-line color. If None, Matplotlib chooses it.
-        hist_color : color-like, optional
-            Histogram fill color.
-        burn_in_color : color-like, optional
-            Color of the burn-in limit line.
-        """
-        eps_chain = np.asarray(results["eps"])
-        nu_chain = np.asarray(results["nu"])
-        thin = results.get("thin", 1)
-        n_iter = results.get("n_iter", eps_chain.shape[0])
-        n_store = eps_chain.shape[0]
-        if not 0.0 <= burn_in < 1.0:
-            raise ValueError("burn_in must be in [0, 1).")
-        burn = int(n_store * burn_in)
-
-        # Axe x en vraies itérations
-        iters = np.arange(n_store) * thin
-
-        J = eps_chain.shape[1]
-        fig, axes = plt.subplots(J, 2, figsize=(figsize[0], 3 * J), squeeze=False)
-        for j in range(J):
-            axes[j, 0].plot(iters, eps_chain[:, j], linewidth=1, color=trace_color)
-            axes[j, 0].axvline(burn * thin, color=burn_in_color, linestyle="--", alpha=0.5)
-            axes[j, 0].set_title(rf"Trace $\epsilon_{j}$")
-            axes[j, 0].set_xlabel(f"Iteration (thin={thin})")
-            axes[j, 0].grid(alpha=0.3)
-            axes[j, 1].hist(eps_chain[burn:, j], bins=30, density=True,
-                            edgecolor="black", alpha=0.7, color=hist_color)
-            axes[j, 1].set_title(rf"Posterior $\epsilon_{j}$")
-            axes[j, 1].grid(alpha=0.3)
-        plt.tight_layout()
-        if savefigure:
-            try:
-                save_path = save_figure(fig, title_savefig)
-                print(f"Figure sauvegardée : {save_path}")
-            except Exception as e:
-                print(f"Erreur lors de la sauvegarde : {e}")
-        plt.show()
-
-        if results["acceptance_nu"] is not None:
-            fig, axes = plt.subplots(2, 2, figsize=(figsize[0], 6), squeeze=False)
-            labels = [r"$v^2$", r"$\ell$"]
-            for k in range(2):
-                axes[k, 0].plot(iters, nu_chain[:, k], linewidth=1, color=trace_color)
-                axes[k, 0].axvline(burn * thin, color=burn_in_color, linestyle="--", alpha=0.5)
-                axes[k, 0].set_title(rf"Trace {labels[k]}")
-                axes[k, 0].set_xlabel(f"Iteration (thin={thin})")
-                axes[k, 0].grid(alpha=0.3)
-                axes[k, 1].hist(nu_chain[burn:, k], bins=30, density=True,
-                                edgecolor="black", alpha=0.7, color=hist_color)
-                axes[k, 1].set_title(rf"Posterior {labels[k]}")
-                axes[k, 1].grid(alpha=0.3)
-            plt.tight_layout()
-            if savefigure:
-                try:
-                    save_path = save_figure(fig, "traces_nu")
-                    print(f"Figure sauvegardée : {save_path}")
-                except Exception as e:
-                    print(f"Erreur lors de la sauvegarde : {e}")
-            plt.show()
-
-
-    def plot_acf(self, results, burn_in=0.3, max_lag=50, figsize=(8, 6),
-                 savefigure=False, title_savefig="trace_acf"):
-        """Plot post-burn-in autocorrelation functions for SSGC chains.
-
-        Parameters
-        ----------
-        results : dict
-            Output from :meth:`run`.
-        burn_in : float, optional
-            Fraction of stored draws discarded.
-        max_lag : int, optional
-            Largest displayed lag.
-        figsize : tuple of float, optional
-            Base figure width and height.
-        savefigure : bool, optional
-            Save the figure as PDF.
-        title_savefig : str, optional
-            Output filename or stem.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure or None
-            Figure, or ``None`` when too few post-burn-in draws are available.
-        """
-        eps_chain = np.asarray(results["eps"])
-        burn = int(burn_in * eps_chain.shape[0])
-        n_post = eps_chain.shape[0] - burn
-        max_lag = min(int(max_lag), n_post - 1)
-        if max_lag < 1:
-            print(f"[plot_acf] Not enough post-burn-in draws ({n_post}).")
-            return None
-
-        plots = [(rf"$\epsilon_{j}$", eps_chain[burn:, j]) for j in range(eps_chain.shape[1])]
-        if results.get("acceptance_nu") is not None:
-            nu_chain = np.asarray(results["nu"])
-            plots.extend([(r"$v^2$", nu_chain[burn:, 0]), (r"$\ell$", nu_chain[burn:, 1])])
-
-        fig, axes = plt.subplots(len(plots), 1, figsize=(figsize[0], 3.0 * len(plots)), squeeze=False)
-        lags = np.arange(max_lag + 1)
-        thin = results.get("thin", 1)
-        for ax, (label, chain) in zip(axes[:, 0], plots):
-            values = self._acf(chain, max_lag)
-            ax.plot(lags[:len(values)], values)
-            ax.axhline(0.0, color="black", linewidth=0.8)
-            ax.set(xlim=(0, max_lag), ylim=(-1.0, 1.0), xlabel="Lag")
-            ax.set_title(f"ACF - {label} (thin={thin})")
-            ax.grid(alpha=0.3)
-        plt.tight_layout()
-        if savefigure:
-            save_figure(fig, title_savefig)
-        plt.show()
-        return fig
-
     def compute_diagnostics_multichain(self, results_list, burn_in=0.3):
         """Compute rank-normalized R-hat and effective sample sizes for eps.
 
@@ -2006,25 +1435,3 @@ class SSGC_GibbsSampler:
             az.ess(eps_array, method="tail", prob=0.05), dtype=float
         )
         return r_hat, ess_bulk, ess_tail
-
-
-"""
-SPIN_H_GibbsSampler
-
-Extends SSGC_GibbsSampler with spatio-temporal self-excitation (ETAS),
-latent branching structure, and optional magnitude modelling (Gutenberg-Richter).
-
-Modes :
-    use_etas=False            →  SSGC sampler inherited from the parent
-    use_etas=True,  m=None    →  Hawkes ST       : θ_φ = {A, c, p, d, q}
-    use_etas=True,  m=array   →  Hawkes marqué   : θ_φ = {A, α, c, p, d, q, γ}  ± β
-
-All MH blocks use Adaptive Metropolis (Haario, Saksman & Tamminen, 2001).
-"""
-
-import numpy as np
-import openturns as ot
-import matplotlib.pyplot as plt
-from shapely.geometry import Point as ShapelyPoint
-
-# from .ssgc_gibbs_sampler import SSGC_GibbsSampler

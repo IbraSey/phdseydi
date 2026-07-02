@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Iterable, Sequence
+
 import numpy as np
 from shapely.geometry import Point
 from shapely.ops import unary_union
