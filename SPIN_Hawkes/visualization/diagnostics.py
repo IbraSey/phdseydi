@@ -1,6 +1,7 @@
 """Diagnostic plots for simulations, partitions and posterior outputs."""
 
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.axes_grid1 import make_axes_locatable

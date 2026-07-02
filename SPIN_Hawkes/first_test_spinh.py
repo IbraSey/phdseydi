@@ -1,4 +1,4 @@
-# %% 
+"""Minimal SPIN-H Gibbs smoke test on Hawkes-simulated data."""
 
 import sys
 import warnings
@@ -10,31 +10,30 @@ import openturns as ot
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 warnings.filterwarnings("ignore")
 
-from SPIN_Hawkes import (
+from SPIN_Hawkes import (  
     ETASInferenceConfig,
     ETASParameters,
-    ExactGPBackend,
-    FourierSparseGPBackend,
     GPParameters,
     MCMCConfig,
-    SPINHGibbsInference,
     SPINHModel,
 )
-from SPIN_Hawkes.simulation import generate_voronoi_cells, simulate_hawkes_process
+from SPIN_Hawkes.simulation import generate_voronoi_cells, simulate_hawkes_process  
 
 
 X_BOUNDS = (0.0, 2.0)
 Y_BOUNDS = (0.0, 2.0)
-DURATION = 100.0
+DURATION = 50.0
 DOMAIN_INTENSITIES = (10.0, 1.0, 2.0, 10.0, 8.0, 2.0)
 SEED = 42
 
-N_ITER = 5000
-THIN = 1
-BURN_IN = 0.6
-MALA_STEP = 0.1
-sigma_mh_etas = 0.03
+N_ITER = 3000
+THIN = 5
+BURN_IN = 0.5
+MALA_STEP = 0.12
+SIGMA_MH_ETAS = 0.05
+SIGMA_MH_BETA = 0.1
 USE_SPARSE_GP = True
+MAKE_PLOTS = True
 LAMBDA_GRID_SIZE = 30
 
 EPS_PRIOR_VARIANCE = 1.0
@@ -51,16 +50,23 @@ TRUE_ETAS = ETASParameters(
 )
 TRUE_BETA = 2.3
 MAGNITUDE_MIN = 2.0
-MAGNITUDE_MAX = 7.0
+MAGNITUDE_MAX = 6.0
 
 THETA_PRIORS = {
-    "a_A": 5.0, "b_A": 10.0,
-    "a_alpha": 8.0, "b_alpha": 10.0,
-    "a_c": 2.0, "b_c": 100.0,
-    "a_p": 4.0, "b_p": 10.0,
-    "a_d": 2.0, "b_d": 40.0,
-    "a_q": 9.0, "b_q": 10.0,
-    "a_gamma": 5.0, "b_gamma": 10.0,
+    "a_A": 5.0,
+    "b_A": 10.0,
+    "a_alpha": 8.0,
+    "b_alpha": 10.0,
+    "a_c": 2.0,
+    "b_c": 100.0,
+    "a_p": 4.0,
+    "b_p": 10.0,
+    "a_d": 2.0,
+    "b_d": 40.0,
+    "a_q": 9.0,
+    "b_q": 10.0,
+    "a_gamma": 5.0,
+    "b_gamma": 10.0,
 }
 
 
@@ -88,6 +94,12 @@ def build_lambda_grid():
     return np.asarray(mesh.getVertices(), dtype=float)
 
 
+def true_latent_state(lambda_xy):
+    eps_true = np.log(np.asarray(DOMAIN_INTENSITIES, dtype=float))
+    f_true = latent_field(lambda_xy[:, 0], lambda_xy[:, 1])
+    return eps_true, f_true
+
+
 def print_parameter_summary(summary):
     print("\nPosterior ETAS summary")
     print(f"{'param':<8} {'true':>8} {'estimate':>10}")
@@ -107,25 +119,6 @@ def print_intensity_metrics(name, estimated, truth):
     print(f"MAE = {mae:.4f}")
     print(f"mean estim = {estimated.mean():.4f}")
     print(f"mean true = {truth.mean():.4f}")
-
-
-def true_conditional_intensity(model, catalog, lambda_xy):
-    eps_true = np.log(np.asarray(DOMAIN_INTENSITIES, dtype=float))
-    f_true = latent_field(lambda_xy[:, 0], lambda_xy[:, 1])
-    mu_true = model.background_intensity(
-        lambda_xy[:, 0],
-        lambda_xy[:, 1],
-        eps=eps_true,
-        latent_gp=f_true,
-    )
-    trigger_true = model.triggering_intensity(
-        np.full(lambda_xy.shape[0], DURATION),
-        lambda_xy[:, 0],
-        lambda_xy[:, 1],
-        catalog,
-        parameters=TRUE_ETAS,
-    )
-    return mu_true, trigger_true, mu_true + trigger_true
 
 
 def main():
@@ -153,7 +146,7 @@ def main():
 
     print("Generated Hawkes catalog")
     print(
-        f"N={len(catalog)}"
+        f"N={len(catalog)} "
         f"({simulation.n_background} background, {simulation.n_triggered} triggered)"
     )
 
@@ -172,8 +165,8 @@ def main():
         magnitude_max=MAGNITUDE_MAX,
     )
 
-    inference = SPINHGibbsInference(
-        model=model,
+    fit = model.gibbs(
+        catalog,
         config=MCMCConfig(
             n_iter=N_ITER,
             thin=THIN,
@@ -186,16 +179,14 @@ def main():
             learn_beta=True,
             beta_init=2.0,
             theta_priors=THETA_PRIORS,
-            sigma_mh_etas=sigma_mh_etas,
-            sigma_mh_beta=0.1,
+            sigma_mh_etas=SIGMA_MH_ETAS,
+            sigma_mh_beta=SIGMA_MH_BETA,
             adaptation_start=200,
             proposal_jitter=1e-6,
         ),
-        gp_backend=FourierSparseGPBackend() if USE_SPARSE_GP else ExactGPBackend(),
+        gp_backend="sparse" if USE_SPARSE_GP else "exact",
         rng_seed=SEED,
     )
-
-    fit = inference.fit(catalog)
     summary = fit.summary(burn_in=BURN_IN)
 
     print_parameter_summary(summary)
@@ -206,29 +197,35 @@ def main():
     )
 
     lambda_xy = build_lambda_grid()
+    t_eval = np.full(lambda_xy.shape[0], DURATION)
     mu_eval, trigger_eval, lambda_eval = fit.conditional_intensity(
-        t=np.full(lambda_xy.shape[0], DURATION),
+        t=t_eval,
         x=lambda_xy[:, 0],
         y=lambda_xy[:, 1],
         burn_in=BURN_IN,
     )
-    mu_true, trigger_true, lambda_true = true_conditional_intensity(
-        model, catalog, lambda_xy
+
+    eps_true, f_true = true_latent_state(lambda_xy)
+    mu_true, trigger_true, lambda_true = model.conditional_intensity(
+        t_eval=t_eval,
+        x_eval=lambda_xy[:, 0],
+        y_eval=lambda_xy[:, 1],
+        history=catalog,
+        eps=eps_true,
+        latent_gp=f_true,
+        parameters=TRUE_ETAS,
     )
 
     print_intensity_metrics("Background intensity", mu_eval, mu_true)
     print_intensity_metrics("Triggering intensity", trigger_eval, trigger_true)
     print_intensity_metrics("Total conditional intensity", lambda_eval, lambda_true)
 
-
-    fit.plot_traces(burn_in=BURN_IN)
-    fit.plot_declustering(
-        burn_in=BURN_IN,
-        true_parent=simulation.branching_labels,
-    )
-
+    if MAKE_PLOTS:
+        fit.plot_traces(burn_in=BURN_IN)
+        fit.plot_declustering(
+            burn_in=BURN_IN,
+            true_parent=simulation.branching_labels,
+        )
 
 if __name__ == "__main__":
     main()
-
-# %%

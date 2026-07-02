@@ -2,13 +2,18 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+
 import numpy as np
-import openturns as ot
+
 from ..data.catalog import EventCatalog
 from ..models.ssgc import SSGCModel
 
 
 """Fourier-basis approximation of a two-dimensional squared-exponential GP."""
+
+import numpy as np
+import openturns as ot
+
 
 def fourier_mode(x, index, radius):
     """Evaluate a normalized sine basis mode on ``[-radius, radius]``."""
@@ -144,7 +149,9 @@ class ExactGPBackend(GPBackend):
             squared_distance = np.sum(
                 (left[:, None, :] - right[None, :, :]) ** 2, axis=2
             )
-            return variance * np.exp( -squared_distance / (2.0 * length**2) )
+            return variance * np.exp(
+                -squared_distance / (2.0 * length**2)
+            )
 
         K = covariance(train, train) + model.jitter * np.eye(len(catalog))
         K_query = covariance(query, train)

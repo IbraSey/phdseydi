@@ -63,6 +63,41 @@ spin_h/
     domain.py
   config.py                       model and inference configuration
   README.md
+
+
+SPIN_Hawkes/
+  figures/                        generated figures
+  experiments/                    runnable experiment protocols
+    exp_ssgc/
+      experiment_1.py
+      experiment_2.py
+      experiment_3.py
+      experiment_4.py
+    exp_spinh/
+  models/
+    base.py                       common model interface
+    ssgc.py                       SSGC model
+    spinh.py                      SPIN-H model
+    kernels.py                    ETAS productivity, temporal and spatial kernels
+  inference/
+    ssgc_gibbs.py                 SSGC Gibbs implementation
+    spinh_gibbs.py                SPIN-H Gibbs implementation
+    backends.py
+    results.py                    posterior summaries and diagnostics
+  simulation/
+    process.py                    point-process simulation
+    tessellation.py               tessellation
+  visualization/
+    fields.py
+    diagnostics.py
+  data/
+    catalog.py
+  spatial/
+    domain.py
+  config.py                       model and inference configuration
+  first_test_spinh.py             first SPIN-H test
+  how_to_use.md                   user guide
+  README.md
 ```
 
 
@@ -101,5 +136,3 @@ If you use this repository, please cite the associated manuscript:
 ## License
 
 See the package-specific license files `...`, `...`, `...`.
-
-

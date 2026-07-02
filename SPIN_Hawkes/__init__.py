@@ -3,13 +3,12 @@
 from .config import ETASInferenceConfig, ETASParameters, GPParameters, MCMCConfig
 from .data import EventCatalog
 from .inference import (
-    ExactGPBackend, FourierSparseGPBackend, GPBackend, GibbsResults, GibbsState,
-    InferenceMethod, PosteriorAnalysis, SPINHGibbsInference, SPIN_H_GibbsSampler,
-    SSGCGibbsInference, SSGC_GibbsSampler, SparseGP,
+    ExactGPBackend, FourierSparseGPBackend, GPBackend, GibbsResults,
+    SparseGP,
 )
 from .models import (
-    ETASKernel, OmoriKernel, ProductivityKernel, SPINHModel, SSGCModel,
-    SpatialPowerLawKernel,
+    ETASKernel, OmoriKernel, PointProcessModel, ProductivityKernel, SPINHModel,
+    SSGCModel, SpatialPowerLawKernel,
 )
 from .simulation import (
     HawkesProcessSimulation, SimulationGrid, SpatialProcessSimulation,
@@ -24,10 +23,9 @@ from .visualization import (
 __all__ = [
     "DomainPartition", "ETASInferenceConfig", "ETASKernel", "ETASParameters",
     "EventCatalog", "ExactGPBackend", "FIGURE_DPI", "FourierSparseGPBackend",
-    "GPBackend", "GPParameters", "GibbsResults", "GibbsState",
-    "InferenceMethod", "MCMCConfig", "PosteriorAnalysis", "OmoriKernel", "ProductivityKernel",
-    "SPINHGibbsInference", "SPINHModel", "SPIN_H_GibbsSampler",
-    "SSGCGibbsInference", "SSGCModel", "SSGC_GibbsSampler",
+    "GPBackend", "GPParameters", "GibbsResults",
+    "MCMCConfig", "OmoriKernel", "PointProcessModel",
+    "ProductivityKernel", "SPINHModel", "SSGCModel",
     "HawkesProcessSimulation", "SimulationGrid",
     "SparseGP", "SpatialDomain", "SpatialPowerLawKernel",
     "SpatialProcessSimulation",
