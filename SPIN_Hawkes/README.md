@@ -26,45 +26,6 @@ cd SPIN-H
 ## Package layout
 
 ```text
-spin_h/
-  artifacts/                      generated figures, ignored by git
-  experiments/                    runnable experiment protocols
-    exp_ssgc/
-      experiment_1.py
-      experiment_2.py
-      experiment_3.py
-      experiment_4.py
-    exp_spin_h/
-      experiment_5.py
-      experiment_6.py
-      experiment_7.py
-      experiment_8.py
-      experiment_9.py
-      experiment_10.py
-  models/
-    ssgc.py                       SSGC model
-    spinh.py                      SPIN-H model
-    kernels.py                    ETAS productivity, temporal and spatial kernels
-  inference/
-    base.py                       inference contracts and state
-    ssgc_gibbs.py                 SSGC Gibbs implementation
-    spinh_gibbs.py                SPIN-H Gibbs implementation
-    backends.py
-    results.py                    posterior summaries and diagnostics
-  simulation/
-    process.py                    point-process simulation
-    tessellation.py               tessellation
-  visualization/
-    fields.py
-    diagnostics.py
-  data/
-    catalog.py
-  spatial/
-    domain.py
-  config.py                       model and inference configuration
-  README.md
-
-
 SPIN_Hawkes/
   figures/                        generated figures
   experiments/                    runnable experiment protocols
