@@ -1,12 +1,14 @@
 """Validated event-catalog representation."""
 
 from dataclasses import dataclass
+
 import numpy as np
 
 
 @dataclass(frozen=True)
 class EventCatalog:
     """Time-ordered spatial event catalog with optional magnitudes."""
+
     t: np.ndarray
     x: np.ndarray
     y: np.ndarray
