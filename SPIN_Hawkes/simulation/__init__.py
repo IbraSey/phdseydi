@@ -5,7 +5,6 @@ from .process import (
     SimulationGrid,
     SpatialProcessSimulation,
     simulate_hawkes_process,
-    simulate_process,
     simulate_spatial_process,
 )
 from .tessellation import generate_voronoi_cells
@@ -16,6 +15,5 @@ __all__ = [
     "SpatialProcessSimulation",
     "generate_voronoi_cells",
     "simulate_hawkes_process",
-    "simulate_process",
     "simulate_spatial_process",
 ]

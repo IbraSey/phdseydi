@@ -27,18 +27,6 @@ class SimulationGrid:
     sigmoid: np.ndarray
     intensity: np.ndarray
 
-    def as_dict(self) -> dict[str, np.ndarray]:
-        """Return a dictionary representation for experiment scripts."""
-        return {
-            "GX": self.x,
-            "GY": self.y,
-            "mu_tilde": self.baseline,
-            "f_star": self.latent,
-            "sig_f": self.sigmoid,
-            "mu_star": self.intensity,
-        }
-
-
 @dataclass(frozen=True)
 class SpatialProcessSimulation:
     """A simulated catalog together with its generating spatial intensity."""
@@ -61,20 +49,6 @@ class SpatialProcessSimulation:
     def spatial_components(self, x, y):
         """Evaluate ``mu_tilde``, ``f``, ``sigmoid(f)`` and ``mu``."""
         return self._component_evaluator(x, y)
-
-    def as_mapping(self):
-        """Return the ``(simulation_data, grid_data)`` pair used by experiment scripts."""
-        sim_data = {
-            "X": self.sample,
-            "domains": list(self.domains.polygons),
-            "mus_vec": self.baseline_intensities.tolist(),
-            "bounds": (self.x_bounds, self.y_bounds, self.duration),
-            "mu_tilde_func": lambda x, y: self.spatial_components(x, y)[0],
-            "f_star_func": lambda x, y: self.spatial_components(x, y)[1],
-            "mu_star_func": lambda x, y: self.spatial_components(x, y)[3],
-        }
-        return sim_data, self.grid.as_dict()
-
 
 @dataclass(frozen=True)
 class HawkesProcessSimulation:
@@ -448,8 +422,3 @@ def simulate_spatial_process(
             f"over T={duration:g}."
         )
     return simulation
-
-
-def simulate_process(*args, **kwargs):
-    """Simulate a process and return dictionary payloads for experiment scripts."""
-    return simulate_spatial_process(*args, **kwargs).as_mapping()

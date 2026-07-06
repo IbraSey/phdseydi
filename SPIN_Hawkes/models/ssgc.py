@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.special import expit
 
-from ..config import GPParameters
+from ..config import GPParameters, GibbsConfig
 from ..data.catalog import EventCatalog
 from ..spatial.domain import DomainPartition
 from .base import PointProcessModel
@@ -89,19 +89,12 @@ class SSGCModel(PointProcessModel):
             -squared_distance / (2.0 * self.eps_prior_length_scale**2)
         )
 
-    def _build_gibbs_sampler(self, rng_seed=None):
-        from ..inference.ssgc_gibbs import SSGC_GibbsSampler
-
-        return SSGC_GibbsSampler(
-            model=self,
-            rng_seed=rng_seed,
-        )
-
     def gibbs(
         self,
         catalog,
         config=None,
         gp_backend="sparse",
+        sparse_gp=None,
         rng_seed=None,
         reference_intensity=None,
     ):
@@ -111,13 +104,16 @@ class SSGCModel(PointProcessModel):
         diagnostics are returned in a GibbsResults object.
         """
         config, gp_backend = self._prepare_gibbs(
-            catalog, config, gp_backend
+            catalog, config, gp_backend, GibbsConfig
         )
-        sampler = self._build_gibbs_sampler(rng_seed)
+        from ..inference.ssgc_gibbs import SSGC_GibbsSampler
+
+        sampler = SSGC_GibbsSampler(model=self, rng_seed=rng_seed)
         return self._run_gibbs(
             sampler,
             catalog,
             config,
             gp_backend,
-            reference_intensity,
+            sparse_gp=sparse_gp,
+            reference_intensity=reference_intensity,
         )

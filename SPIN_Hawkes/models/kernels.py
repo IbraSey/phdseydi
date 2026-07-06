@@ -139,9 +139,7 @@ class SpatialPowerLawKernel:
         if not (parent_x.shape[0] == parent_y.shape[0] == magnitudes.size):
             raise ValueError("Parent coordinates and magnitudes must have matching lengths.")
 
-        distance_squared = (
-            (points_x - parent_x) ** 2 + (points_y - parent_y) ** 2
-        )
+        distance_squared = ((points_x - parent_x) ** 2 + (points_y - parent_y) ** 2)
         density = self.evaluate(
             distance_squared,
             magnitudes[:, None],
@@ -168,9 +166,7 @@ class ETASKernel:
         magnitude_min: float,
     ) -> np.ndarray:
         return (
-            self.productivity.evaluate(
-                parent_magnitudes, parameters, magnitude_min
-            )
+            self.productivity.evaluate(parent_magnitudes, parameters, magnitude_min)
             * self.temporal.evaluate(delta_t, parameters)
             * self.spatial.evaluate(
                 distance_squared,

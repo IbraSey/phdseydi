@@ -777,108 +777,16 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         return False
 
     # ─────────────────────────────────────────────────────────
-    #  posterior_summary  (extends parent)
-    # ─────────────────────────────────────────────────────────
-
-    def posterior_summary(self, results, burn_in=0.3):
-        """Compute posterior means and declustering probabilities.
-        
-        Parameters
-        ----------
-        results : dict
-            Output from :meth:`run`.
-        burn_in : float, optional
-            Fraction of stored draws discarded from the beginning.
-        
-        Returns
-        -------
-        summary : dict
-            Parent SSGC summaries plus ``theta_phi_hat`` and eventwise
-            ``p_background`` when ETAS is active, and ``beta_hat`` when beta was stored."""
-        summary = super().posterior_summary(results, burn_in)
-        burn = int(np.asarray(results["eps"]).shape[0] * burn_in)
-
-        if results.get("use_etas", False) and results.get("theta_phi") is not None:
-            tp = np.asarray(results["theta_phi"])
-            names = results.get("theta_phi_names", [])
-            if not names:
-                names = ["A", "alpha", "c", "p", "d", "q", "gamma"][:tp.shape[1]]
-            summary["theta_phi_hat"] = {n: tp[burn:, i].mean() for i, n in enumerate(names)}
-            summary["p_background"] = np.mean(np.asarray(results["Z"])[burn:] == 0, axis=0)
-
-        if results.get("beta") is not None:
-            summary["beta_hat"] = np.asarray(results["beta"])[burn:].mean()
-        return summary
-
-    # ─────────────────────────────────────────────────────────
     #  run
     # ─────────────────────────────────────────────────────────
 
-    def initialize_Z_heuristic(self, t, x, y, m, mu_tilde_obs, theta_phi, m_c):
-        """Initialize branching labels by deterministic maximum-weight assignment.
-        
-        Only candidate parents within the 99.5% Omori quantile are considered. The
-        background weight is ``mu_tilde_obs`` and triggering weights use the supplied
-        initial ETAS parameters.
-        
-        Parameters
-        ----------
-        t, x, y : array_like, shape (N,)
-            Time-ordered event data.
-        m : array_like, shape (N,)
-            Magnitudes, or zeros for the unmarked model.
-        mu_tilde_obs : array_like, shape (N,)
-            Initial background weights at observed locations.
-        theta_phi : dict
-            Initial ETAS parameter values.
-        m_c : float
-            Magnitude of completeness.
-        
-        Returns
-        -------
-        Z : ot.Point, shape (N,)
-            Initial one-based parent labels, with zero for background."""
-        N = len(t)
-        Z = np.zeros(N)
-        tp = theta_phi
-        dt_max = tp["c"] * ((1.0 - 0.995) ** (-1.0 / (tp["p"] - 1.0)) - 1.0)
-        dt_max = min(float(dt_max), float(self.T))
-
-        for i in range(N):
-            w_bg = mu_tilde_obs[i]
-            best_w, best_j = w_bg, 0
-
-            for j in range(i):
-                dt = t[i] - t[j]
-                if dt <= 0 or dt > dt_max:
-                    continue
-                prod = tp["A"]
-                if "alpha" in tp:
-                    prod *= np.exp(tp["alpha"] * (m[j] - m_c))
-                phi_t = (tp["p"]-1) * tp["c"]**(tp["p"]-1) * (dt+tp["c"])**(-tp["p"])
-                R = tp["d"]
-                if "gamma" in tp:
-                    R *= np.exp(tp["gamma"] * (m[j] - m_c))
-                r2 = (x[i]-x[j])**2 + (y[i]-y[j])**2
-                phi_s = (tp["q"]-1) / (np.pi*R) * (1 + r2/R)**(-tp["q"])
-                w = prod * phi_t * phi_s
-
-                if w > best_w:
-                    best_w = w
-                    best_j = j + 1   # convention Z : j+1 = triggered by event j
-
-            Z[i] = best_j
-
-        n_bg = np.sum(Z == 0)
-        print(f"  [init_Z] {n_bg} bg / {N} total ({n_bg/N:.1%})")
-        return ot.Point(Z.tolist())
-    
     def run(self, t, x, y, mala_step=0.05, n_iter=1000,
             learn_nu=False, learn_beta=False,
+            sample_z=True, known_z=None, sample_etas=True,
             t0_nu=50, step_nu_init=0.1,
             verbose=True, verbose_every=100, use_calibration=True,
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
-            compute_emu=False, emu_every=10, calibration_method="sklearn",
+            compute_emu=False, emu_every=10, calibration_method="openturns",
             plot_calibration_kde=False, calibration_kde_cmap="viridis",
             gp_backend="exact", sparse_gp=None):
         """Run the SPIN-Hawkes Gibbs sampler.
@@ -900,6 +808,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             Update GP hyperparameters.
         learn_beta : bool, optional
             Update the Gutenberg-Richter rate. Ignored in the unmarked model.
+        sample_z : bool, optional
+            Sample branching labels. Set to ``False`` to keep ``known_z`` fixed.
+        known_z : array_like or None, optional
+            One-based branching labels used as the initial/fixed branching state.
+        sample_etas : bool, optional
+            Update ETAS parameters. Set to ``False`` to keep theta fixed.
         t0_nu : int, optional
             Warm-up length for GP-hyperparameter adaptation.
         step_nu_init : float, optional
@@ -956,6 +870,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             raise ValueError("gp_backend must be 'exact' or 'sparse'.")
 
         N = len(t)
+        sample_z = bool(sample_z)
+        sample_etas = bool(sample_etas)
         self._t_obs_arr = np.asarray([float(v) for v in t], dtype=float)
         self._x_obs_arr = np.asarray([float(v) for v in x], dtype=float)
         self._y_obs_arr = np.asarray([float(v) for v in y], dtype=float)
@@ -1009,18 +925,19 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         f_data = ot.Point([0.0] * N)
 
-        # ── Initialisation informée de Z ────────────────────────────────────
-        XY_init    = self._XY_obs
-        mu_t_init  = self.compute_mu_tilde(XY_init, eps=eps_mle_all)
-        mu_init    = mu_t_init * 0.5          # σ(0) = 0.5 (f initialisé à 0)
-
-        Z = self.initialize_Z_heuristic(
-            np.array([float(t[i]) for i in range(N)]),
-            np.array([float(x[i]) for i in range(N)]),
-            np.array([float(y[i]) for i in range(N)]),
-            self.m if self.m is not None else np.zeros(N),
-            mu_init, self.theta_phi, self.m_c,
-        )
+        # Initial branching labels. Passing known_z enables oracle-Z experiments.
+        if known_z is None:
+            Z = ot.Point([0.0] * N)
+        else:
+            known_z_arr = np.asarray(known_z, dtype=int).reshape(-1)
+            if known_z_arr.size != N:
+                raise ValueError("known_z must contain one label per event.")
+            if np.any(known_z_arr < 0):
+                raise ValueError("known_z labels must be non-negative.")
+            for child, label in enumerate(known_z_arr):
+                if label > child:
+                    raise ValueError("known_z must only reference earlier parents.")
+            Z = ot.Point(known_z_arr.astype(float).tolist())
 
         # ── Fix B3 : eps_mle recalculé sur les background events uniquement ─
         N_j_bg, _ = self._count_events_per_zone(x, y, Z, ot.Sample(0, 3))
@@ -1031,7 +948,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         if verbose:
             mode  = "Hawkes marqué" if self.use_magnitudes else "Hawkes ST"
             flags = [f for f in ["learn_ν" if learn_nu else "",
-                                  "learn_β" if learn_beta else ""] if f]
+                                  "sample_Z" if sample_z else "fixed_Z",
+                                  "sample_θ" if sample_etas else "fixed_θ",
+                                  "learn_β" if learn_beta and sample_etas else ""] if f]
             print(f"[Init] {mode} | θ_φ = {tp_names} | {', '.join(flags) or '—'}")
             if gp_backend == "sparse":
                 print(f"[Init] Sparse GP with {int(sparse_gp.m)} basis functions")
@@ -1148,15 +1067,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     an += int(ok)
 
                 # ── Step 6 : Z | f, ε, θ_φ ──────────────────────────────────
-                Z = self.update_Z(t, x, y, ea, f_data)
+                if sample_z:
+                    Z = self.update_Z(t, x, y, ea, f_data)
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
-                acc["A_alpha"]   += int(self.update_A_alpha(t, x, y, Z, hAa, it))
-                acc["c_p"]       += int(self.update_c_p(t, x, y, Z, hcp, it))
-                acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
+                if sample_etas:
+                    acc["A_alpha"]   += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                    acc["c_p"]       += int(self.update_c_p(t, x, y, Z, hcp, it))
+                    acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
-                if learn_beta:
+                if learn_beta and sample_etas:
                     ab += int(self.update_beta(hb, it))
 
                 # ── Verbose ───────────────────────────────────────────────────
@@ -1170,12 +1091,20 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         f"[{it:>5d}] pi_S={Pi_S.getSize():<4d} "
                         f"acc_eps={ae/denom*100:.0f}% "
                         f"bg={nb}/{N} "
-                        f"acc_Aα={acc_Aa:.0f}% "
-                        f"acc_cp={acc_cp:.0f}% "
-                        f"acc_dqγ={acc_dqg:.0f}%"
                     )
+                    if sample_etas:
+                        msg += (
+                            f"acc_Aα={acc_Aa:.0f}% "
+                            f"acc_cp={acc_cp:.0f}% "
+                            f"acc_dqγ={acc_dqg:.0f}%"
+                        )
+                    else:
+                        msg += "θ_fixed"
                     if learn_beta:
-                        msg += f" β={self.beta:.3f} acc_β={ab/denom*100:.0f}%"
+                        if sample_etas:
+                            msg += f" β={self.beta:.3f} acc_β={ab/denom*100:.0f}%"
+                        else:
+                            msg += f" β={self.beta:.3f} β_fixed"
                     if learn_nu:
                         msg += f" acc_ν={an/denom*100:.0f}%"
                     if it > self.t0_etas: msg += " [AM]"
@@ -1227,9 +1156,16 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             bl = {"A_alpha": "{A,α}" if self.use_magnitudes else "{A}",
                   "c_p":     "{c,p}",
                   "d_q_gamma": "{d,q,γ}" if self.use_magnitudes else "{d,q}"}
-            for k, v in acc.items():
-                print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
-            if learn_beta: print(f"  {'β':14s}  : {ab/n_iter*100:.1f}%")
+            if sample_etas:
+                for k, v in acc.items():
+                    print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
+            else:
+                print(f"  {'θ_φ fixed':14s}  : yes")
+            if learn_beta:
+                if sample_etas:
+                    print(f"  {'β':14s}  : {ab/n_iter*100:.1f}%")
+                else:
+                    print(f"  {'β fixed':14s}  : yes")
 
         return {
             "eps": eps_ch[:si], "nPi": nPi_ch[:si], "f_data": f_ch[:si],
@@ -1249,8 +1185,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "thin": thin, "n_iter": n_iter,
             "gp_backend": gp_backend,
             "gp_coeffs": gp_coeffs_ch[:si] if gp_coeffs_ch is not None else None,
+            "sparse_gp": sparse_gp if gp_backend == "sparse" else None,
             "use_etas": True, "use_magnitudes": self.use_magnitudes,
             "learn_beta": learn_beta, "learn_nu": learn_nu,
+            "sample_z": sample_z, "sample_etas": sample_etas,
+            "known_z": np.asarray(known_z, dtype=int) if known_z is not None else None,
             "am_history": {
                 "A_alpha":   np.array(hAa) if hAa else None,
                 "c_p":       np.array(hcp) if hcp else None,
