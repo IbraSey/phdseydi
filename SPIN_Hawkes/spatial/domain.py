@@ -47,9 +47,7 @@ class DomainPartition:
             for right in self.domains[i + 1 :]:
                 if left.polygon.intersection(right.polygon).area > 1e-12:
                     raise ValueError("Spatial domains must not overlap in their interiors.")
-        self._observation_geometry = unary_union(
-            [domain.polygon for domain in self.domains]
-        )
+        self._observation_geometry = unary_union([domain.polygon for domain in self.domains])
 
     @classmethod
     def from_polygons(
@@ -94,9 +92,7 @@ class DomainPartition:
 
     @property
     def initial_log_intensities(self) -> np.ndarray:
-        return np.asarray(
-            [domain.initial_log_intensity for domain in self.domains], dtype=float
-        )
+        return np.asarray([domain.initial_log_intensity for domain in self.domains], dtype=float)
 
     def locate(self, x, y) -> np.ndarray:
         x = np.asarray(x, dtype=float).reshape(-1)

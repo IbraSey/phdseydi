@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class GPParameters:
-    variance: float = 0.3
+    variance: float = 1.0
     length_scale: float = 0.5
 
     def __post_init__(self):
@@ -45,12 +45,14 @@ class ETASParameters:
 
 
 @dataclass(frozen=True)
-class MCMCConfig:
+class GibbsConfig:
+    """Settings shared by the SSGC and SPIN-H Gibbs samplers."""
+
     n_iter: int = 3000
     thin: int = 1
     mala_step: float = 0.25
     learn_nu: bool = False
-    calibration_method: str = "sklearn"
+    calibration_method: str = "openturns"
     use_calibration: bool = True
     verbose: bool = True
     verbose_every: int = 100
@@ -71,15 +73,34 @@ class MCMCConfig:
 
 
 @dataclass(frozen=True)
-class ETASInferenceConfig:
+class SPINHGibbsConfig(GibbsConfig):
+    """Configuration of a SPIN-H Gibbs run, including ETAS updates."""
+
     learn_beta: bool = False
     beta_init: float = 2.3
     beta_prior: dict[str, float] = field(
         default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
     )
     theta_priors: dict[str, float] = field(default_factory=dict)
+    sample_z: bool = True
+    known_z: object = None
+    sample_etas: bool = True
     sigma_mh_etas: float = 0.1
     sigma_mh_beta: float = 0.1
     adaptation_start: int = 50
     proposal_jitter: float = 1e-6
 
+    def __post_init__(self):
+        super().__post_init__()
+        if self.beta_init <= 0:
+            raise ValueError("beta_init must be positive.")
+        if not isinstance(self.sample_z, bool):
+            raise ValueError("sample_z must be a boolean.")
+        if not isinstance(self.sample_etas, bool):
+            raise ValueError("sample_etas must be a boolean.")
+        if self.sigma_mh_etas <= 0 or self.sigma_mh_beta <= 0:
+            raise ValueError("Metropolis proposal scales must be positive.")
+        if self.adaptation_start < 0:
+            raise ValueError("adaptation_start must be non-negative.")
+        if self.proposal_jitter <= 0:
+            raise ValueError("proposal_jitter must be positive.")

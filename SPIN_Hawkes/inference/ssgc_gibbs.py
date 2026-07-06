@@ -3,6 +3,7 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
+import openturns.experimental as otexp
 from polyagamma import random_polyagamma
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
@@ -903,18 +904,19 @@ class SSGC_GibbsSampler:
         Returns
         -------
         eps_mle : ndarray, shape (J,)
-            Maximum likelihood estimates of the domain log-intensities.
+            Initial envelope log-intensity estimates, using a factor-two correction
+            for the average sigmoid thinning probability.
         """
         zones = self._compute_event_domain_indices(x, y)
         counts = np.bincount(zones[zones >= 0], minlength=self.J)[:self.J].astype(float)
         eps_mle = np.zeros(self.J)
         for j in range(self.J):
             area_j = self.polygons[j].area
-            rate_j = max(counts[j] / (self.T * area_j), 1e-6)
+            rate_j = max(2.0 * counts[j] / (self.T * area_j), 1e-6)
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, verbose=True, method="sklearn", plot_kde=False,
+    def calibrate_nu(self, x, y, verbose=True, method="openturns", plot_kde=False,
                      kde_cmap="viridis"):
         """Calibrate GP hyperparameters from a linearized sigmoid target.
 
@@ -939,7 +941,7 @@ class SSGC_GibbsSampler:
         l_ot : float
             Calibrated OpenTURNS length scale.
         eps_mle : ndarray, shape (J,)
-            Domainwise Poisson MLE used to initialize the chain.
+            Domainwise envelope estimate used to initialize the chain.
         """
         method = str(method).lower()
         if method not in {"sklearn", "openturns"}:
@@ -970,32 +972,55 @@ class SSGC_GibbsSampler:
         eps_mle = self.estimate_eps_mle(x, y)
         if verbose:
             print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
-        domain_area = sum(poly.area for poly in self.polygons)
-        target = 2.0 * domain_area * p_hat - 2.0
 
-        if method == "sklearn":
+        # KDE estimates lambda(x, y).  The latent GP controls the Bernoulli
+        # thinning probability sigmoid(f), so the natural calibration target is
+        # logit(lambda_KDE / mu_tilde_MLE) rather than an arbitrary rescaling of
+        # the spatial density.
+        domain_indices = self._compute_event_domain_indices(x, y)
+        baseline_mle = np.exp(eps_mle[np.maximum(domain_indices, 0)])
+        lambda_kde = len(obs_pts) / self.T * p_hat
+        probability_target = lambda_kde / np.maximum(baseline_mle, self.jitter)
+        probability_target = np.clip(probability_target, 1e-4, 1.0 - 1e-4)
+        target = np.log(probability_target / (1.0 - probability_target))
+        target_variance = float(np.nanvar(target)) if target.size else float(self.nu[0])
+        variance_upper = max(5.0, 4.0 * target_variance, 4.0 * float(self.nu[0]))
+        span_x = float(self.X_bounds[1] - self.X_bounds[0])
+        span_y = float(self.Y_bounds[1] - self.Y_bounds[0])
+        prior_length = float(np.asarray(self.nu, dtype=float).reshape(-1)[1])
+        length_upper = max(0.05, min(0.5 * min(span_x, span_y), 2.5 * prior_length))
+
+        def fit_with_sklearn():
             kernel = (
-                C(0.1, (1e-3, 0.58 ** 2))
-                * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
+                C(0.1, (1e-3, variance_upper))
+                * RBF(length_scale=0.3, length_scale_bounds=(1e-2, length_upper))
                 + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
             )
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
             gp.fit(obs_pts, target)
             parameters = gp.kernel_.get_params()
-            v_sq = float(parameters["k1__k1__constant_value"])
-            l_ot = float(parameters["k1__k2__length_scale"]) * np.sqrt(2.0)
+            return (
+                float(parameters["k1__k1__constant_value"]),
+                float(parameters["k1__k2__length_scale"]) * np.sqrt(2.0),
+            )
+
+        if method == "sklearn":
+            v_sq, l_ot = fit_with_sklearn()
         else:
             basis = ot.ConstantBasisFactory(2).build()
             covariance = ot.SquaredExponential([0.3, 0.3], [0.3])
-            fitter = ot.GaussianProcessFitter(
+            fitter = otexp.GaussianProcessFitter(
                 sample_ot, ot.Sample(target.reshape(-1, 1).tolist()), covariance, basis
             )
-            fitter.setOptimizationBounds(ot.Interval([1e-2, 1e-2], [5.0, 5.0]))
+            fitter.setOptimizationBounds(
+                ot.Interval([1e-2, 1e-2], [length_upper, length_upper])
+            )
             fitter.run()
             fitted_covariance = fitter.getResult().getCovarianceModel()
             l_ot = float(np.min(np.asarray(fitted_covariance.getScale(), dtype=float)))
+            l_ot = min(max(l_ot, 1e-2), length_upper)
             amplitude = float(fitted_covariance.getAmplitude()[0])
-            v_sq = min(amplitude ** 2, 0.58 ** 2)
+            v_sq = min(max(amplitude ** 2, 1e-8), variance_upper)
 
         v = np.sqrt(v_sq)
         self.nu = ot.Point([v_sq, l_ot])
@@ -1039,7 +1064,7 @@ class SSGC_GibbsSampler:
     def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
-        compute_emu=True, emu_every=10, calibration_method="sklearn",
+        compute_emu=True, emu_every=10, calibration_method="openturns",
         plot_calibration_kde=False, calibration_kde_cmap="viridis",
         gp_backend="exact", sparse_gp=None): 
         """Run the augmented SSGC Gibbs sampler.
@@ -1311,127 +1336,7 @@ class SSGC_GibbsSampler:
             "n_iter"         : n_iter,
             "gp_backend"     : gp_backend,
             "gp_coeffs"      : gp_coeffs_chain[:store_idx] if gp_coeffs_chain is not None else None,
+            "sparse_gp"      : sparse_gp if gp_backend == "sparse" else None,
         }
     
 
-    # ================================================================================================
-    # ---------------------------------- Analyse posterior -------------------------------------------
-    # ================================================================================================
-
-    def posterior_summary(self, results, burn_in=0.3):
-        """Compute posterior mean estimates from MCMC chain output.
- 
-        Discards the first ``burn_in`` fraction of the chain and averages the
-        remaining samples for each parameter.
- 
-        Parameters
-        ----------
-        results : dict
-            Output of :meth:`run`.
-        burn_in : float, optional
-            Fraction of the chain to discard as burn-in (default 0.3).
- 
-        Returns
-        -------
-        summary : dict
-            - ``'eps_hat'``: ndarray (J,), posterior mean of ε.
-            - ``'f_data_hat'``: ndarray (N,), posterior mean of f at data locations.
-            - ``'nu_hat'``: ndarray (2,), posterior mean of ν = (v², ℓ).
-        """
-        eps_chain = np.asarray(results["eps"])
-        f_chain = np.asarray(results["f_data"])
-        nu_chain = np.asarray(results["nu"])
-        burn = int(eps_chain.shape[0] * burn_in)
-        return {
-            "eps_hat" : eps_chain[burn:].mean(axis=0),
-            "f_data_hat" : f_chain[burn:].mean(axis=0),
-            "nu_hat" : nu_chain[burn:].mean(axis=0),
-        }
-
-    def posterior_gp(self, XY_data, f_data_hat, mesh, eps_hat):
-        """Compute the GP predictive posterior at mesh vertices.
- 
-        Given the posterior mean of f at the data locations, computes the
-        kriging mean and covariance at the mesh vertices using the standard
-        GP conditional formulas:
- 
-            μ_* = K_{*d} K_{dd}⁻¹ f̂,
-            Σ_* = K_{**} − K_{*d} K_{dd}⁻¹ K_{*d}ᵀ.
- 
-        Parameters
-        ----------
-        XY_data : ot.Sample, shape (N, 2)
-            Conditioning locations (observed event positions).
-        f_data_hat : ot.Point or array_like, shape (N,)
-            Posterior mean of the GP at conditioning locations.
-        mesh : ot.Mesh
-            OpenTURNS mesh whose vertices define the prediction locations.
-        eps_hat : ndarray, shape (J,)
-            Posterior mean of the zonal log-intensities (not used in GP
-            prediction but kept in the signature for API consistency).
- 
-        Returns
-        -------
-        mu_post : ot.Point, shape (M,)
-            Kriging mean at mesh vertices.
-        Sigma_post : ot.CovarianceMatrix, shape (M, M)
-            Kriging covariance at mesh vertices.
-        """
-        XY_grid = mesh.getVertices()
-        N = XY_data.getSize()
-        M = XY_grid.getSize()
-
-        K_dd, K_gd, K_gg = self.compute_kernel(XY_data, XY_grid)
-        K_dd_reg = ot.CovarianceMatrix(K_dd)
-        for i in range(N):
-            K_dd_reg[i, i] += self.jitter
-        f_hat_pt = f_data_hat if isinstance(f_data_hat, ot.Point) else ot.Point(list(f_data_hat))
-        alpha = K_dd_reg.solveLinearSystem(f_hat_pt)
-        mu_post = K_gd * alpha
-
-        solved_cross = K_dd_reg.solveLinearSystem(ot.Matrix(np.array(K_gd).T.tolist()))
-        Sigma_arr = np.array(K_gg) - np.array(K_gd * solved_cross)
-        Sigma_arr = 0.5 * (Sigma_arr + Sigma_arr.T)
-        Sigma_arr += self.jitter * np.eye(M)
-        Sigma_post = ot.CovarianceMatrix(Sigma_arr.tolist())
-
-        return mu_post, Sigma_post
-    
-
-    def compute_diagnostics_multichain(self, results_list, burn_in=0.3):
-        """Compute rank-normalized R-hat and effective sample sizes for eps.
-
-        Parameters
-        ----------
-        results_list : sequence of dict
-            At least two independent outputs from :meth:`run`.
-        burn_in : float, optional
-            Fraction discarded independently from each stored chain.
-
-        Returns
-        -------
-        r_hat, ess_bulk, ess_tail : tuple of ndarray
-            One diagnostic value per domain log-intensity.
-        """
-        import arviz as az
-
-        if len(results_list) < 2:
-            raise ValueError("At least two independent chains are required.")
-        post_chains = []
-        for result in results_list:
-            chain = np.asarray(result["eps"], dtype=float)
-            burn = int(burn_in * chain.shape[0])
-            post_chains.append(chain[burn:])
-        draws = min(chain.shape[0] for chain in post_chains)
-        if draws < 4:
-            raise ValueError("At least four post-burn-in draws per chain are required.")
-        if any(chain.shape[1] != self.J for chain in post_chains):
-            raise ValueError("All chains must contain the same number of domains.")
-
-        eps_array = np.stack([chain[:draws] for chain in post_chains], axis=0)
-        r_hat = np.asarray(az.rhat(eps_array, method="rank"), dtype=float)
-        ess_bulk = np.asarray(az.ess(eps_array, method="bulk"), dtype=float)
-        ess_tail = np.asarray(
-            az.ess(eps_array, method="tail", prob=0.05), dtype=float
-        )
-        return r_hat, ess_bulk, ess_tail

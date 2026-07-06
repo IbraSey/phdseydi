@@ -1,4 +1,4 @@
-"""Diagnostic plots for simulations, partitions and posterior outputs."""
+"""Plotting and figure-saving helpers."""
 
 from pathlib import Path
 
@@ -7,37 +7,120 @@ import numpy as np
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from ..simulation import SpatialProcessSimulation
-from .fields import save_figure
+
+DEFAULT_FIGURES_DIR = Path(__file__).resolve().parents[1] / "figures"
+VECTOR_FIGURE_FORMAT = "pdf"
+RASTER_FIGURE_FORMAT = "png"
+RASTER_FIGURE_DPI = 600
+FIGURE_DPI = RASTER_FIGURE_DPI
 
 
-def _simulation_payload(simulation, grids=None):
-    if isinstance(simulation, SpatialProcessSimulation):
-        sim_data, grid_data = simulation.as_mapping()
-        return sim_data, grid_data
-    if grids is None:
-        raise ValueError("grids is required with a simulation-data dictionary.")
-    return simulation, grids
+def save_figure(
+    fig,
+    filename: str | Path,
+    output_dir: str | Path | None = None,
+    figure_type: str = "vector",
+    dpi: int | None = None,
+) -> Path:
+    """Save a figure below the package ``figures`` directory.
+
+    ``figure_type='vector'`` is for curves, graphs, diagrams and histograms:
+    figures are saved as PDF and no explicit DPI is passed. ``figure_type='raster'``
+    is for heatmaps, intensity maps, simulation images and other matrix-like
+    displays: figures are saved as PNG at 600 dpi by default.
+    """
+    figure_type = str(figure_type).lower()
+    if figure_type not in {"vector", "raster"}:
+        raise ValueError("figure_type must be 'vector' or 'raster'.")
+
+    path = Path(filename)
+    suffix = ".png" if figure_type == "raster" else ".pdf"
+    if path.suffix.lower() != suffix:
+        path = path.with_suffix(suffix)
+
+    directory = DEFAULT_FIGURES_DIR if output_dir is None else Path(output_dir)
+    destination = directory / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_kwargs = {"bbox_inches": "tight"}
+    if figure_type == "raster":
+        save_kwargs["dpi"] = RASTER_FIGURE_DPI if dpi is None else int(dpi)
+    fig.savefig(destination, **save_kwargs)
+    return destination
+
+
+def plot_field(
+    field,
+    mode: str = "plot",
+    ax=None,
+    title: str | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cmap="viridis",
+    add_colorbar: bool = True,
+    savefigure: bool = False,
+    title_savefig: str = "field_output",
+    output_dir: str | Path | None = None,
+    show: bool = True,
+):
+    """Plot a scalar OpenTURNS field on a regular two-dimensional mesh."""
+    mesh = field.getMesh()
+    vertices = np.asarray(mesh.getVertices(), dtype=float)
+    values = np.asarray(field.getValues(), dtype=float).reshape(-1)
+    x_unique = np.unique(vertices[:, 0])
+    y_unique = np.unique(vertices[:, 1])
+    expected_size = x_unique.size * y_unique.size
+    if vertices.shape[0] != expected_size or values.size != expected_size:
+        raise ValueError("plot_field requires a complete regular two-dimensional mesh.")
+
+    x_grid = vertices[:, 0].reshape(y_unique.size, x_unique.size)
+    y_grid = vertices[:, 1].reshape(y_unique.size, x_unique.size)
+    value_grid = values.reshape(y_unique.size, x_unique.size)
+
+    if mode == "plot":
+        fig, local_ax = plt.subplots(figsize=(6, 4))
+    elif mode == "subplot":
+        if ax is None:
+            raise ValueError("ax is required when mode='subplot'.")
+        fig, local_ax = ax.figure, ax
+    else:
+        raise ValueError("mode must be either 'plot' or 'subplot'.")
+
+    contour = local_ax.contourf(
+        x_grid, y_grid, value_grid, levels=15, vmin=vmin, vmax=vmax, cmap=cmap
+    )
+    if add_colorbar:
+        fig.colorbar(contour, ax=local_ax)
+    if title:
+        local_ax.set_title(title)
+    if savefigure:
+        if mode != "plot":
+            raise ValueError("A subplot must be saved through its parent figure.")
+        save_figure(fig, title_savefig, output_dir, figure_type="raster")
+    if show and mode == "plot":
+        plt.show()
+    return fig, local_ax, contour
 
 
 def plot_process_dashboard(
     simulation,
-    grids=None,
     cmap="viridis",
     latent_cmap="coolwarm",
     title: str = "Spatial process simulation",
     savefigure: bool = False,
-    title_savefig: str = "process_dashboard.pdf",
+    title_savefig: str = "process_dashboard",
     output_dir: str | Path | None = None,
     show: bool = True,
 ):
     """Plot latent field, intensity, events and piecewise baseline domains."""
-    sim_data, grid_data = _simulation_payload(simulation, grids)
-    events = np.asarray(sim_data["X"], dtype=float)
+    if not isinstance(simulation, SpatialProcessSimulation):
+        raise TypeError("simulation must be a SpatialProcessSimulation instance.")
+    events = np.asarray(simulation.sample, dtype=float)
     n_events = events.shape[0]
-    x_bounds, y_bounds, _ = sim_data["bounds"]
-    baseline = np.asarray(sim_data["mus_vec"], dtype=float)
-    domains = sim_data["domains"]
-    grid_x, grid_y = grid_data["GX"], grid_data["GY"]
+    x_bounds, y_bounds = simulation.x_bounds, simulation.y_bounds
+    baseline = simulation.baseline_intensities
+    domains = simulation.domains.polygons
+    grid = simulation.grid
+    grid_x, grid_y = grid.x, grid.y
     color_map = plt.get_cmap(cmap) if isinstance(cmap, str) else cmap
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -45,7 +128,7 @@ def plot_process_dashboard(
 
     latent_ax = axes[0, 0]
     latent_image = latent_ax.contourf(
-        grid_x, grid_y, grid_data["f_star"], levels=50, cmap=latent_cmap
+        grid_x, grid_y, grid.latent, levels=50, cmap=latent_cmap
     )
     latent_divider = make_axes_locatable(latent_ax)
     fig.colorbar(
@@ -57,7 +140,7 @@ def plot_process_dashboard(
 
     intensity_ax = axes[0, 1]
     intensity_image = intensity_ax.contourf(
-        grid_x, grid_y, grid_data["mu_star"], levels=50, cmap=cmap
+        grid_x, grid_y, grid.intensity, levels=50, cmap=cmap
     )
     intensity_divider = make_axes_locatable(intensity_ax)
     fig.colorbar(
@@ -65,7 +148,7 @@ def plot_process_dashboard(
         cax=intensity_divider.append_axes("right", size="5%", pad=0.08),
         label=r"$\mu^\star(x,y)$",
     )
-    intensity_ax.set_title(r"True intensity $\mu^\star=\tilde\mu\,\sigma(f^\star)$")
+    intensity_ax.set_title(r"True intensity $\mu^\star=	ilde\mu\,\sigma(f^\star)$")
 
     event_ax = axes[1, 0]
     if n_events:
@@ -85,7 +168,7 @@ def plot_process_dashboard(
         domain_ax.text(
             domain.centroid.x,
             domain.centroid.y,
-            rf"$\tilde\mu={baseline[index]:.2g}$",
+            rf"$	ilde\mu={baseline[index]:.2g}$",
             ha="center",
             va="center",
             fontsize=8,
@@ -102,7 +185,7 @@ def plot_process_dashboard(
         axis.grid(alpha=0.3)
     fig.tight_layout()
     if savefigure:
-        save_figure(fig, title_savefig, output_dir)
+        save_figure(fig, title_savefig, output_dir, figure_type="raster")
     if show:
         plt.show()
     return fig, axes
@@ -118,7 +201,7 @@ def plot_voronoi_cells(
     title: str = "Voronoi tessellation",
     figsize=(6, 6),
     savefigure: bool = False,
-    title_savefig: str = "voronoi.pdf",
+    title_savefig: str = "voronoi",
     output_dir: str | Path | None = None,
     show: bool = True,
 ):

@@ -1,7 +1,7 @@
-"""User-facing posterior analysis and inference result objects."""
+"""User-facing Gibbs posterior result object."""
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,255 +15,13 @@ from ..visualization import plot_field, save_figure
 
 
 @dataclass
-class PosteriorAnalysis:
-    """Posterior summaries and predictions shared by Gibbs result objects."""
-
-    raw: dict
-    model: SSGCModel
-    catalog: EventCatalog
-    default_burn_in: float = 0.3
-
-    def _burn_index(self, n_samples: int, burn_in: float | None = None) -> int:
-        burn_in = self.default_burn_in if burn_in is None else burn_in
-        if not 0.0 <= burn_in < 1.0:
-            raise ValueError("burn_in must be in [0, 1).")
-        burn = int(n_samples * burn_in)
-        if burn >= n_samples:
-            raise ValueError("burn_in leaves no posterior samples.")
-        return burn
-
-    def summary(self, burn_in: float | None = None) -> dict:
-        """Compute posterior mean estimates from stored Gibbs chains."""
-        eps_chain = np.asarray(self.raw["eps"])
-        f_chain = np.asarray(self.raw["f_data"])
-        nu_chain = np.asarray(self.raw["nu"])
-        burn = self._burn_index(eps_chain.shape[0], burn_in)
-        summary = {
-            "eps_hat": eps_chain[burn:].mean(axis=0),
-            "f_data_hat": f_chain[burn:].mean(axis=0),
-            "nu_hat": nu_chain[burn:].mean(axis=0),
-        }
-
-        if self.raw.get("use_etas", False) and self.raw.get("theta_phi") is not None:
-            theta_chain = np.asarray(self.raw["theta_phi"])
-            names = self.raw.get("theta_phi_names", [])
-            if not names:
-                names = ["A", "alpha", "c", "p", "d", "q", "gamma"][:theta_chain.shape[1]]
-            summary["theta_phi_hat"] = {
-                name: theta_chain[burn:, index].mean()
-                for index, name in enumerate(names)
-            }
-            summary["p_background"] = self.background_probabilities(burn_in)
-
-        if self.raw.get("beta") is not None:
-            summary["beta_hat"] = np.asarray(self.raw["beta"])[burn:].mean()
-        return summary
-
-    def background_probabilities(self, burn_in: float | None = None) -> np.ndarray:
-        """Eventwise posterior probability of being background."""
-        branching_chain = self.raw.get("Z")
-        if branching_chain is None:
-            return np.ones(len(self.catalog))
-        branching_chain = np.asarray(branching_chain)
-        burn = self._burn_index(branching_chain.shape[0], burn_in)
-        return np.mean(branching_chain[burn:] == 0, axis=0)
-
-    def _gp_conditional_mean(self, x_eval, y_eval, f_data_hat, nu_hat) -> np.ndarray:
-        """Kriging mean of the latent GP at evaluation coordinates."""
-        x_eval = np.asarray(x_eval, dtype=float).reshape(-1)
-        y_eval = np.asarray(y_eval, dtype=float).reshape(-1)
-        f_data_hat = np.asarray(f_data_hat, dtype=float).reshape(-1)
-        n_eval = x_eval.size
-        n_obs = len(self.catalog)
-        if f_data_hat.size != n_obs:
-            raise ValueError("f_data_hat must have one value per observed event.")
-        if n_obs == 0:
-            return np.zeros(n_eval, dtype=float)
-
-        nu0, nu1 = map(float, np.asarray(nu_hat, dtype=float).reshape(-1))
-        if nu0 <= 0.0 or nu1 <= 0.0:
-            raise ValueError("nu_hat must contain positive GP variance and length scale.")
-        sigma_amp = np.sqrt(nu0)
-        kernel = ot.SquaredExponential([nu1, nu1], [sigma_amp])
-
-        observed = ot.Sample(np.column_stack([self.catalog.x, self.catalog.y]).tolist())
-        evaluation = ot.Sample(np.column_stack([x_eval, y_eval]).tolist())
-        all_points = ot.Sample(n_obs + n_eval, 2)
-        observed_array = np.asarray(observed)
-        evaluation_array = np.asarray(evaluation)
-        for index in range(n_obs):
-            all_points[index, 0] = float(observed_array[index, 0])
-            all_points[index, 1] = float(observed_array[index, 1])
-        for index in range(n_eval):
-            all_points[n_obs + index, 0] = float(evaluation_array[index, 0])
-            all_points[n_obs + index, 1] = float(evaluation_array[index, 1])
-
-        covariance = np.asarray(kernel.discretize(all_points), dtype=float)
-        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
-        for index in range(n_obs):
-            K_obs[index, index] += self.model.jitter
-        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
-        alpha_gp = K_obs.solveLinearSystem(ot.Point(f_data_hat.tolist()))
-        return np.asarray(K_eval_obs * alpha_gp, dtype=float).reshape(-1)
-
-    def background_intensity(self, x, y, burn_in: float | None = None) -> np.ndarray:
-        """Posterior-mean background intensity at spatial coordinates."""
-        summary = self.summary(burn_in)
-        x_eval, y_eval = np.broadcast_arrays(
-            np.asarray(x, dtype=float),
-            np.asarray(y, dtype=float),
-        )
-        x_flat = x_eval.reshape(-1)
-        y_flat = y_eval.reshape(-1)
-        f_eval = self._gp_conditional_mean(
-            x_flat,
-            y_flat,
-            summary["f_data_hat"],
-            summary["nu_hat"],
-        )
-        return self.model.background_intensity(
-            x_flat,
-            y_flat,
-            summary["eps_hat"],
-            f_eval,
-        ).reshape(x_eval.shape)
-
-    def background_intensity_samples(
-        self,
-        x,
-        y,
-        burn_in: float | None = None,
-        n_samples: int = 500,
-    ) -> np.ndarray:
-        """Draw background-intensity fields at arbitrary spatial coordinates."""
-        if n_samples <= 0:
-            raise ValueError("n_samples must be positive.")
-
-        summary = self.summary(burn_in)
-        x_eval, y_eval = np.broadcast_arrays(
-            np.asarray(x, dtype=float),
-            np.asarray(y, dtype=float),
-        )
-        x_flat = x_eval.reshape(-1)
-        y_flat = y_eval.reshape(-1)
-        evaluation_xy = np.column_stack([x_flat, y_flat])
-
-        nu0, nu1 = map(float, np.asarray(summary["nu_hat"]).reshape(-1))
-        kernel = ot.SquaredExponential([nu1, nu1], [np.sqrt(nu0)])
-        all_points = ot.Sample(
-            np.vstack([self.catalog.xy, evaluation_xy]).tolist()
-        )
-        covariance = np.asarray(kernel.discretize(all_points), dtype=float)
-        n_obs = len(self.catalog)
-        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
-        for index in range(n_obs):
-            K_obs[index, index] += self.model.jitter
-        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
-        K_eval = covariance[n_obs:, n_obs:]
-
-        f_data_hat = ot.Point(np.asarray(summary["f_data_hat"]).tolist())
-        mean = np.asarray(
-            K_eval_obs * K_obs.solveLinearSystem(f_data_hat), dtype=float
-        ).reshape(-1)
-        solved_cross = K_obs.solveLinearSystem(
-            ot.Matrix(np.asarray(K_eval_obs).T.tolist())
-        )
-        conditional_covariance = K_eval - np.asarray(K_eval_obs * solved_cross)
-        conditional_covariance = 0.5 * (
-            conditional_covariance + conditional_covariance.T
-        )
-
-        latent_samples = None
-        last_error = None
-        for jitter in (self.model.jitter, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4):
-            try:
-                covariance_ot = ot.CovarianceMatrix(
-                    (
-                        conditional_covariance
-                        + jitter * np.eye(x_flat.size)
-                    ).tolist()
-                )
-                latent_samples = np.asarray(
-                    ot.Normal(
-                        ot.Point(mean.tolist()), covariance_ot
-                    ).getSample(n_samples)
-                ).T
-                break
-            except Exception as error:
-                last_error = error
-        if latent_samples is None:
-            raise RuntimeError(
-                "OpenTURNS could not sample the posterior GP."
-            ) from last_error
-
-        baseline = self.model.baseline_intensity(
-            x_flat, y_flat, summary["eps_hat"]
-        )
-        return baseline[:, None] * expit(latent_samples)
-
-    def conditional_intensity(self, t, x, y, burn_in: float | None = None):
-        """Posterior-mean conditional SPIN-H intensity at evaluation points."""
-        if not hasattr(self.model, "triggering_intensity"):
-            raise TypeError("Conditional ETAS intensity is unavailable for this model.")
-        summary = self.summary(burn_in)
-        if "theta_phi_hat" not in summary:
-            raise TypeError("Conditional ETAS intensity requires theta_phi samples.")
-
-        t_eval, x_eval, y_eval = np.broadcast_arrays(
-            np.asarray(t, dtype=float),
-            np.asarray(x, dtype=float),
-            np.asarray(y, dtype=float),
-        )
-        shape = t_eval.shape
-        t_flat = t_eval.reshape(-1)
-        x_flat = x_eval.reshape(-1)
-        y_flat = y_eval.reshape(-1)
-
-        f_eval = self._gp_conditional_mean(
-            x_flat,
-            y_flat,
-            summary["f_data_hat"],
-            summary["nu_hat"],
-        )
-        background = self.model.background_intensity(
-            x_flat,
-            y_flat,
-            summary["eps_hat"],
-            f_eval,
-        ).reshape(-1)
-
-        parameters = ETASParameters(**summary["theta_phi_hat"])
-        triggering = self.model.triggering_intensity(
-            t_flat,
-            x_flat,
-            y_flat,
-            self.catalog,
-            parameters,
-        ).reshape(-1)
-        total = background + triggering
-        return background.reshape(shape), triggering.reshape(shape), total.reshape(shape)
-
-
-@dataclass
 class GibbsResults(Mapping):
-    """Typed view over the Gibbs output dictionary."""
+    """Gibbs chains, posterior summaries, predictions and diagnostics."""
 
     raw: dict
     model: SSGCModel
     catalog: EventCatalog
     default_burn_in: float = 0.3
-    _analysis: PosteriorAnalysis | None = field(default=None, init=False, repr=False)
-
-    @property
-    def analysis(self) -> PosteriorAnalysis:
-        if self._analysis is None:
-            self._analysis = PosteriorAnalysis(
-                self.raw,
-                self.model,
-                self.catalog,
-                self.default_burn_in,
-            )
-        return self._analysis
 
     def __getitem__(self, key):
         return self.raw[key]
@@ -302,16 +60,106 @@ class GibbsResults(Mapping):
         rates.update(self.raw.get("acceptance_etas") or {})
         return rates
 
-    def summary(self, burn_in: float | None = None) -> dict:
-        return self.analysis.summary(burn_in)
+    def _burn_index(self, n_samples: int, burn_in: float | None = None) -> int:
+        burn_in = self.default_burn_in if burn_in is None else burn_in
+        if not 0.0 <= burn_in < 1.0:
+            raise ValueError("burn_in must be in [0, 1).")
+        burn = int(n_samples * burn_in)
+        if burn >= n_samples:
+            raise ValueError("burn_in leaves no posterior samples.")
+        return burn
 
-    def background_probabilities(
-        self, burn_in: float | None = None
+    def summary(self, burn_in: float | None = None) -> dict:
+        """Compute posterior mean estimates from stored Gibbs chains."""
+        eps_chain = np.asarray(self.raw["eps"])
+        f_chain = np.asarray(self.raw["f_data"])
+        nu_chain = np.asarray(self.raw["nu"])
+        burn = self._burn_index(eps_chain.shape[0], burn_in)
+        summary = {
+            "eps_hat": eps_chain[burn:].mean(axis=0),
+            "f_data_hat": f_chain[burn:].mean(axis=0),
+            "nu_hat": nu_chain[burn:].mean(axis=0),
+        }
+        gp_coeffs = self.raw.get("gp_coeffs")
+        if gp_coeffs is not None:
+            gp_coeffs = np.asarray(gp_coeffs, dtype=float)
+            if gp_coeffs.size:
+                summary["gp_coeffs_hat"] = gp_coeffs[burn:].mean(axis=0)
+
+        if self.raw.get("use_etas", False) and self.raw.get("theta_phi") is not None:
+            theta_chain = np.asarray(self.raw["theta_phi"])
+            names = self.raw.get("theta_phi_names", [])
+            if not names:
+                names = ["A", "alpha", "c", "p", "d", "q", "gamma"][:theta_chain.shape[1]]
+            summary["theta_phi_hat"] = {
+                name: theta_chain[burn:, index].mean()
+                for index, name in enumerate(names)
+            }
+            summary["p_background"] = self.background_probabilities(burn_in)
+
+        if self.raw.get("beta") is not None:
+            summary["beta_hat"] = np.asarray(self.raw["beta"])[burn:].mean()
+        return summary
+
+    def background_probabilities(self, burn_in: float | None = None) -> np.ndarray:
+        """Eventwise posterior probability of being background."""
+        branching_chain = self.raw.get("Z")
+        if branching_chain is None:
+            return np.ones(len(self.catalog))
+        branching_chain = np.asarray(branching_chain)
+        burn = self._burn_index(branching_chain.shape[0], burn_in)
+        return np.mean(branching_chain[burn:] == 0, axis=0)
+
+    def _gp_conditional_mean_from_points(
+        self, x_eval, y_eval, x_obs, y_obs, f_obs, nu_hat
     ) -> np.ndarray:
-        return self.analysis.background_probabilities(burn_in)
+        """Kriging mean of the latent GP from selected conditioning points."""
+        x_eval = np.asarray(x_eval, dtype=float).reshape(-1)
+        y_eval = np.asarray(y_eval, dtype=float).reshape(-1)
+        x_obs = np.asarray(x_obs, dtype=float).reshape(-1)
+        y_obs = np.asarray(y_obs, dtype=float).reshape(-1)
+        f_obs = np.asarray(f_obs, dtype=float).reshape(-1)
+        n_eval = x_eval.size
+        n_obs = x_obs.size
+        if not (n_obs == y_obs.size == f_obs.size):
+            raise ValueError("x_obs, y_obs and f_obs must have matching lengths.")
+        if n_obs == 0:
+            return np.zeros(n_eval, dtype=float)
+
+        nu0, nu1 = map(float, np.asarray(nu_hat, dtype=float).reshape(-1))
+        if nu0 <= 0.0 or nu1 <= 0.0:
+            raise ValueError("nu_hat must contain positive GP variance and length scale.")
+        kernel = ot.SquaredExponential([nu1, nu1], [np.sqrt(nu0)])
+
+        observed_array = np.column_stack([x_obs, y_obs])
+        evaluation_array = np.column_stack([x_eval, y_eval])
+        all_points = ot.Sample(np.vstack([observed_array, evaluation_array]).tolist())
+        covariance = np.asarray(kernel.discretize(all_points), dtype=float)
+        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
+        for index in range(n_obs):
+            K_obs[index, index] += self.model.jitter
+        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
+        alpha_gp = K_obs.solveLinearSystem(ot.Point(f_obs.tolist()))
+        return np.asarray(K_eval_obs * alpha_gp, dtype=float).reshape(-1)
+
+    def _gp_conditional_mean(self, x_eval, y_eval, f_data_hat, nu_hat) -> np.ndarray:
+        """Kriging mean of the latent GP at evaluation coordinates."""
+        return self._gp_conditional_mean_from_points(
+            x_eval, y_eval, self.catalog.x, self.catalog.y, f_data_hat, nu_hat
+        )
 
     def background_intensity(self, x, y, burn_in: float | None = None) -> np.ndarray:
-        return self.analysis.background_intensity(x, y, burn_in)
+        """Posterior-mean background intensity at spatial coordinates."""
+        summary = self.summary(burn_in)
+        x_eval, y_eval = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+        x_flat = x_eval.reshape(-1)
+        y_flat = y_eval.reshape(-1)
+        return self._posterior_background_flat(
+            x_flat, y_flat, summary, burn_in
+        ).reshape(x_eval.shape)
 
     def background_intensity_samples(
         self,
@@ -320,9 +168,535 @@ class GibbsResults(Mapping):
         burn_in: float | None = None,
         n_samples: int = 500,
     ) -> np.ndarray:
-        return self.analysis.background_intensity_samples(
-            x, y, burn_in, n_samples
+        """Draw background-intensity fields at arbitrary spatial coordinates."""
+        if n_samples <= 0:
+            raise ValueError("n_samples must be positive.")
+
+        summary = self.summary(burn_in)
+        x_eval, y_eval = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
         )
+        x_flat = x_eval.reshape(-1)
+        y_flat = y_eval.reshape(-1)
+
+        eps_chain = np.asarray(self.raw.get("eps", []), dtype=float)
+        sparse_gp = self.raw.get("sparse_gp")
+        gp_coeffs = self.raw.get("gp_coeffs")
+        if sparse_gp is not None and gp_coeffs is not None and eps_chain.ndim == 2:
+            gp_coeffs = np.asarray(gp_coeffs, dtype=float)
+            if gp_coeffs.ndim == 2 and gp_coeffs.shape[0] >= eps_chain.shape[0]:
+                burn = self._burn_index(eps_chain.shape[0], burn_in)
+                available_indices = np.arange(burn, eps_chain.shape[0])
+                positions = np.linspace(
+                    0, available_indices.size - 1, int(n_samples)
+                ).round().astype(int)
+                draw_indices = available_indices[positions]
+                points = ot.Sample(np.column_stack([x_flat, y_flat]).tolist())
+                design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
+                samples = np.empty((x_flat.size, draw_indices.size), dtype=float)
+                for column, index in enumerate(draw_indices):
+                    latent_gp = design @ gp_coeffs[index]
+                    samples[:, column] = self.model.background_intensity(
+                        x_flat, y_flat, eps_chain[index], latent_gp
+                    ).reshape(-1)
+                return samples
+
+        evaluation_xy = np.column_stack([x_flat, y_flat])
+
+        nu0, nu1 = map(float, np.asarray(summary["nu_hat"]).reshape(-1))
+        kernel = ot.SquaredExponential([nu1, nu1], [np.sqrt(nu0)])
+        all_points = ot.Sample(
+            np.vstack([self.catalog.xy, evaluation_xy]).tolist()
+        )
+        covariance = np.asarray(kernel.discretize(all_points), dtype=float)
+        n_obs = len(self.catalog)
+        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
+        for index in range(n_obs):
+            K_obs[index, index] += self.model.jitter
+        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
+        K_eval = covariance[n_obs:, n_obs:]
+
+        f_data_hat = ot.Point(np.asarray(summary["f_data_hat"]).tolist())
+        mean = np.asarray(
+            K_eval_obs * K_obs.solveLinearSystem(f_data_hat), dtype=float
+        ).reshape(-1)
+        solved_cross = K_obs.solveLinearSystem(
+            ot.Matrix(np.asarray(K_eval_obs).T.tolist())
+        )
+        conditional_covariance = K_eval - np.asarray(K_eval_obs * solved_cross)
+        conditional_covariance = 0.5 * (
+            conditional_covariance + conditional_covariance.T
+        )
+
+        latent_samples = None
+        last_error = None
+        for jitter in (self.model.jitter, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4):
+            try:
+                covariance_ot = ot.CovarianceMatrix(
+                    (conditional_covariance + jitter * np.eye(x_flat.size)).tolist()
+                )
+                latent_samples = np.asarray(
+                    ot.Normal(ot.Point(mean.tolist()), covariance_ot).getSample(n_samples)
+                ).T
+                break
+            except Exception as error:
+                last_error = error
+        if latent_samples is None:
+            raise RuntimeError(
+                "OpenTURNS could not sample the posterior GP."
+            ) from last_error
+
+        baseline = self.model.baseline_intensity(
+            x_flat, y_flat, summary["eps_hat"]
+        )
+        return baseline[:, None] * expit(latent_samples)
+
+    @staticmethod
+    def _thin_indices(indices, max_draws=200):
+        indices = np.asarray(indices, dtype=int).reshape(-1)
+        if indices.size <= max_draws:
+            return indices
+        selected = np.linspace(0, indices.size - 1, int(max_draws)).round().astype(int)
+        return np.unique(indices[selected])
+
+    def _posterior_background_flat(
+        self, x_flat, y_flat, summary, burn_in: float | None = None, max_draws=200
+    ) -> np.ndarray:
+        eps_chain = np.asarray(self.raw.get("eps", []), dtype=float)
+        if eps_chain.ndim != 2 or eps_chain.shape[0] == 0:
+            f_eval = self._gp_conditional_mean(
+                x_flat, y_flat, summary["f_data_hat"], summary["nu_hat"]
+            )
+            return self.model.background_intensity(
+                x_flat, y_flat, summary["eps_hat"], f_eval
+            ).reshape(-1)
+
+        burn = self._burn_index(eps_chain.shape[0], burn_in)
+        draw_indices = self._thin_indices(np.arange(burn, eps_chain.shape[0]), max_draws)
+        sparse_gp = self.raw.get("sparse_gp")
+        gp_coeffs = self.raw.get("gp_coeffs")
+        if sparse_gp is not None and gp_coeffs is not None:
+            gp_coeffs = np.asarray(gp_coeffs, dtype=float)
+            if gp_coeffs.size:
+                points = ot.Sample(np.column_stack([x_flat, y_flat]).tolist())
+                design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
+                mu_sum = np.zeros(np.asarray(x_flat).size, dtype=float)
+                for index in draw_indices:
+                    f_eval = design @ gp_coeffs[index]
+                    mu_sum += self.model.background_intensity(
+                        x_flat, y_flat, eps_chain[index], f_eval
+                    ).reshape(-1)
+                return mu_sum / draw_indices.size
+
+        branching_chain = self.branching_chain
+        f_chain = np.asarray(self.raw.get("f_data", []), dtype=float)
+        nu_chain = np.asarray(self.raw.get("nu", []), dtype=float)
+        if (
+            branching_chain is not None
+            and f_chain.ndim == 2
+            and nu_chain.ndim == 2
+            and f_chain.shape[0] >= eps_chain.shape[0]
+            and nu_chain.shape[0] >= eps_chain.shape[0]
+        ):
+            mu_sum = np.zeros(np.asarray(x_flat).size, dtype=float)
+            used = 0
+            for index in draw_indices:
+                mask = np.asarray(branching_chain[index], dtype=int) == 0
+                if not np.any(mask):
+                    continue
+                f_eval = self._gp_conditional_mean_from_points(
+                    x_flat, y_flat,
+                    self.catalog.x[mask], self.catalog.y[mask],
+                    f_chain[index, mask], nu_chain[index],
+                )
+                mu_sum += self.model.background_intensity(
+                    x_flat, y_flat, eps_chain[index], f_eval
+                ).reshape(-1)
+                used += 1
+            if used:
+                return mu_sum / used
+
+        f_eval = self._gp_conditional_mean(
+            x_flat, y_flat, summary["f_data_hat"], summary["nu_hat"]
+        )
+        return self.model.background_intensity(
+            x_flat, y_flat, summary["eps_hat"], f_eval
+        ).reshape(-1)
+
+    def _posterior_etas_parameters(self, summary) -> ETASParameters:
+        if "theta_phi_hat" not in summary:
+            raise TypeError("Conditional ETAS intensity requires theta_phi samples.")
+        return ETASParameters(**summary["theta_phi_hat"])
+
+    def conditional_intensity(self, t, x, y, burn_in: float | None = None):
+        """Posterior-mean conditional SPIN-H intensity at evaluation points."""
+        if not hasattr(self.model, "triggering_intensity"):
+            raise TypeError("Conditional ETAS intensity is unavailable for this model.")
+        summary = self.summary(burn_in)
+        parameters = self._posterior_etas_parameters(summary)
+
+        t_eval, x_eval, y_eval = np.broadcast_arrays(
+            np.asarray(t, dtype=float),
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+        shape = t_eval.shape
+        t_flat = t_eval.reshape(-1)
+        x_flat = x_eval.reshape(-1)
+        y_flat = y_eval.reshape(-1)
+
+        background = self._posterior_background_flat(x_flat, y_flat, summary, burn_in)
+        triggering = self.model.triggering_intensity(
+            t_flat,
+            x_flat,
+            y_flat,
+            self.catalog,
+            parameters,
+        ).reshape(-1)
+        total = background + triggering
+        return background.reshape(shape), triggering.reshape(shape), total.reshape(shape)
+
+    def _conditional_intensity_grid(self, times, burn_in, nx, ny):
+        if not hasattr(self.model, "triggering_intensity"):
+            raise TypeError("Conditional intensity plots require a SPIN-H model.")
+
+        summary = self.summary(burn_in)
+        parameters = self._posterior_etas_parameters(summary)
+        times = np.asarray(times, dtype=float).reshape(-1)
+        if times.size == 0:
+            raise ValueError("times must contain at least one value.")
+        if not np.all(np.isfinite(times)):
+            raise ValueError("times must contain only finite values.")
+        if int(nx) < 2 or int(ny) < 2:
+            raise ValueError("nx and ny must be at least 2.")
+
+        x_grid = np.linspace(self.model.x_bounds[0], self.model.x_bounds[1], int(nx))
+        y_grid = np.linspace(self.model.y_bounds[0], self.model.y_bounds[1], int(ny))
+        X, Y = np.meshgrid(x_grid, y_grid)
+        x_flat = X.reshape(-1)
+        y_flat = Y.reshape(-1)
+        background = self._posterior_background_flat(
+            x_flat, y_flat, summary, burn_in
+        ).reshape(Y.shape)
+
+        triggering_frames = []
+        total_frames = []
+        for time in times:
+            triggering = self.model.triggering_intensity(
+                np.full(x_flat.size, time),
+                x_flat,
+                y_flat,
+                self.catalog,
+                parameters,
+            ).reshape(Y.shape)
+            triggering_frames.append(triggering)
+            total_frames.append(background + triggering)
+
+        return {
+            "times": times,
+            "x_grid": X,
+            "y_grid": Y,
+            "background": background,
+            "triggering": np.asarray(triggering_frames),
+            "total": np.asarray(total_frames),
+        }
+
+    @staticmethod
+    def _as_spatial_grid(name, values, shape):
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=float)
+        if array.shape == shape:
+            return array
+        if array.size == int(np.prod(shape)):
+            return array.reshape(shape)
+        expected_size = int(np.prod(shape))
+        raise ValueError(
+            f"{name} must have shape {shape} "
+            f"or be flat with {expected_size} values."
+        )
+
+    @staticmethod
+    def _as_time_grids(name, values, shape):
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=float)
+        if array.shape == shape:
+            return array
+        if array.ndim == 2 and shape[0] == 1 and array.shape == shape[1:]:
+            return array[None, :, :]
+        if array.size == int(np.prod(shape)):
+            return array.reshape(shape)
+        expected_size = int(np.prod(shape))
+        raise ValueError(
+            f"{name} must have shape {shape} "
+            f"or be flat with {expected_size} values."
+        )
+
+    @staticmethod
+    def _color_upper(values, color_quantile):
+        value = float(np.nanquantile(values, color_quantile))
+        if value <= 0.0:
+            value = float(np.nanmax(values))
+        return value if value > 0.0 else 1.0
+
+    def plot_conditional_intensity_snapshots(
+        self,
+        times=None,
+        burn_in: float | None = None,
+        nx=50,
+        ny=50,
+        cmap_background="viridis",
+        cmap_triggering="magma",
+        cmap_total="inferno",
+        color_quantile=0.98,
+        true_background=None,
+        true_triggering=None,
+        true_total=None,
+        figsize=None,
+        show=True,
+        savefigure=False,
+        title_savefig="spinh_conditional_intensity_snapshots",
+    ):
+        """Plot static SPIN-H intensity snapshots for interactive sessions.
+
+        Optional ``true_background``, ``true_triggering`` and ``true_total`` arrays
+        can be supplied when simulated ground truth is available. They must be
+        evaluated on the same grid and times as the posterior snapshots.
+        """
+        if times is None:
+            times = np.linspace(
+                0.2 * float(self.model.duration),
+                float(self.model.duration),
+                4,
+            )
+        grids = self._conditional_intensity_grid(times, burn_in, nx, ny)
+        times = grids["times"]
+        X = grids["x_grid"]
+        Y = grids["y_grid"]
+        background = grids["background"]
+        triggering = grids["triggering"]
+        total = grids["total"]
+
+        true_background = self._as_spatial_grid(
+            "true_background", true_background, background.shape
+        )
+        true_triggering = self._as_time_grids(
+            "true_triggering", true_triggering, triggering.shape
+        )
+        true_total = self._as_time_grids("true_total", true_total, total.shape)
+        has_truth = any(
+            value is not None
+            for value in (true_background, true_triggering, true_total)
+        )
+
+        n_times = times.size
+        if not 0.0 < color_quantile <= 1.0:
+            raise ValueError("color_quantile must be in (0, 1].")
+
+        bg_values = (
+            background
+            if true_background is None
+            else np.r_[background.ravel(), true_background.ravel()]
+        )
+        trig_values = (
+            triggering
+            if true_triggering is None
+            else np.r_[triggering.ravel(), true_triggering.ravel()]
+        )
+        total_values = (
+            total
+            if true_total is None
+            else np.r_[total.ravel(), true_total.ravel()]
+        )
+        bg_vmax = self._color_upper(bg_values, color_quantile)
+        trig_vmax = self._color_upper(trig_values, color_quantile)
+        total_vmax = self._color_upper(total_values, color_quantile)
+
+        def setup_axis(ax):
+            ax.set_xlim(self.model.x_bounds)
+            ax.set_ylim(self.model.y_bounds)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.grid(alpha=0.2)
+
+        def add_panel(ax, values, cmap, vmax, title, label):
+            mesh = ax.pcolormesh(
+                X, Y, values, shading="auto", cmap=cmap, vmin=0.0, vmax=vmax
+            )
+            fig.colorbar(mesh, ax=ax, label=label)
+            ax.set_title(title)
+            setup_axis(ax)
+            return mesh
+
+        if not has_truth:
+            if figsize is None:
+                figsize = (3.6 * (n_times + 1), 6.8)
+            fig = plt.figure(figsize=figsize, constrained_layout=True)
+            grid = fig.add_gridspec(2, n_times + 1)
+
+            ax_bg = fig.add_subplot(grid[:, 0])
+            mesh = ax_bg.pcolormesh(
+                X, Y, background, shading="auto", cmap=cmap_background
+            )
+            fig.colorbar(mesh, ax=ax_bg, label=r"$\mu(x, y)$")
+            ax_bg.set_title("Background")
+
+            axes_triggering = []
+            axes_total = []
+            for index, time in enumerate(times):
+                ax_trig = fig.add_subplot(grid[0, index + 1])
+                add_panel(
+                    ax_trig,
+                    triggering[index],
+                    cmap_triggering,
+                    trig_vmax,
+                    f"Triggering | t={time:.3g}",
+                    r"$g(t, x, y)$",
+                )
+                axes_triggering.append(ax_trig)
+
+                ax_total = fig.add_subplot(grid[1, index + 1])
+                add_panel(
+                    ax_total,
+                    total[index],
+                    cmap_total,
+                    total_vmax,
+                    f"Total | t={time:.3g}",
+                    r"$\lambda(t, x, y)$",
+                )
+                axes_total.append(ax_total)
+
+            setup_axis(ax_bg)
+            axes = {
+                "background": ax_bg,
+                "triggering": axes_triggering,
+                "total": axes_total,
+            }
+        else:
+            if figsize is None:
+                figsize = (3.6 * (n_times + 1), 12.2)
+            fig = plt.figure(figsize=figsize, constrained_layout=True)
+            grid = fig.add_gridspec(4, n_times + 1)
+
+            axes_triggering_est = []
+            axes_triggering_true = []
+            axes_total_est = []
+            axes_total_true = []
+
+            ax_bg_est = fig.add_subplot(grid[0, 0])
+            add_panel(
+                ax_bg_est,
+                background,
+                cmap_background,
+                bg_vmax,
+                "Estimated background",
+                r"$\mu(x, y)$",
+            )
+
+            ax_bg_true = fig.add_subplot(grid[1, 0])
+            if true_background is None:
+                ax_bg_true.axis("off")
+                ax_bg_true.set_title("True background not provided")
+            else:
+                add_panel(
+                    ax_bg_true,
+                    true_background,
+                    cmap_background,
+                    bg_vmax,
+                    "True background",
+                    r"$\mu(x, y)$",
+                )
+
+            for row in (2, 3):
+                ax_empty = fig.add_subplot(grid[row, 0])
+                ax_empty.axis("off")
+
+            for index, time in enumerate(times):
+                ax_trig_est = fig.add_subplot(grid[0, index + 1])
+                add_panel(
+                    ax_trig_est,
+                    triggering[index],
+                    cmap_triggering,
+                    trig_vmax,
+                    f"Estimated triggering | t={time:.3g}",
+                    r"$g(t, x, y)$",
+                )
+                axes_triggering_est.append(ax_trig_est)
+
+                ax_trig_true = fig.add_subplot(grid[1, index + 1])
+                if true_triggering is None:
+                    ax_trig_true.axis("off")
+                    ax_trig_true.set_title(
+                        f"True triggering not provided | t={time:.3g}"
+                    )
+                else:
+                    add_panel(
+                        ax_trig_true,
+                        true_triggering[index],
+                        cmap_triggering,
+                        trig_vmax,
+                        f"True triggering | t={time:.3g}",
+                        r"$g(t, x, y)$",
+                    )
+                axes_triggering_true.append(ax_trig_true)
+
+                ax_total_est = fig.add_subplot(grid[2, index + 1])
+                add_panel(
+                    ax_total_est,
+                    total[index],
+                    cmap_total,
+                    total_vmax,
+                    f"Estimated total | t={time:.3g}",
+                    r"$\lambda(t, x, y)$",
+                )
+                axes_total_est.append(ax_total_est)
+
+                ax_total_true = fig.add_subplot(grid[3, index + 1])
+                if true_total is None:
+                    ax_total_true.axis("off")
+                    ax_total_true.set_title(
+                        f"True total not provided | t={time:.3g}"
+                    )
+                else:
+                    add_panel(
+                        ax_total_true,
+                        true_total[index],
+                        cmap_total,
+                        total_vmax,
+                        f"True total | t={time:.3g}",
+                        r"$\lambda(t, x, y)$",
+                    )
+                axes_total_true.append(ax_total_true)
+
+            axes = {
+                "background": ax_bg_est,
+                "true_background": ax_bg_true,
+                "triggering": axes_triggering_est,
+                "true_triggering": axes_triggering_true,
+                "total": axes_total_est,
+                "true_total": axes_total_true,
+            }
+
+        if savefigure:
+            save_figure(fig, title_savefig, figure_type="raster")
+        if show:
+            plt.show()
+
+        output = {
+            "fig": fig,
+            "axes": axes,
+            **grids,
+        }
+        if true_background is not None:
+            output["true_background"] = true_background
+        if true_triggering is not None:
+            output["true_triggering"] = true_triggering
+        if true_total is not None:
+            output["true_total"] = true_total
+        return output
 
     def _make_mesh(self, nx, ny):
         xmin, xmax = self.model.x_bounds
@@ -345,13 +719,12 @@ class GibbsResults(Mapping):
         title_savefig_Emu="Emu",
         color_Emu="steelblue",
         mu_star_func=None,
-        alpha_ecp=0.95,
         n_mc=500,
     ):
         """Plot and summarize the posterior SSGC background intensity."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         mesh, vertices = self._make_mesh(nx, ny)
-        if vertices.shape[0] > 10000:
+        if vertices.shape[0] > 22500:
             raise ValueError(f"Mesh too large: {vertices.shape[0]} points")
 
         x_grid = vertices[:, 0]
@@ -396,7 +769,7 @@ class GibbsResults(Mapping):
 
         mu_star_grid = None
         diff = None
-        rmse = mae = crps_bar = ecp = None
+        rmse = mae = crps_bar = None
         if mu_star_func is not None:
             mu_star_grid = np.asarray(mu_star_func(x_grid, y_grid), dtype=float).reshape(-1)
             if mu_star_grid.size != mu_hat.size:
@@ -412,10 +785,6 @@ class GibbsResults(Mapping):
                 crps_bar = float(ps.crps_ensemble(mu_star_grid, mu_hat_sims).mean())
             except Exception:
                 crps_bar = None
-            q_lo = np.quantile(mu_hat_sims, (1 - alpha_ecp) / 2, axis=1)
-            q_hi = np.quantile(mu_hat_sims, 1 - (1 - alpha_ecp) / 2, axis=1)
-            ecp = float(np.mean((mu_star_grid >= q_lo) & (mu_star_grid <= q_hi)))
-
             print(f"\n{'='*45}")
             print(f"  Metrics (grid {nx}x{ny}, n_mc={n_mc})")
             print(f"{'='*45}")
@@ -423,7 +792,6 @@ class GibbsResults(Mapping):
             print(f"  MAE           : {mae:.4f}")
             if crps_bar is not None:
                 print(f"  CRPS          : {crps_bar:.4f}")
-            print(f"  ECP({alpha_ecp:.2f})   : {ecp:.4f}  (target: {alpha_ecp:.2f})")
             print(f"{'='*45}\n")
 
             fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -465,7 +833,7 @@ class GibbsResults(Mapping):
 
         plt.tight_layout()
         if savefigure:
-            save_figure(fig, title_savefig)
+            save_figure(fig, title_savefig, figure_type="raster")
         plt.show()
 
         summary = self.summary(burn_in)
@@ -493,18 +861,7 @@ class GibbsResults(Mapping):
             "rmse": rmse,
             "mae": mae,
             "crps": crps_bar,
-            "ecp": ecp,
-            "alpha_ecp": alpha_ecp,
         }
-
-    def conditional_intensity(
-        self,
-        t,
-        x,
-        y,
-        burn_in: float | None = None,
-    ):
-        return self.analysis.conditional_intensity(t, x, y, burn_in)
 
     def plot_traces(
         self,

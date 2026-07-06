@@ -26,7 +26,7 @@ cd SPIN-H
 ## Package layout
 
 ```text
-SPIN_Hawkes/
+spin_h/
   figures/                        generated figures
   experiments/                    runnable experiment protocols
     exp_ssgc/
@@ -34,7 +34,6 @@ SPIN_Hawkes/
       experiment_2.py
       experiment_3.py
       experiment_4.py
-    exp_spinh/
   models/
     base.py                       common model interface
     ssgc.py                       SSGC model
@@ -49,15 +48,14 @@ SPIN_Hawkes/
     process.py                    point-process simulation
     tessellation.py               tessellation
   visualization/
-    fields.py
-    diagnostics.py
+    plots.py
   data/
     catalog.py
   spatial/
     domain.py
   config.py                       model and inference configuration
-  first_test_spinh.py             first SPIN-H test
-  how_to_use.md                   user guide
+  first_test_spinh.py              first SPIN-H test
+  how_to_use.md                    user guide
   README.md
 ```
 
@@ -70,7 +68,7 @@ The four SSGC studies are available in `examples/experiments/ssgc/` and can be r
 See `examples/experiments/ssgc/README.md` for the study matrix.
 
 All active plotting functions use `gp.visualization.save_figure`. 
-Saved images are written at **50 dpi** (à modifier potentiellement, dans fields.py) below `artifacts/figures/`.
+Vector figures are saved as PDF; raster figures are saved as PNG at **600 dpi** (à modifier potentiellement, dans visualization/plots.py) below `figures/`.
 
 
 ---

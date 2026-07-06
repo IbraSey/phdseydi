@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..config import ETASParameters
+from ..config import ETASParameters, SPINHGibbsConfig
 from ..data.catalog import EventCatalog
 from .kernels import ETASKernel
 from .ssgc import SSGCModel
@@ -44,31 +44,12 @@ class SPINHModel(SSGCModel):
                 raise ValueError("Catalog magnitudes exceed magnitude_max.")
         return indices
 
-    def _build_gibbs_sampler(self, catalog, etas_config, rng_seed=None):
-        from ..inference.spinh_gibbs import SPIN_H_GibbsSampler
-
-        marked_magnitudes = (
-            catalog.magnitudes if self.etas_parameters.marked else None
-        )
-        return SPIN_H_GibbsSampler(
-            model=self,
-            theta_phi_priors=etas_config.theta_priors,
-            m=marked_magnitudes,
-            beta_init=etas_config.beta_init,
-            beta_priors=etas_config.beta_prior,
-            sigma_MH_etas=etas_config.sigma_mh_etas,
-            sigma_MH_beta=etas_config.sigma_mh_beta,
-            t0_etas=etas_config.adaptation_start,
-            eps_mh_etas=etas_config.proposal_jitter,
-            rng_seed=rng_seed,
-        )
-
     def gibbs(
         self,
         catalog,
         config=None,
-        etas_config=None,
         gp_backend="sparse",
+        sparse_gp=None,
         rng_seed=None,
         reference_intensity=None,
     ):
@@ -77,23 +58,34 @@ class SPINHModel(SSGCModel):
         ``etas_parameters`` supplies the initial ETAS state. The model is not
         mutated; posterior chains and analyses are returned in GibbsResults.
         """
-        from ..config import ETASInferenceConfig
-
         config, gp_backend = self._prepare_gibbs(
-            catalog, config, gp_backend
+            catalog, config, gp_backend, SPINHGibbsConfig
         )
-        if etas_config is None:
-            etas_config = ETASInferenceConfig()
-        elif not isinstance(etas_config, ETASInferenceConfig):
-            raise TypeError("etas_config must be an ETASInferenceConfig instance.")
-        sampler = self._build_gibbs_sampler(catalog, etas_config, rng_seed)
+        from ..inference.spinh_gibbs import SPIN_H_GibbsSampler
+
+        sampler = SPIN_H_GibbsSampler(
+            model=self,
+            theta_phi_priors=config.theta_priors,
+            m=catalog.magnitudes if self.etas_parameters.marked else None,
+            beta_init=config.beta_init,
+            beta_priors=config.beta_prior,
+            sigma_MH_etas=config.sigma_mh_etas,
+            sigma_MH_beta=config.sigma_mh_beta,
+            t0_etas=config.adaptation_start,
+            eps_mh_etas=config.proposal_jitter,
+            rng_seed=rng_seed,
+        )
         return self._run_gibbs(
             sampler,
             catalog,
             config,
             gp_backend,
-            reference_intensity,
-            learn_beta=etas_config.learn_beta,
+            sparse_gp=sparse_gp,
+            reference_intensity=reference_intensity,
+            learn_beta=config.learn_beta,
+            sample_z=config.sample_z,
+            known_z=config.known_z,
+            sample_etas=config.sample_etas,
         )
 
     def triggering_intensity(

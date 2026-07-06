@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 
 import openturns as ot
 
-from ..config import MCMCConfig
 from ..data.catalog import EventCatalog
 
 
@@ -13,29 +12,20 @@ class PointProcessModel(ABC):
 
     @staticmethod
     def _resolve_gp_backend(gp_backend):
-        from ..inference.backends import (
-            ExactGPBackend,
-            FourierSparseGPBackend,
-            GPBackend,
-        )
+        name = "exact" if gp_backend is None else str(gp_backend).lower()
+        if name not in {"exact", "sparse"}:
+            raise ValueError("gp_backend must be 'exact' or 'sparse'.")
+        return name
 
-        if gp_backend is None or gp_backend == "exact":
-            return ExactGPBackend()
-        if gp_backend == "sparse":
-            return FourierSparseGPBackend()
-        if isinstance(gp_backend, GPBackend):
-            return gp_backend
-        raise ValueError(
-            "gp_backend must be 'exact', 'sparse', or a GPBackend instance."
-        )
-
-    def _prepare_gibbs(self, catalog, config, gp_backend):
+    def _prepare_gibbs(self, catalog, config, gp_backend, config_type):
         if not isinstance(catalog, EventCatalog):
             raise TypeError("catalog must be an EventCatalog instance.")
         if config is None:
-            config = MCMCConfig()
-        elif not isinstance(config, MCMCConfig):
-            raise TypeError("config must be a MCMCConfig instance.")
+            config = config_type()
+        elif not isinstance(config, config_type):
+            raise TypeError(
+                f"config must be a {config_type.__name__} instance."
+            )
         self.validate_catalog(catalog)
         return config, self._resolve_gp_backend(gp_backend)
 
@@ -45,6 +35,7 @@ class PointProcessModel(ABC):
         catalog,
         config,
         gp_backend,
+        sparse_gp=None,
         reference_intensity=None,
         **run_overrides,
     ):
@@ -71,7 +62,9 @@ class PointProcessModel(ABC):
             "emu_every": config.emu_every,
             "calibration_method": config.calibration_method,
         }
-        run_options.update(gp_backend.sampler_options(self))
+        if sparse_gp is not None and gp_backend != "sparse":
+            raise ValueError("sparse_gp requires gp_backend='sparse'.")
+        run_options.update({"gp_backend": gp_backend, "sparse_gp": sparse_gp})
         run_options.update(run_overrides)
         raw = sampler.run(**run_options)
         return GibbsResults(raw, self, catalog)
