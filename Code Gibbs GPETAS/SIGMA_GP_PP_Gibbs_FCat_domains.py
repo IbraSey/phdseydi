@@ -39,7 +39,7 @@ import pandas as pd
 
 import os
 from phebus.pybus.frclass import FrenchDomainsSourceModel
-
+phebus_path = os.path.abspath("./phebus")
 # phebus_root = "/home/g80884/Documents/phebus"
 # phebus_root = os.path.join( phebus_path, "phebus" )
 demo_path = os.path.join( phebus_path, "phebus", "demos", "FrenchDomainsAnalysis")
