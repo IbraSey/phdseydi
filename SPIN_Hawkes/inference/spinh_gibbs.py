@@ -1,24 +1,16 @@
 import math
-from dataclasses import dataclass, field
-import matplotlib.pyplot as plt
+
 import numpy as np
 import openturns as ot
 from polyagamma import random_polyagamma
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
-from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 
-from ..data.catalog import EventCatalog
-from ..config import ETASInferenceConfig, ETASParameters, GPParameters, MCMCConfig
-from ..spatial.domain import DomainPartition
-from ..models import SPINHModel, SSGCModel
-from .backends import ExactGPBackend, GPBackend, SparseGP
-from .base import InferenceMethod
-from .results import GibbsResults
-from ..visualization import plot_field, save_figure
-from .ssgc_gibbs import SSGC_GibbsSampler
+from ..config import ETASParameters
+from ..models import SPINHModel
 
+from .backends import SparseGP
+
+from .ssgc_gibbs import SSGC_GibbsSampler
 
 class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
     """Gibbs sampler for the spatial SPIN-Hawkes model.
@@ -32,24 +24,14 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
     
     Parameters
     ----------
-    X_bounds, Y_bounds, T, Areas, lambda_nu, nu, delta, polygons : object
-        Forwarded unchanged to :class:`SSGC_GibbsSampler`.
-    use_etas : bool, optional
-        If false, :meth:`run` delegates to the parent SSGC sampler.
-    theta_phi_init : dict or None, optional
-        Initial ETAS parameters. Required keys are ``A, c, p, d, q``; ``alpha``
-        and ``gamma`` are used when magnitudes are supplied.
+    model : SPINHModel
+        Configured SPIN-H model defining the SSGC background and ETAS settings.
     theta_phi_priors : dict or None, optional
         Shape/rate hyperparameters of Gamma priors. Priors for ``p`` and ``q``
         apply to ``p-1`` and ``q-1``.
     m : array_like or None, optional
         Event magnitudes in the same order as the observations. Passing ``None``
         selects the unmarked spatio-temporal model.
-    m_c : float, optional
-        Magnitude of completeness.
-    m_max : float or None, optional
-        Upper truncation of the Gutenberg-Richter law. If omitted, uses
-        ``max(m) + 1``.
     beta_init : float, optional
         Initial Gutenberg-Richter rate.
     beta_priors : dict or None, optional
@@ -62,8 +44,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         Number of warm-up iterations before adaptive Metropolis covariance is used.
     eps_mh_etas : float, optional
         Diagonal regularization of adaptive proposal covariances.
-    jitter : float, optional
-        Numerical regularization forwarded to the parent sampler.
     rng_seed : int or None, optional
         OpenTURNS random seed forwarded to the parent sampler."""
 
@@ -85,69 +65,47 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
     def __init__(
         self,
-        X_bounds, Y_bounds, T,
-        Areas, lambda_nu, nu, delta, polygons,
-        use_etas=False,
-        theta_phi_init=None, theta_phi_priors=None,
-        m=None, m_c=0.0, m_max=None,
+        model,
+        theta_phi_priors=None,
+        m=None,
         beta_init=2.3, beta_priors=None,
         sigma_MH_etas=0.1, sigma_MH_beta=0.1,
         t0_etas=50, eps_mh_etas=1e-6,
-        jitter=1e-5, rng_seed=None,
+        rng_seed=None,
     ):
         """Initialize the SPIN-Hawkes sampler; see the class docstring for parameters."""
-        super().__init__(
-            X_bounds=X_bounds, Y_bounds=Y_bounds, T=T,
-            Areas=Areas, lambda_nu=lambda_nu, nu=nu,
-            delta=delta, polygons=polygons,
-            jitter=jitter, rng_seed=rng_seed,
-        )
-        self.use_etas = use_etas
+        if not isinstance(model, SPINHModel):
+            raise TypeError("model must be a SPINHModel instance.")
+        super().__init__(model=model, rng_seed=rng_seed)
+        self.use_etas = True
         self.t0_etas = t0_etas
         self.eps_mh_etas = eps_mh_etas
         self.sigma_MH_etas = sigma_MH_etas
         self.sigma_MH_beta = sigma_MH_beta
 
-        if use_etas:
-            self.m_c = float(m_c)
-            if m is not None:
-                self.m = np.asarray(m)
-                self.use_magnitudes = True
-                self.m_max = float(m_max) if m_max is not None else float(np.max(self.m)) + 1.0
-                self.beta = float(beta_init)
-                self.beta_priors = {"a_beta": 2.0, "b_beta": 1.0, **(beta_priors or {})}
-            else:
-                self.m, self.use_magnitudes = None, False
-                self.m_max, self.beta, self.beta_priors = None, None, None
-
-            base = {"A": 0.5, "c": 0.01, "p": 1.5, "d": 0.01, "q": 2.0}
-            if self.use_magnitudes:
-                base.update({"alpha": 1.0, "gamma": 1.0})
-            self.theta_phi = {**base, **(theta_phi_init or {})}
-
-            pr = {"a_A": 2.0, "b_A": 1.0, "a_c": 2.0, "b_c": 1.0,
-                  "a_p": 2.0, "b_p": 1.0, "a_d": 2.0, "b_d": 1.0, "a_q": 2.0, "b_q": 1.0}
-            if self.use_magnitudes:
-                pr.update({"a_alpha": 2.0, "b_alpha": 1.0, "a_gamma": 2.0, "b_gamma": 1.0})
-            self.theta_phi_priors = {**pr, **(theta_phi_priors or {})}
-            self.model = SPINHModel(
-                domains=self.domain_partition,
-                duration=self.T,
-                x_bounds=self.X_bounds,
-                y_bounds=self.Y_bounds,
-                gp_prior=GPParameters(float(self.nu[0]), float(self.nu[1])),
-                eps_prior_variance=float(self.delta[0]),
-                eps_prior_length_scale=float(self.delta[1]),
-                nu_prior_rate=float(self.lambda_nu),
-                jitter=float(self.jitter),
-                etas_parameters=ETASParameters(**self.theta_phi),
-                magnitude_min=self.m_c,
-                magnitude_max=self.m_max,
+        self.m_c = model.magnitude_min
+        if m is not None:
+            self.m = np.asarray(m)
+            self.use_magnitudes = True
+            self.m_max = (
+                model.magnitude_max
+                if model.magnitude_max is not None
+                else float(np.max(self.m)) + 1.0
             )
+            self.beta = float(beta_init)
+            self.beta_priors = {"a_beta": 2.0, "b_beta": 1.0, **(beta_priors or {})}
         else:
-            self.m, self.use_magnitudes, self.m_c = None, False, 0.0
+            self.m, self.use_magnitudes = None, False
             self.m_max, self.beta, self.beta_priors = None, None, None
-            self.theta_phi, self.theta_phi_priors = None, None
+
+        self.theta_phi = model.etas_parameters.as_dict()
+        pr = {"a_A": 2.0, "b_A": 1.0, "a_c": 2.0, "b_c": 1.0,
+              "a_p": 2.0, "b_p": 1.0, "a_d": 2.0, "b_d": 1.0,
+              "a_q": 2.0, "b_q": 1.0}
+        if self.use_magnitudes:
+            pr.update({"a_alpha": 2.0, "b_alpha": 1.0,
+                       "a_gamma": 2.0, "b_gamma": 1.0})
+        self.theta_phi_priors = {**pr, **(theta_phi_priors or {})}
 
     def _etas_parameters(self, **updates):
         values = dict(self.theta_phi)
@@ -1018,7 +976,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     if self.use_magnitudes else ["A", "c", "p", "d", "q"])
         n_tp = len(tp_names)
 
-        # Calibration GP 
+        # ── Calibration GP ──────────────────────────────────────────────────
         if use_calibration:
             if verbose: print("[Pre-run] Calibrating GP hyperparameters")
             _, _, eps_mle_all = self.calibrate_nu(
@@ -1051,10 +1009,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         f_data = ot.Point([0.0] * N)
 
-        # Initialisation informée de Z
-        XY_init = self._XY_obs
-        mu_t_init = self.compute_mu_tilde(XY_init, eps=eps_mle_all)
-        mu_init = mu_t_init * 0.5          # σ(0) = 0.5 (f initialisé à 0)
+        # ── Initialisation informée de Z ────────────────────────────────────
+        XY_init    = self._XY_obs
+        mu_t_init  = self.compute_mu_tilde(XY_init, eps=eps_mle_all)
+        mu_init    = mu_t_init * 0.5          # σ(0) = 0.5 (f initialisé à 0)
 
         Z = self.initialize_Z_heuristic(
             np.array([float(t[i]) for i in range(N)]),
@@ -1064,14 +1022,14 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             mu_init, self.theta_phi, self.m_c,
         )
 
-        # eps_mle recalculé sur les background events uniquement
+        # ── Fix B3 : eps_mle recalculé sur les background events uniquement ─
         N_j_bg, _ = self._count_events_per_zone(x, y, Z, ot.Sample(0, 3))
-        areas_j = np.array([self.polygons[j].area for j in range(self.J)])
-        eps_mle = np.log(np.maximum(N_j_bg / (self.T * areas_j), 1e-6))
-        eps = ot.Point(eps_mle.tolist())
+        areas_j   = np.array([self.polygons[j].area for j in range(self.J)])
+        eps_mle   = np.log(np.maximum(N_j_bg / (self.T * areas_j), 1e-6))
+        eps       = ot.Point(eps_mle.tolist())
 
         if verbose:
-            mode = "Hawkes marqué" if self.use_magnitudes else "Hawkes ST"
+            mode  = "Hawkes marqué" if self.use_magnitudes else "Hawkes ST"
             flags = [f for f in ["learn_ν" if learn_nu else "",
                                   "learn_β" if learn_beta else ""] if f]
             print(f"[Init] {mode} | θ_φ = {tp_names} | {', '.join(flags) or '—'}")
@@ -1079,16 +1037,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 print(f"[Init] Sparse GP with {int(sparse_gp.m)} basis functions")
             print(f"[Init] ε = {np.round(eps_mle, 4)} | θ_φ = {self.theta_phi}")
             if self.use_magnitudes:
-                print(f"[Init] beta = {self.beta} (learn={learn_beta}) | AM t0 = {self.t0_etas}")
+                print(f"[Init] β = {self.beta} (learn={learn_beta}) | AM t0 = {self.t0_etas}")
 
         # ── Grille E_μ optionnelle ───────────────────────────────────────────
         compute_emu = bool(compute_emu and mu_star_func is not None)
         if compute_emu:
             xmin, xmax = self.X_bounds; ymin, ymax = self.Y_bounds
-            GX, GY = np.meshgrid(np.linspace(xmin, xmax, grid_nx), np.linspace(ymin, ymax, grid_ny))
+            GX, GY     = np.meshgrid(np.linspace(xmin, xmax, grid_nx),
+                                      np.linspace(ymin, ymax, grid_ny))
             grid_x, grid_y = GX.ravel(), GY.ravel()
-            Xg  = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
-            M_grid = len(grid_x)
+            Xg          = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
+            M_grid      = len(grid_x)
             domain_area = (xmax - xmin) * (ymax - ymin)
             mu_star_grid = mu_star_func(grid_x, grid_y)
         else:
@@ -1097,22 +1056,22 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             domain_area = 0.0
 
         # ── Chaînes ──────────────────────────────────────────────────────────
-        ns = (n_iter + thin - 1) // thin
-        eps_ch = np.zeros((ns, self.J))
-        nPi_ch = np.zeros(ns, dtype=int)
-        f_ch = np.zeros((ns, N))
-        nu_ch = np.zeros((ns, 2))
-        Z_ch = np.zeros((ns, N))
-        tp_ch = np.zeros((ns, n_tp))
-        beta_ch = np.zeros(ns) if learn_beta else None
+        ns       = (n_iter + thin - 1) // thin
+        eps_ch   = np.zeros((ns, self.J))
+        nPi_ch   = np.zeros(ns, dtype=int)
+        f_ch     = np.zeros((ns, N))
+        nu_ch    = np.zeros((ns, 2))
+        Z_ch     = np.zeros((ns, N))
+        tp_ch    = np.zeros((ns, n_tp))
+        beta_ch  = np.zeros(ns) if learn_beta else None
         gp_coeffs_ch = (
             np.zeros((ns, int(sparse_gp.m))) if gp_backend == "sparse" else None
         )
-        Emu = np.full(n_iter, np.nan)
-        si = 0
+        Emu      = np.full(n_iter, np.nan)
+        si       = 0
 
         ae, an, ab = 0, 0, 0
-        acc = {"A_alpha": 0, "c_p": 0, "d_q_gamma": 0}
+        acc        = {"A_alpha": 0, "c_p": 0, "d_q_gamma": 0}
         hnu, hAa, hcp, hdqg, hb = [], [], [], [], []
 
         if verbose:
@@ -1163,9 +1122,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                     idx_trig = [i for i in range(N) if float(Z[i]) != 0.0]
                     if idx_trig and idx0:
-                        XY_bg = ot.Sample([[float(x[i]), float(y[i])] for i in idx0])
-                        XY_tr = ot.Sample([[float(x[i]), float(y[i])] for i in idx_trig])
-                        K_bg = self.compute_kernel(XY_bg)
+                        XY_bg  = ot.Sample([[float(x[i]), float(y[i])] for i in idx0])
+                        XY_tr  = ot.Sample([[float(x[i]), float(y[i])] for i in idx_trig])
+                        K_bg   = self.compute_kernel(XY_bg)
                         for ii in range(len(idx0)):
                             K_bg[ii, ii] += self.jitter
                         _, K_tr_bg, _ = self.compute_kernel(XY_bg, XY_tr)
@@ -1178,21 +1137,22 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                 # ── Step 4 : ε | f, π_S  (MALA) ────────────────────────────
                 N_j, M_j = self._count_events_per_zone(x, y, Z, Pi_S)
-                ea, ok = self.update_eps(eps, N_j, M_j, step=mala_step)
-                eps = ot.Point(ea.tolist()); ae += int(ok)
+                ea, ok   = self.update_eps(eps, N_j, M_j, step=mala_step)
+                eps      = ot.Point(ea.tolist()); ae += int(ok)
 
                 # ── Step 5 : ν | f  (AM, optional) ─────────────────────────
                 if learn_nu:
                     hnu.append(np.log(np.array(self.nu)))
-                    _, ok = self.update_nu(f_Df, D_f, hnu, it, step_nu_init=step_nu_init, t0=t0_nu)
+                    _, ok = self.update_nu(f_Df, D_f, hnu, it,
+                                           step_nu_init=step_nu_init, t0=t0_nu)
                     an += int(ok)
 
                 # ── Step 6 : Z | f, ε, θ_φ ──────────────────────────────────
                 Z = self.update_Z(t, x, y, ea, f_data)
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
-                acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
-                acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
+                acc["A_alpha"]   += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                acc["c_p"]       += int(self.update_c_p(t, x, y, Z, hcp, it))
                 acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
@@ -1233,25 +1193,25 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         Kr = ot.CovarianceMatrix(Kd)
                         for ii in range(len(idx_bg)): Kr[ii, ii] += self.jitter
                         alpha = Kr.solveLinearSystem(f_bg_pt)
-                        mg = np.array(Kg * alpha).flatten()
+                        mg   = np.array(Kg * alpha).flatten()
                         solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T.tolist()))
-                        S = np.array(Kgg) - np.array(Kg * solved_cross)
-                        S = .5*(S+S.T) + self.jitter*np.eye(M_grid)
+                        S    = np.array(Kgg) - np.array(Kg * solved_cross)
+                        S    = .5*(S+S.T) + self.jitter*np.eye(M_grid)
                         S_cov = ot.CovarianceMatrix(S.tolist())
-                        fg = np.array(ot.Normal(ot.Point(mg.tolist()), S_cov).getRealization())
-                    mt = self.compute_mu_tilde(Xg, eps=ea)
+                        fg   = np.array(ot.Normal(ot.Point(mg.tolist()), S_cov).getRealization())
+                    mt   = self.compute_mu_tilde(Xg, eps=ea)
                     Emu[it] = (domain_area/M_grid) * np.sum(
                         (mt / (1 + np.exp(-fg)) - mu_star_grid) ** 2
                     )
 
                 # ── Stockage ─────────────────────────────────────────────────
                 if it % thin == 0:
-                    eps_ch[si] = ea
-                    nPi_ch[si] = Pi_S.getSize()
-                    f_ch[si] = np.array(f_data)
-                    nu_ch[si] = np.array(self.nu)
-                    Z_ch[si] = np.array(Z)
-                    tp_ch[si] = [self.theta_phi[k] for k in tp_names]
+                    eps_ch[si]  = ea
+                    nPi_ch[si]  = Pi_S.getSize()
+                    f_ch[si]    = np.array(f_data)
+                    nu_ch[si]   = np.array(self.nu)
+                    Z_ch[si]    = np.array(Z)
+                    tp_ch[si]   = [self.theta_phi[k] for k in tp_names]
                     if beta_ch is not None: beta_ch[si] = self.beta
                     if gp_coeffs_ch is not None:
                         gp_coeffs_ch[si] = np.asarray(gp_coeffs, dtype=float)
@@ -1262,10 +1222,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         if verbose:
             print("=" * 100 + "\n")
-            print(f"eps (MALA): {ae/n_iter*100:.1f}%    (target ≈57%)")
-            if learn_nu: print(f" nu (AM): {an/n_iter*100:.1f}%")
+            print(f"  ε (MALA)       : {ae/n_iter*100:.1f}%  (target ≈57%)")
+            if learn_nu: print(f"  ν (AM)         : {an/n_iter*100:.1f}%")
             bl = {"A_alpha": "{A,α}" if self.use_magnitudes else "{A}",
-                  "c_p": "{c,p}",
+                  "c_p":     "{c,p}",
                   "d_q_gamma": "{d,q,γ}" if self.use_magnitudes else "{d,q}"}
             for k, v in acc.items():
                 print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
@@ -1277,10 +1237,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "theta_phi": tp_ch[:si], "theta_phi_names": tp_names,
             "beta": beta_ch[:si] if beta_ch is not None else None,
             "E_mu": Emu,
-            "acceptance_eps": ae/n_iter,
-            "acceptance_nu": an/n_iter if learn_nu else None,
-            "acceptance_beta": ab/n_iter if learn_beta else None,
-            "acceptance_etas": {k: v/n_iter for k, v in acc.items()},
+            "acceptance_eps":   ae/n_iter,
+            "acceptance_nu":    an/n_iter if learn_nu else None,
+            "acceptance_beta":  ab/n_iter if learn_beta else None,
+            "acceptance_etas":  {k: v/n_iter for k, v in acc.items()},
             "last_state": {
                 "eps": ea, "nu": list(self.nu), "delta": list(self.delta),
                 "theta_phi": dict(self.theta_phi), "beta": self.beta,
@@ -1299,426 +1259,3 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 "nu":        np.array(hnu) if hnu else None,
             },
         }
-
-    # ─────────────────────────────────────────────────────────
-    #  Visualisation
-    # ─────────────────────────────────────────────────────────
-
-    def plot_etas_chains(self, results, figsize=None, burn_in=0.3,
-                         savefigure=False, title_savefig="traces_etas",
-                         trace_color=None, hist_color="steelblue", burn_in_color="red"):
-        """Plot ETAS trace plots and marginal posterior histograms.
-        
-        Parameters
-        ----------
-        results : dict
-            Output from :meth:`run`.
-        figsize : tuple or None, optional
-            Figure size; chosen from the number of plotted parameters when omitted.
-        burn_in : float, optional
-            Fraction of stored draws excluded from posterior histograms.
-        savefigure : bool, optional
-            Save the figure as PDF.
-        title_savefig : str, optional
-            Output filename or stem.
-        trace_color : color-like, optional
-            Trace-line color. If None, Matplotlib chooses it.
-        hist_color : color-like, optional
-            Histogram fill color.
-        burn_in_color : color-like, optional
-            Color of the burn-in limit line.
-        
-        Returns
-        -------
-        None
-            The figure is displayed and optionally saved."""
-        tp_chain = np.asarray(results["theta_phi"])
-        names = results.get("theta_phi_names", [])
-        thin = results.get("thin", 1)
-        burn = int(tp_chain.shape[0] * burn_in)
-        iters = np.arange(tp_chain.shape[0]) * thin
-        tex = {"A": r"$A$", "alpha": r"$\alpha$", "c": r"$c$", "p": r"$p$",
-               "d": r"$d$", "q": r"$q$", "gamma": r"$\gamma$", "beta": r"$\beta$"}
-        chains, labs = [], []
-        for i, n in enumerate(names):
-            chains.append(tp_chain[:, i]); labs.append(n)
-        if results.get("beta") is not None:
-            chains.append(np.asarray(results["beta"])); labs.append("beta")
-        np_ = len(chains)
-        if figsize is None: figsize = (10, 1.8 * np_)
-        fig, ax = plt.subplots(np_, 2, figsize=figsize, squeeze=False)
-        for i, (ch, n) in enumerate(zip(chains, labs)):
-            lb = tex.get(n, n)
-            ax[i,0].plot(iters, ch, lw=.6, alpha=.8, color=trace_color)
-            ax[i,0].axvline(burn*thin, c=burn_in_color, ls="--", alpha=.4)
-            ax[i,0].set_title(f"Trace {lb}"); ax[i,0].grid(alpha=.3)
-            ax[i,1].hist(ch[burn:], bins=35, density=True, ec="k", alpha=.7, color=hist_color)
-            ax[i,1].set_title(f"Posterior {lb}"); ax[i,1].grid(alpha=.3)
-        plt.tight_layout()
-        if savefigure:
-            save_figure(fig, title_savefig)
-        plt.show()
-
-    def plot_declustering(self, x, y, t, results, burn_in=0.3,
-                          savefigure=False, title_savefig="declustering",
-                          probability_cmap="RdYlBu", branching_cmap="plasma",
-                          point_edge_color="black", link_color="black",
-                          magnitudes=None, true_parent=None,
-                          true_parent_convention="auto", background_threshold=0.5):
-        """Plot posterior background probabilities and a two-stage branching tree.
-
-        The declustering decision is made in two stages. First, event ``i`` is
-        classified as background when ``P(Z_i=0 | D) >= background_threshold``.
-        Otherwise, its parent is the most probable positive label conditional on
-        ``Z_i > 0``. This avoids comparing one background label against many parent
-        labels when the diagnostic question is only background versus triggered.
-
-        Two panels are produced:
-          (0) posterior background probability at each event location;
-          (1) the two-stage branching tree, with generation on the y-axis.
-
-        Parameters
-        ----------
-        x, y, t : array_like, shape (N,)
-            Event coordinates and times.
-        results : dict
-            Output of :meth:`run`.
-        magnitudes : array_like, shape (N,), optional
-            Event magnitudes used to color branching-tree nodes. If omitted,
-            node colors fall back to event times.
-        burn_in : float, optional
-            Fraction of stored draws discarded from the beginning.
-        savefigure : bool, optional
-            Save the figure.
-        title_savefig : str, optional
-            Output filename or stem.
-        probability_cmap : str or Colormap, optional
-            Colormap for background probabilities.
-        branching_cmap : str or Colormap, optional
-            Colormap for magnitudes, or event times when magnitudes are absent.
-        point_edge_color, link_color : color-like, optional
-            Colors used for node outlines and parent-child links.
-        true_parent : array_like, shape (N,), optional
-            Known branching labels for simulated data. Accepted conventions are
-            ``0 = background, j+1 = parent j`` and ``-1 = background, j = parent j``.
-        true_parent_convention : {"auto", "branching", "indices"}, optional
-            Convention used by ``true_parent``.
-        background_threshold : float, optional
-            Background classification threshold in ``[0, 1]``.
-
-        Returns
-        -------
-        diagnostics : dict
-            Posterior background probabilities, binary classifications, selected
-            parents, conditional parent probabilities, generations, and optional
-            truth-based classification and parent-recovery diagnostics.
-        """
-        if not 0.0 <= background_threshold <= 1.0:
-            raise ValueError("background_threshold must be in [0, 1].")
-
-        Z_chain = np.asarray(results["Z"], dtype=int)
-        burn = int(Z_chain.shape[0] * burn_in)
-        Z_post = Z_chain[burn:]
-        if Z_post.shape[0] == 0:
-            raise ValueError("burn_in leaves no posterior declustering draws.")
-        N = Z_post.shape[1]
-
-        ta = np.asarray(t, dtype=float).reshape(-1)
-        xa = np.asarray(x, dtype=float).reshape(-1)
-        ya = np.asarray(y, dtype=float).reshape(-1)
-        if ta.size != N or xa.size != N or ya.size != N:
-            raise ValueError("x, y, t and results['Z'] must describe the same events.")
-
-        if magnitudes is None:
-            branching_colors = ta
-            branching_color_label = "t"
-        else:
-            branching_colors = np.asarray(magnitudes, dtype=float).reshape(-1)
-            if branching_colors.size != N:
-                raise ValueError("magnitudes must have one value per event.")
-            if not np.all(np.isfinite(branching_colors)):
-                raise ValueError("magnitudes must contain only finite values.")
-            branching_color_label = "magnitude"
-
-        p_bg = np.mean(Z_post == 0, axis=0)
-        background_mode = p_bg >= background_threshold
-        parent_mode = np.zeros(N, dtype=int)
-        parent_probability = p_bg.copy()
-
-        for child in np.flatnonzero(~background_mode):
-            positive_labels = Z_post[:, child]
-            positive_labels = positive_labels[positive_labels > 0]
-            if positive_labels.size == 0:
-                background_mode[child] = True
-                continue
-            labels, counts = np.unique(positive_labels, return_counts=True)
-            best = int(np.argmax(counts))
-            parent_mode[child] = int(labels[best])
-            parent_probability[child] = counts[best] / positive_labels.size
-
-        generation = np.zeros(N, dtype=int)
-        valid_link = np.zeros(N, dtype=bool)
-        for child in np.flatnonzero(~background_mode):
-            parent = parent_mode[child] - 1
-            if 0 <= parent < child:
-                generation[child] = generation[parent] + 1
-                valid_link[child] = True
-            else:
-                background_mode[child] = True
-                parent_mode[child] = 0
-                parent_probability[child] = p_bg[child]
-        linked = valid_link
-        max_generation = int(generation.max()) if N else 0
-
-        true_labels = None
-        true_background = None
-        parent_truth_probability = None
-        parent_correct = None
-        classification_report_text = None
-        supervised = true_parent is not None
-
-        if supervised:
-            truth = np.asarray(true_parent, dtype=int).reshape(-1)
-            if truth.size != N:
-                raise ValueError("true_parent must have one label per event.")
-            convention = str(true_parent_convention).lower()
-            if convention not in {"auto", "branching", "indices"}:
-                raise ValueError(
-                    "true_parent_convention must be 'auto', 'branching', or 'indices'."
-                )
-            if convention == "auto":
-                convention = "indices" if np.any(truth < 0) else "branching"
-            true_labels = (
-                np.where(truth < 0, 0, truth + 1).astype(int)
-                if convention == "indices"
-                else truth.astype(int)
-            )
-            if np.any(true_labels < 0):
-                raise ValueError("true_parent contains invalid negative labels.")
-            for child, label in enumerate(true_labels):
-                if label > 0 and label - 1 >= child:
-                    raise ValueError(
-                        "true_parent must only reference earlier events as parents."
-                    )
-
-            true_background = true_labels == 0
-            parent_truth_probability = np.mean(
-                Z_post == true_labels.reshape(1, -1), axis=0
-            )
-            parent_correct = parent_mode == true_labels
-
-            from sklearn.metrics import classification_report
-            classification_report_text = classification_report(
-                true_background.astype(int),
-                background_mode.astype(int),
-                labels=[1, 0],
-                target_names=["background", "triggered"],
-                zero_division=0,
-            )
-
-        fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.5))
-
-        ax = axes[0]
-        sc = ax.scatter(
-            xa, ya, c=p_bg, cmap=probability_cmap, s=20,
-            edgecolors=point_edge_color, linewidths=0.3, vmin=0, vmax=1,
-        )
-        if supervised:
-            ax.scatter(
-                xa[true_background], ya[true_background],
-                facecolors="none", edgecolors="black", s=90,
-                linewidths=1.0, label="True background", zorder=3,
-            )
-            ax.legend(loc="upper right")
-        plt.colorbar(sc, ax=ax, label=r"$P(z_i = 0 \mid \mathcal{D})$")
-        ax.set_title(
-            f"Probability background (threshold={background_threshold:g})\n"
-            f"({background_mode.sum()} background, {linked.sum()} triggered)"
-        )
-        ax.set_xlim(self.X_bounds)
-        ax.set_ylim(self.Y_bounds)
-        ax.set_aspect("equal")
-        ax.grid(alpha=0.3)
-
-        ax = axes[1]
-        for child in np.flatnonzero(linked):
-            parent = parent_mode[child] - 1
-            alpha = 0.15 + 0.75 * parent_probability[child]
-            ax.plot(
-                [ta[parent], ta[child]],
-                [generation[parent], generation[child]],
-                color=link_color, lw=0.8, alpha=alpha, zorder=1,
-            )
-        scatter = ax.scatter(
-            ta,
-            generation,
-            c=branching_colors,
-            cmap=branching_cmap,
-            s=26 + 42 * parent_probability,
-            edgecolors=point_edge_color,
-            linewidths=0.35,
-            alpha=0.9,
-            zorder=2,
-        )
-        ax.set_xlabel("t")
-        ax.set_ylabel("generation")
-        ax.set_yticks(np.arange(max_generation + 1))
-        ax.set_ylim(-0.5, max_generation + 0.7)
-        ax.set_title("Two-stage branching tree")
-        ax.grid(alpha=0.3)
-        plt.colorbar(scatter, ax=ax, label=branching_color_label)
-
-        plt.tight_layout()
-        if savefigure:
-            save_figure(fig, title_savefig)
-        plt.show()
-
-        diagnostics = {
-            "p_bg": p_bg,
-            "background_threshold": float(background_threshold),
-            "predicted_background": background_mode,
-            "parent_mode": parent_mode,
-            "parent_probability": parent_probability,
-            "generation": generation,
-            "branching_color_values": branching_colors,
-            "branching_color_label": branching_color_label,
-        }
-
-        if supervised:
-            print("\nDeclustering classification report")
-            print(classification_report_text)
-            triggered_truth = true_labels > 0
-            parent_accuracy_triggered = np.nan
-            if np.any(triggered_truth):
-                parent_accuracy_triggered = float(
-                    np.mean(parent_mode[triggered_truth] == true_labels[triggered_truth])
-                )
-            diagnostics.update({
-                "true_parent": true_labels,
-                "true_background": true_background,
-                "parent_correct": parent_correct,
-                "parent_truth_probability": parent_truth_probability,
-                "parent_accuracy": float(np.mean(parent_correct)),
-                "parent_accuracy_triggered": parent_accuracy_triggered,
-                "classification_report": classification_report_text,
-            })
-
-        return diagnostics
-
-    def compute_lambda_conditional(self, t_eval, x_eval, y_eval,
-                                   t_obs, x_obs, y_obs, m_obs,
-                                   eps_hat, f_data_hat, theta_phi_hat):
-        """Evaluate the posterior-mean ETAS conditional intensity.
-
-        The returned intensity is decomposed as
-
-        ``lambda(t, s | H_t) = mu(s) + sum_{j: t_j < t} phi(t-t_j, s-s_j)``.
-
-        The background GP is kriged from every location supplied in
-        ``(x_obs, y_obs)``. Causality is applied separately to the triggering
-        term, so observations at or after each evaluation time do not contribute.
-
-        Parameters
-        ----------
-        t_eval, x_eval, y_eval : float or array_like
-            Evaluation times and coordinates. Inputs are broadcast to a common
-            one-dimensional shape.
-        t_obs, x_obs, y_obs : array_like, shape (N,)
-            Observed event times and coordinates used for GP conditioning and
-            as potential ETAS parents.
-        m_obs : array_like, shape (N,), or None
-            Parent magnitudes. Required when ``alpha`` or ``gamma`` is present
-            in ``theta_phi_hat``; ignored in the unmarked model.
-        eps_hat : array_like, shape (J,)
-            Posterior estimate of the domain log-intensities.
-        f_data_hat : array_like, shape (N,)
-            Posterior GP estimate at all observed locations.
-        theta_phi_hat : mapping
-            ETAS parameters ``A, c, p, d, q`` and optionally ``alpha, gamma``.
-
-        Returns
-        -------
-        mu_eval : ndarray, shape (M,)
-            Background component ``mu_tilde * sigmoid(f)``.
-        trig_eval : ndarray, shape (M,)
-            Sum of triggering contributions from events in each history.
-        lambda_eval : ndarray, shape (M,)
-            Total conditional intensity.
-
-        Raises
-        ------
-        ValueError
-            If dimensions disagree or ETAS parameters are outside their support.
-        """
-        t_eval, x_eval, y_eval = np.broadcast_arrays(
-            np.asarray(t_eval, dtype=float),
-            np.asarray(x_eval, dtype=float),
-            np.asarray(y_eval, dtype=float),
-        )
-        t_eval = t_eval.reshape(-1)
-        x_eval = x_eval.reshape(-1)
-        y_eval = y_eval.reshape(-1)
-        n_eval = t_eval.size
-
-        t_obs = np.asarray(t_obs, dtype=float).reshape(-1)
-        x_obs = np.asarray(x_obs, dtype=float).reshape(-1)
-        y_obs = np.asarray(y_obs, dtype=float).reshape(-1)
-        f_data_hat = np.asarray(f_data_hat, dtype=float).reshape(-1)
-        n_obs = t_obs.size
-        if not (x_obs.size == y_obs.size == f_data_hat.size == n_obs):
-            raise ValueError(
-                "t_obs, x_obs, y_obs, and f_data_hat must have the same length."
-            )
-
-        required = {"A", "c", "p", "d", "q"}
-        missing = required.difference(theta_phi_hat)
-        if missing:
-            raise ValueError(f"Missing ETAS parameters: {sorted(missing)}")
-        tp = {name: float(value) for name, value in theta_phi_hat.items()}
-        if tp["A"] < 0 or tp["c"] <= 0 or tp["p"] <= 1:
-            raise ValueError("ETAS parameters require A >= 0, c > 0, and p > 1.")
-        if tp["d"] <= 0 or tp["q"] <= 1:
-            raise ValueError("ETAS parameters require d > 0 and q > 1.")
-
-        evaluation_sample = ot.Sample(
-            np.column_stack([x_eval, y_eval]).tolist()
-        )
-        mu_tilde = np.asarray(
-            self.compute_mu_tilde(evaluation_sample, eps=eps_hat), dtype=float
-        )
-
-        if n_obs:
-            observed_sample = ot.Sample(
-                np.column_stack([x_obs, y_obs]).tolist()
-            )
-            K_obs, K_eval_obs, _ = self.compute_kernel(
-                observed_sample, evaluation_sample
-            )
-            K_obs_reg = ot.CovarianceMatrix(K_obs)
-            for i in range(n_obs):
-                K_obs_reg[i, i] += self.jitter
-            alpha_gp = K_obs_reg.solveLinearSystem(
-                ot.Point(f_data_hat.tolist())
-            )
-            f_eval = np.asarray(K_eval_obs * alpha_gp, dtype=float).reshape(-1)
-        else:
-            # The conditional GP mean equals the zero prior mean without data.
-            f_eval = np.zeros(n_eval, dtype=float)
-        mu_eval = mu_tilde * expit(f_eval)
-
-        magnitudes = None
-        if "alpha" in tp or "gamma" in tp:
-            if m_obs is None:
-                raise ValueError(
-                    "m_obs is required when theta_phi_hat contains alpha or gamma."
-                )
-            magnitudes = np.asarray(m_obs, dtype=float).reshape(-1)
-            if magnitudes.size != n_obs:
-                raise ValueError("m_obs must have the same length as t_obs.")
-
-        history = EventCatalog(t_obs, x_obs, y_obs, magnitudes)
-        parameters = ETASParameters(**tp)
-        trig_eval = self.model.triggering_intensity(
-            t_eval, x_eval, y_eval, history, parameters
-        ).reshape(-1)
-        return mu_eval, trig_eval, mu_eval + trig_eval

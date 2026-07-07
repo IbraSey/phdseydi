@@ -1,15 +1,18 @@
 """Spatially structured sigmoidal Gaussian Cox-process model."""
 
 from dataclasses import dataclass, field
+
 import numpy as np
 from scipy.special import expit
+
 from ..config import GPParameters
 from ..data.catalog import EventCatalog
 from ..spatial.domain import DomainPartition
+from .base import PointProcessModel
 
 
 @dataclass
-class SSGCModel:
+class SSGCModel(PointProcessModel):
     """Spatially structured sigmoidal Gaussian Cox-process model."""
 
     domains: DomainPartition
@@ -43,7 +46,9 @@ class SSGCModel:
         **kwargs,
     ) -> "SSGCModel":
         return cls(
-            domains=DomainPartition.from_polygons( polygons, initial_log_intensities ),
+            domains=DomainPartition.from_polygons(
+                polygons, initial_log_intensities
+            ),
             duration=duration,
             x_bounds=x_bounds,
             y_bounds=y_bounds,
@@ -84,9 +89,35 @@ class SSGCModel:
             -squared_distance / (2.0 * self.eps_prior_length_scale**2)
         )
 
-    def sampler_geometry(self):
-        """Return the geometry arguments required by the Gibbs sampler."""
-        areas = list( zip(self.domains.prepared_domains, self.domains.initial_log_intensities) )
-        return areas, list(self.domains.polygons)
+    def _build_gibbs_sampler(self, rng_seed=None):
+        from ..inference.ssgc_gibbs import SSGC_GibbsSampler
 
+        return SSGC_GibbsSampler(
+            model=self,
+            rng_seed=rng_seed,
+        )
 
+    def gibbs(
+        self,
+        catalog,
+        config=None,
+        gp_backend="sparse",
+        rng_seed=None,
+        reference_intensity=None,
+    ):
+        """Estimate this SSGC model with its Gibbs sampler.
+
+        The model remains unchanged. Posterior chains, predictions and
+        diagnostics are returned in a GibbsResults object.
+        """
+        config, gp_backend = self._prepare_gibbs(
+            catalog, config, gp_backend
+        )
+        sampler = self._build_gibbs_sampler(rng_seed)
+        return self._run_gibbs(
+            sampler,
+            catalog,
+            config,
+            gp_backend,
+            reference_intensity,
+        )
