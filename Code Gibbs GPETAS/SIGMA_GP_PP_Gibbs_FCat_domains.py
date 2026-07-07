@@ -50,8 +50,6 @@ SM = FrenchDomainsSourceModel(
     FILE_DOMAINS=os.path.join(demo_path, "data", "domains", "domaines_xy.csv")
 )
 
-
-
 catalog = SM.catalog[SM.catalog.year >= 1965]
 
 D = np.vstack((catalog.X, catalog.Y, catalog.magnitude)).T
