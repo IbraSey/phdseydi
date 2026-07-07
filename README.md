@@ -53,4 +53,51 @@ README.md                                              # Explication du projet, 
 ```
 
 
+## Installation
+
+### Prérequis
+
+- **Python** : Version 3.12 ou supérieure
+- **uv** (recommandé) ou **pip** : Pour la gestion des dépendances
+- **Conda** (optionnel) : Pour créer un environnement virtuel
+
+### Méthode 1 : Avec uv (recommandé)
+
+```bash
+# Installer uv si ce n'est pas déjà fait
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Depuis la racine du projet
+uv sync
+```
+
+### Méthode 2 : Avec pip et un venv (conda)
+
+```bash
+# Créer un environnement conda
+conda create -n stage2026 python=3.12
+conda activate stage2026
+
+# Installer le projet en mode éditable
+pip install -e .
+```
+
+### Méthode 3 : Installation directe avec pip
+
+```bash
+# Depuis un environnement Python existant
+pip install .
+```
+
+### Dépendances principales
+
+Les dépendances sont définies dans `pyproject.toml` :
+- openturns >= 1.27.post1
+- ottoolbox (fournis localement)
+- scipy >= 1.18.0
+- numpy >= 2.4.6
+
+Pour le développement :
+- pytest >= 9.1.1
+
 

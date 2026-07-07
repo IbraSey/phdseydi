@@ -514,20 +514,12 @@ class SSGC_Gibbs():
 
         return samples, randinits
 
-    def run(self, D=None, sampleSize=300, blockSize=50, ninits=3):
-        """perform Bayesian inference of SGPPI model given dataset
+    def calibrate_GP_and_set_prior(self, D=None, prior_weight=0.1):
+        """Calibrate sparse GP and set prior
 
         Args:
-            D (N,2) (optional): Dataset. Defaults to None
-            sampleSize (int, optional): number of Gibbs iterations. Defaults to 300.
-            blockSize (int, optional): block size for cv messages. Defaults to 50.
-            ninits (int, optional): Number of chains run for Gelman-Rubin convergence diagnostic. Defaults to 3.
-
-        returns:
-            samples (list of arrays): resulting MCMC chains
-            randinits (list of vectors): initial points
+            D (_type_, optional): _description_. Defaults to None.
         """
-        # Set dataset
         if D is None:
             try:
                 D = self.D
@@ -540,14 +532,44 @@ class SSGC_Gibbs():
         # set prior mean of zone effects to calibrated value
         m = np.exp(eps_opt)
         # give it the same weight as the data
-        T0 = self.T*0.1
+        T0 = self.T*prior_weight
         v = m**2/T0
         a, b = np.repeat(T0, self.J), T0/m
         self.setPrior(a, b, self.Nmax, l_opt, v_opt)
-        # self.setSparseGP(l_opt, v_opt)
-        # elif not hasattr(self, "D"):
-        #     print("No data for inference!")
-        #     raise ValueError
+        
+    
+    def run(self, D=None, sampleSize=300, blockSize=50, ninits=3, prior_weight=0.1):
+        """perform Bayesian inference of SGPPI model given dataset
+
+        Args:
+            D (N,2) (optional): Dataset. Defaults to None
+            sampleSize (int, optional): number of Gibbs iterations. Defaults to 300.
+            blockSize (int, optional): block size for cv messages. Defaults to 50.
+            ninits (int, optional): Number of chains run for Gelman-Rubin convergence diagnostic. Defaults to 3.
+            prior_weight (float): weight of prior info on zone effects with respect to the entire dataset. Defaults to 0.1.
+
+        returns:
+            samples (list of arrays): resulting MCMC chains
+            randinits (list of vectors): initial points
+        """
+        # Set dataset
+        # if D is None:
+        #     try:
+        #         D = self.D
+        #     except:
+        #         print("No data for inference!")
+        #         raise ValueError
+        # self.setD(D)
+        # # calibrate GP
+        # l_opt, v_opt, eps_opt = self.calibrate_GP()
+        # # set prior mean of zone effects to calibrated value
+        # m = np.exp(eps_opt)
+        # # give it the same weight as the data
+        # T0 = self.T*0.1
+        # v = m**2/T0
+        # a, b = np.repeat(T0, self.J), T0/m
+        # self.setPrior(a, b, self.Nmax, l_opt, v_opt)
+        self.calibrate_GP_and_set_prior(D)
         # Launch Gibbs 
         self.samples, _ = self.Gibbs(sampleSize=sampleSize, blockSize=blockSize,ninits=ninits)
 
