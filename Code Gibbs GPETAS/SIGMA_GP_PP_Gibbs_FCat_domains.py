@@ -5,21 +5,21 @@ from SIGMA_GP_PP_Gibbs import *
 import os
 import sys
 
-phebus_path = os.getenv("PHEBUS_PATH")
-if not phebus_path or not os.path.isdir(phebus_path):
-    raise EnvironmentError(
-        "PHEBUS_PATH must be set to the directory containing the phebus package."
-    )
+# phebus_path = os.getenv("PHEBUS_PATH")
+# if not phebus_path or not os.path.isdir(phebus_path):
+#     raise EnvironmentError(
+#         "PHEBUS_PATH must be set to the directory containing the phebus package."
+#     )
 
-sys.path.insert(0, phebus_path)
+# sys.path.insert(0, phebus_path)
 
-try:
-    import phebus
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        f"Could not import phebus from PHEBUS_PATH={phebus_path!r}. "
-        "Ensure that directory contains a `phebus` package."
-    ) from exc
+# try:
+#     import phebus
+# except ModuleNotFoundError as exc:
+#     raise ModuleNotFoundError(
+#         f"Could not import phebus from PHEBUS_PATH={phebus_path!r}. "
+#         "Ensure that directory contains a `phebus` package."
+#     ) from exc
 
 
 
@@ -39,7 +39,7 @@ import pandas as pd
 
 import os
 from phebus.pybus.frclass import FrenchDomainsSourceModel
-
+phebus_path = os.path.abspath("./phebus")
 # phebus_root = "/home/g80884/Documents/phebus"
 # phebus_root = os.path.join( phebus_path, "phebus" )
 demo_path = os.path.join( phebus_path, "phebus", "demos", "FrenchDomainsAnalysis")
