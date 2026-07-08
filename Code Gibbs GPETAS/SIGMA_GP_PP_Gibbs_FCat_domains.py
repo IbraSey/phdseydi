@@ -10,23 +10,17 @@ import sys
 #     raise EnvironmentError(
 #         "PHEBUS_PATH must be set to the directory containing the phebus package."
 #     )
-
-# sys.path.insert(0, phebus_path)
-
-# try:
-#     import phebus
-# except ModuleNotFoundError as exc:
-#     raise ModuleNotFoundError(
-#         f"Could not import phebus from PHEBUS_PATH={phebus_path!r}. "
-#         "Ensure that directory contains a `phebus` package."
-#     ) from exc
+from pathlib import Path
+file_path = Path(__file__).resolve()
+ROOT = file_path.parent.parent
+phebus_path = ROOT / "lib_py"
+sys.path.insert(0, str(phebus_path) )
 
 
-
+import phebus
 
 # import sys, os
 # sys.path.append( os.getenv("PHEBUS_PATH")) # for importing phebus
-import phebus
 from phebus.pybus.frclass import FrenchDomainsSourceModel
 
 import pandas as pd
