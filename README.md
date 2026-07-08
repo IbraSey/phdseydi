@@ -61,7 +61,26 @@ README.md                                              # Explication du projet, 
 - **uv** (recommandé) ou **pip** : Pour la gestion des dépendances
 - **Conda** (optionnel) : Pour créer un environnement virtuel
 
-### Méthode 1 : Avec uv (recommandé)
+### Etape 1 : Cloner le dépôt et tous ses sous-modules en une seule commande (basé sur le fichier .gitmodules)
+
+```bash
+git clone --recurse-submodules https://github.com/IbraSey/phdseydi.git
+
+cd phdeseydi
+```
+
+### Etape 1 (alternative) : Clobner le dépôt seul puis initialiser et mettre à jour tous les sous-modules
+
+```bash
+git clone --recurse-submodules https://github.com/IbraSey/phdseydi.git
+
+cd phdeseydi
+
+git submodule init
+git submodule update
+```
+
+## Installation des autres dépendances dans .venv avec uv (basé sur le fichier pyproject.toml)
 
 ```bash
 # Installer uv si ce n'est pas déjà fait
@@ -71,6 +90,3 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-### Dépendances principales
-
-Les dépendances sont définies dans `pyproject.toml` :
