@@ -61,6 +61,17 @@ README.md                                              # Explication du projet, 
 - **uv** (recommandé) ou **pip** : Pour la gestion des dépendances
 - **Conda** (optionnel) : Pour créer un environnement virtuel
 
+
+### Etape 0 : Si besoin, déclarer un sous-module dans un repo git existant : 
+
+```bash
+cd phdseydi
+mkdir lib_py
+git submodule add https://gitlab.pleiade.edf.fr/Bayesian_PSHA/phebus-new.git
+```
+
+Ne pas oublier de pousser les modifs résultantes pour que les modules soient accessibles aux autres utilisateurs
+
 ### Etape 1 : Cloner le dépôt et tous ses sous-modules en une seule commande (basé sur le fichier .gitmodules)
 
 ```bash
