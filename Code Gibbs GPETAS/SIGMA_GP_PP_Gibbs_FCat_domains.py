@@ -33,15 +33,15 @@ import pandas as pd
 
 import os
 from phebus.pybus.frclass import FrenchDomainsSourceModel
-phebus_path = os.path.abspath("./phebus")
+# phebus_path = os.path.abspath("./phebus")
 # phebus_root = "/home/g80884/Documents/phebus"
 # phebus_root = os.path.join( phebus_path, "phebus" )
-demo_path = os.path.join( phebus_path, "phebus", "demos", "FrenchDomainsAnalysis")
+demo_path =  phebus_path / "phebus" / "demos" / "FrenchDomainsAnalysis"
 
 SM = FrenchDomainsSourceModel(
     Mmin=3.,
     PWD=demo_path,
-    FILE_DOMAINS=os.path.join(demo_path, "data", "domains", "domaines_xy.csv")
+    FILE_DOMAINS= demo_path / "data" / "domains" / "domaines_xy.csv"
 )
 
 catalog = SM.catalog[SM.catalog.year >= 1965]
