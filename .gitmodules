@@ -1,0 +1,3 @@
+[submodule "phebus-new"]
+	path = lib_py/phebus
+	url = https://gitlab.pleiade.edf.fr/Bayesian_PSHA/phebus-new.git
