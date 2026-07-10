@@ -916,8 +916,8 @@ class SSGC_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, verbose=True, method="openturns", plot_kde=False,
-                     kde_cmap="viridis"):
+    def calibrate_nu(self, x, y, verbose=True, method="openturns", target_mode="homogeneous",
+                     plot_kde=False, kde_cmap="viridis"):
         """Calibrate GP hyperparameters from a linearized sigmoid target.
 
         Parameters
@@ -928,6 +928,11 @@ class SSGC_GibbsSampler:
             Print calibrated values.
         method : {"sklearn", "openturns"}, optional
             Gaussian-process fitter used for the calibration.
+        target_mode : {"homogeneous", "zone_corrected"}, optional
+            Regression target used for the calibration. ``"homogeneous"`` uses
+            the linearized target ``2 |D| p_hat(x, y) - 2`` and avoids injecting
+            domainwise jumps into the GP target. ``"zone_corrected"`` preserves
+            the older target ``logit(lambda_KDE / mu_tilde_MLE)``.
         plot_kde : bool, optional
             Display the OpenTURNS kernel-density estimate used to build the
             regression target.
@@ -946,6 +951,9 @@ class SSGC_GibbsSampler:
         method = str(method).lower()
         if method not in {"sklearn", "openturns"}:
             raise ValueError("method must be 'sklearn' or 'openturns'.")
+        target_mode = str(target_mode).lower()
+        if target_mode not in {"homogeneous", "zone_corrected"}:
+            raise ValueError("target_mode must be 'homogeneous' or 'zone_corrected'.")
 
         obs_pts = np.column_stack([
             np.asarray([float(v) for v in x]),
@@ -973,18 +981,22 @@ class SSGC_GibbsSampler:
         if verbose:
             print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
 
-        # KDE estimates lambda(x, y).  The latent GP controls the Bernoulli
-        # thinning probability sigmoid(f), so the natural calibration target is
-        # logit(lambda_KDE / mu_tilde_MLE) rather than an arbitrary rescaling of
-        # the spatial density.
-        domain_indices = self._compute_event_domain_indices(x, y)
-        baseline_mle = np.exp(eps_mle[np.maximum(domain_indices, 0)])
-        lambda_kde = len(obs_pts) / self.T * p_hat
-        probability_target = lambda_kde / np.maximum(baseline_mle, self.jitter)
-        probability_target = np.clip(probability_target, 1e-4, 1.0 - 1e-4)
-        target = np.log(probability_target / (1.0 - probability_target))
+        if target_mode == "homogeneous":
+            domain_area = float(sum(poly.area for poly in self.polygons))
+            target = 2.0 * domain_area * p_hat - 2.0
+            target = np.clip(target, -1.5, 1.5)
+        else:
+            domain_indices = self._compute_event_domain_indices(x, y)
+            baseline_mle = np.exp(eps_mle[np.maximum(domain_indices, 0)])
+            lambda_kde = len(obs_pts) / self.T * p_hat
+            probability_target = lambda_kde / np.maximum(baseline_mle, self.jitter)
+            probability_target = np.clip(probability_target, 1e-4, 1.0 - 1e-4)
+            target = np.log(probability_target / (1.0 - probability_target))
         target_variance = float(np.nanvar(target)) if target.size else float(self.nu[0])
-        variance_upper = max(5.0, 4.0 * target_variance, 4.0 * float(self.nu[0]))
+        if target_mode == "homogeneous":
+            variance_upper = (1.5 / 2.576) ** 2
+        else:
+            variance_upper = max(5.0, 4.0 * target_variance, 4.0 * float(self.nu[0]))
         span_x = float(self.X_bounds[1] - self.X_bounds[0])
         span_y = float(self.Y_bounds[1] - self.Y_bounds[0])
         prior_length = float(np.asarray(self.nu, dtype=float).reshape(-1)[1])
@@ -1025,7 +1037,7 @@ class SSGC_GibbsSampler:
         v = np.sqrt(v_sq)
         self.nu = ot.Point([v_sq, l_ot])
         if verbose:
-            print(f"[calibrate_nu:{method}] v = {v:.4f} ; l_ot = {l_ot:.4f}")
+            print(f"[calibrate_nu:{method}/{target_mode}] v = {v:.4f} ; l_ot = {l_ot:.4f}")
         return v, l_ot, eps_mle
 
     # def calibrate_nu(self, x, y, grid_size=50, verbose=True):
@@ -1065,6 +1077,7 @@ class SSGC_GibbsSampler:
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
         compute_emu=True, emu_every=10, calibration_method="openturns",
+        calibration_target="homogeneous",
         plot_calibration_kde=False, calibration_kde_cmap="viridis",
         gp_backend="exact", sparse_gp=None): 
         """Run the augmented SSGC Gibbs sampler.
@@ -1105,6 +1118,10 @@ class SSGC_GibbsSampler:
             Compute ``E_mu`` every ``emu_every`` iterations.
         calibration_method : {"sklearn", "openturns"}, optional
             GP fitter used by the optional pre-run calibration.
+        calibration_target : {"homogeneous", "zone_corrected"}, optional
+            Calibration target. ``"homogeneous"`` uses the linearized density
+            target; ``"zone_corrected"`` preserves the older domain-corrected
+            logit target.
         plot_calibration_kde : bool, optional
             Display the KDE used by calibration.
         calibration_kde_cmap : str or Colormap, optional
@@ -1132,6 +1149,7 @@ class SSGC_GibbsSampler:
                 print("[Pre-run] Calibrating GP hyperparameters")
             _, _, eps_mle = self.calibrate_nu(
                 x, y, verbose=verbose, method=calibration_method,
+                target_mode=calibration_target,
                 plot_kde=plot_calibration_kde,
                 kde_cmap=calibration_kde_cmap,
             )

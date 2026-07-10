@@ -1,17 +1,87 @@
 """User-facing Gibbs posterior result object."""
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
 from scipy.special import expit
 
-from ..config import ETASParameters
-from ..data.catalog import EventCatalog
+from package.config import ETASParameters
+from data.catalog import EventCatalog
 from ..models.ssgc import SSGCModel
-from ..visualization import plot_field, save_figure
+from visualization import plot_field, save_figure
+
+
+@dataclass
+class SPINHVIResults:
+    """User-facing result object returned by SPINHVI.fit()."""
+
+    state: Any
+    model: Any
+    catalog: EventCatalog
+    config: Any
+    elbo_trace: list[float]
+    diagnostics: dict = field(default_factory=dict)
+
+    def beta_mean(self) -> float:
+        return float(self.state.etas.beta_mean)
+
+    def etas_mean(self) -> ETASParameters:
+        return self.state.etas.parameters_mean
+
+    def summary(self) -> dict:
+        """Return posterior means and diagnostics in a compact dictionary."""
+        return {
+            "eps_mean": self.state.eps.mean.copy(),
+            "eps_covariance": self.state.eps.covariance.copy(),
+            "f_data_mean": self.state.gp.f_data_mean.copy(),
+            "f_data_var": self.state.gp.f_data_var.copy(),
+            "f_grid_mean": self.state.gp.f_grid_mean.copy(),
+            "f_grid_var": self.state.gp.f_grid_var.copy(),
+            "f_covariance": None if self.state.gp.covariance is None else self.state.gp.covariance.copy(),
+            "gp_backend": getattr(self.config, "gp_backend", "exact"),
+            "gp_coefficients_mean": (
+                None if self.state.gp.coefficients_mean is None
+                else self.state.gp.coefficients_mean.copy()
+            ),
+            "gp_coefficients_covariance": (
+                None if self.state.gp.coefficients_covariance is None
+                else self.state.gp.coefficients_covariance.copy()
+            ),
+            "p_background": self.state.branching.p_background.copy(),
+            "parent_probabilities": self.state.branching.probabilities.copy(),
+            "theta_phi_hat": self.state.etas.parameters_mean.as_dict(),
+            "beta_hat": self.beta_mean(),
+            "latent_poisson_expected_counts": (
+                self.state.latent_poisson.expected_counts_by_domain.copy()
+            ),
+            "elbo_trace": np.asarray(self.elbo_trace, dtype=float),
+            "diagnostics": dict(self.diagnostics),
+        }
+
+    def declustering(self, background_threshold: float = 0.5) -> dict:
+        """Return a two-stage declustering decision from q(Z)."""
+        probabilities = self.state.branching.probabilities
+        p_background = probabilities[:, 0]
+        labels = np.zeros(probabilities.shape[0], dtype=int)
+        parent = np.full(probabilities.shape[0], -1, dtype=int)
+        triggered = p_background < background_threshold
+        for i in np.where(triggered)[0]:
+            if i == 0:
+                labels[i] = 0
+                continue
+            j = int(np.argmax(probabilities[i, 1 : i + 1]))
+            labels[i] = 1
+            parent[i] = j
+        return {
+            "p_background": p_background.copy(),
+            "is_background": ~triggered,
+            "parent": parent,
+            "labels": labels,
+        }
 
 
 @dataclass

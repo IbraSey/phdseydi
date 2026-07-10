@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 import openturns as ot
 
-from ..data.catalog import EventCatalog
+from data.catalog import EventCatalog
 
 
 class PointProcessModel(ABC):
@@ -61,6 +61,7 @@ class PointProcessModel(ABC):
             "compute_emu": config.compute_emu,
             "emu_every": config.emu_every,
             "calibration_method": config.calibration_method,
+            "calibration_target": config.calibration_target,
         }
         if sparse_gp is not None and gp_backend != "sparse":
             raise ValueError("sparse_gp requires gp_backend='sparse'.")

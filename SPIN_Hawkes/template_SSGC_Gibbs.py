@@ -12,7 +12,7 @@ from shapely.ops import unary_union
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from SPIN_Hawkes import EventCatalog, GPParameters, GibbsConfig, SSGCModel
+from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel
 
 
 # =============================================================================

@@ -1,6 +1,6 @@
 #%%
 
-"""Minimal SSGC Gibbs test on simulated data with known intensity."""
+"""Minimal SSGC Gibbs test matching Experiment 1, Profile 1, Setting A."""
 
 import sys
 import warnings
@@ -12,7 +12,7 @@ import openturns as ot
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 warnings.filterwarnings("ignore")
 
-from SPIN_Hawkes import (
+from package import (
     GPParameters,
     GibbsConfig,
     SSGCModel,
@@ -23,26 +23,32 @@ from SPIN_Hawkes import (
 
 X_BOUNDS = (0.0, 2.0)
 Y_BOUNDS = (0.0, 2.0)
-DURATION = 50.0
+DURATION = 180.0
 DOMAIN_INTENSITIES = (10.0, 1.0, 2.0, 10.0, 8.0, 2.0)
-SEED = 42
+VORONOI_SEED = 15
+SIMULATION_SEED = 15
+MCMC_SEED = 42
 
-N_ITER = 10000
-THIN = 4
-BURN_IN = 0.5
-MALA_STEP = 0.14
+N_ITER = 300
+THIN = 3
+BURN_IN = 0.4
+MALA_STEP = 0.06
 USE_SPARSE_GP = True
 MAKE_PLOTS = True
-USE_CALIBRATION = False
+USE_CALIBRATION = True
+CALIBRATION_TARGET = "homogeneous"
 GRID_SIZE = 60
-POST_GRID = 120
+POST_GRID = 60
+POSTERIOR_N_MC = 100
 
-EPS_PRIOR_VARIANCE = 10.0
+EPS_PRIOR_VARIANCE = 2
 EPS_PRIOR_LENGTH_SCALE = 0.01
+GP_PRIOR_VARIANCE = 5.0
+GP_PRIOR_LENGTH_SCALE = 0.2
 
 
 def latent_field(x, y):
-    """Smooth latent field used as the simulation ground truth."""
+    """Latent field used by Experiment 1, Profile 1, Setting A."""
     weights = [1.5, -1.5, 3.0, -3.0]
     sigma2 = 0.3
     means = [
@@ -64,7 +70,7 @@ def main():
         n_germs=len(DOMAIN_INTENSITIES),
         X_bounds=X_BOUNDS,
         Y_bounds=Y_BOUNDS,
-        rng_seed=15,
+        rng_seed=VORONOI_SEED,
     )
 
     simulation = simulate_spatial_process(
@@ -74,17 +80,25 @@ def main():
         polygons=polygons,
         mus=DOMAIN_INTENSITIES,
         f=latent_field,
-        rng_seed=SEED,
+        rng_seed=SIMULATION_SEED,
+        grid_res=100,
     )
     catalog = simulation.catalog
     print(f"Generated SSGC catalog: N={len(catalog)}")
+
+    def true_intensity(x, y):
+        return simulation.spatial_components(x, y)[3]
 
     model = SSGCModel.from_polygons(
         polygons=polygons,
         duration=DURATION,
         x_bounds=X_BOUNDS,
         y_bounds=Y_BOUNDS,
-        gp_prior=GPParameters(variance=5.0, length_scale=0.2),
+        initial_log_intensities=0.0,
+        gp_prior=GPParameters(
+            variance=GP_PRIOR_VARIANCE,
+            length_scale=GP_PRIOR_LENGTH_SCALE,
+        ),
         eps_prior_variance=EPS_PRIOR_VARIANCE,
         eps_prior_length_scale=EPS_PRIOR_LENGTH_SCALE,
         nu_prior_rate=0.5,
@@ -101,9 +115,14 @@ def main():
             verbose_every=max(1, N_ITER // 10),
             use_calibration=USE_CALIBRATION,
             calibration_method="openturns",
+            calibration_target=CALIBRATION_TARGET,
+            grid_nx=30,
+            grid_ny=30,
+            compute_emu=False,
         ),
         gp_backend="sparse" if USE_SPARSE_GP else "exact",
-        rng_seed=SEED,
+        rng_seed=MCMC_SEED,
+        reference_intensity=true_intensity,
     )
 
     summary = fit.summary(burn_in=BURN_IN)
@@ -124,10 +143,7 @@ def main():
         grid[:, 1],
         burn_in=BURN_IN,
     )
-    intensity_true = simulation.spatial_components(
-        grid[:, 0],
-        grid[:, 1],
-    )[3]
+    intensity_true = true_intensity(grid[:, 0], grid[:, 1])
     error = intensity_estimated - intensity_true
 
     print("\nBackground intensity")
@@ -135,6 +151,8 @@ def main():
     print(f"MAE = {np.mean(np.abs(error)):.4f}")
     print(f"mean estim = {intensity_estimated.mean():.4f}")
     print(f"mean true = {intensity_true.mean():.4f}")
+    print(f"min estim = {intensity_estimated.min():.4f}")
+    print(f"min true = {intensity_true.min():.4f}")
     print(f"max estim = {intensity_estimated.max():.4f}")
     print(f"max true = {intensity_true.max():.4f}")
 
@@ -145,11 +163,13 @@ def main():
             burn_in=BURN_IN,
             nx=POST_GRID,
             ny=POST_GRID,
-            n_mc=200,
+            n_mc=POSTERIOR_N_MC,
             cmap="inferno",
-            mu_star_func=lambda x, y: simulation.spatial_components(x, y)[3],
+            mu_star_func=true_intensity,
         )
 
 
 if __name__ == "__main__":
     main()
+
+# %%
