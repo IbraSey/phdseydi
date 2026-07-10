@@ -6,8 +6,8 @@ import numpy as np
 from scipy.special import expit
 
 from ..config import GPParameters, GibbsConfig
-from ..data.catalog import EventCatalog
-from ..spatial.domain import DomainPartition
+from data.catalog import EventCatalog
+from spatial.domain import DomainPartition
 from .base import PointProcessModel
 
 

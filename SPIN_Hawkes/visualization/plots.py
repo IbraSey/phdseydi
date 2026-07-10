@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from ..simulation import SpatialProcessSimulation
+from simulation import SpatialProcessSimulation
 
 DEFAULT_FIGURES_DIR = Path(__file__).resolve().parents[1] / "figures"
 VECTOR_FIGURE_FORMAT = "pdf"
@@ -148,7 +148,7 @@ def plot_process_dashboard(
         cax=intensity_divider.append_axes("right", size="5%", pad=0.08),
         label=r"$\mu^\star(x,y)$",
     )
-    intensity_ax.set_title(r"True intensity $\mu^\star=	ilde\mu\,\sigma(f^\star)$")
+    intensity_ax.set_title(r"True intensity $\mu^\star=\widetilde{\mu}\,\sigma(f^\star)$")
 
     event_ax = axes[1, 0]
     if n_events:
@@ -168,7 +168,7 @@ def plot_process_dashboard(
         domain_ax.text(
             domain.centroid.x,
             domain.centroid.y,
-            rf"$	ilde\mu={baseline[index]:.2g}$",
+            rf"$\widetilde{{\mu}}={baseline[index]:.2g}$",
             ha="center",
             va="center",
             fontsize=8,

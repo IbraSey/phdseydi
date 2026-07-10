@@ -53,6 +53,7 @@ class GibbsConfig:
     mala_step: float = 0.25
     learn_nu: bool = False
     calibration_method: str = "openturns"
+    calibration_target: str = "homogeneous"
     use_calibration: bool = True
     verbose: bool = True
     verbose_every: int = 100
@@ -70,6 +71,8 @@ class GibbsConfig:
             raise ValueError("mala_step and verbose_every must be positive.")
         if self.calibration_method not in {"sklearn", "openturns"}:
             raise ValueError("calibration_method must be 'sklearn' or 'openturns'.")
+        if self.calibration_target not in {"homogeneous", "zone_corrected"}:
+            raise ValueError("calibration_target must be 'homogeneous' or 'zone_corrected'.")
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class SPINHGibbsConfig(GibbsConfig):
         default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
     )
     theta_priors: dict[str, float] = field(default_factory=dict)
+    fixed_etas: dict[str, float] = field(default_factory=dict)
     sample_z: bool = True
     known_z: object = None
     sample_etas: bool = True
@@ -94,6 +98,13 @@ class SPINHGibbsConfig(GibbsConfig):
         super().__post_init__()
         if self.beta_init <= 0:
             raise ValueError("beta_init must be positive.")
+        allowed_etas = {"A", "alpha", "c", "p", "d", "q", "gamma"}
+        unknown_fixed = set(self.fixed_etas).difference(allowed_etas)
+        if unknown_fixed:
+            raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown_fixed)}")
+        for name, value in self.fixed_etas.items():
+            if not isinstance(value, (int, float)):
+                raise ValueError("fixed_etas values must be numeric.")
         if not isinstance(self.sample_z, bool):
             raise ValueError("sample_z must be a boolean.")
         if not isinstance(self.sample_etas, bool):

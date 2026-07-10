@@ -6,7 +6,7 @@
 import numpy as np
 import pandas as pd
 import openturns as ot
-from SPIN_Hawkes import EventCatalog, GPParameters, GibbsConfig, SSGCModel
+from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel
 
 
 DATA_PATH = ".../.../....csv"

@@ -8,10 +8,10 @@ import openturns as ot
 from scipy.special import expit
 from shapely.geometry import box
 
-from ..config import ETASParameters
-from ..data.catalog import EventCatalog
-from ..models.kernels import ETASKernel
-from ..spatial.domain import DomainPartition
+from package.config import ETASParameters
+from data.catalog import EventCatalog
+from package.models.kernels import ETASKernel
+from spatial.domain import DomainPartition
 
 LatentField = Callable[..., np.ndarray | float]
 

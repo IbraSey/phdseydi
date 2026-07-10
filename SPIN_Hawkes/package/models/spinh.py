@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..config import ETASParameters, SPINHGibbsConfig
-from ..data.catalog import EventCatalog
+from package.config import ETASParameters, SPINHGibbsConfig
+from data.catalog import EventCatalog
 from .kernels import ETASKernel
 from .ssgc import SSGCModel
 
@@ -86,7 +86,23 @@ class SPINHModel(SSGCModel):
             sample_z=config.sample_z,
             known_z=config.known_z,
             sample_etas=config.sample_etas,
+            fixed_etas=config.fixed_etas,
         )
+
+    def vi(self, catalog, config=None, rng_seed=None):
+        """Estimate this SPIN-H model with simple hybrid CAVI/VI.
+
+        The model remains unchanged. The returned SPINHVIResults object contains
+        variational posterior summaries for Z, epsilon, the GP and ETAS blocks.
+        """
+        from ..inference.VI import SPINHVI, SPINHVIConfig
+
+        if config is None:
+            config = SPINHVIConfig(random_seed=rng_seed)
+        elif not isinstance(config, SPINHVIConfig):
+            raise TypeError("config must be a SPINHVIConfig instance.")
+        engine = SPINHVI(self, catalog, config=config)
+        return engine.fit()
 
     def triggering_intensity(
         self,

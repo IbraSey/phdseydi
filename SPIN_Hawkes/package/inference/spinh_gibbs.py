@@ -5,7 +5,7 @@ import openturns as ot
 from polyagamma import random_polyagamma
 from shapely.geometry import Point as ShapelyPoint
 
-from ..config import ETASParameters
+from package.config import ETASParameters
 from ..models import SPINHModel
 
 from .backends import SparseGP
@@ -99,6 +99,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             self.m_max, self.beta, self.beta_priors = None, None, None
 
         self.theta_phi = model.etas_parameters.as_dict()
+        self.fixed_etas = {}
         pr = {"a_A": 2.0, "b_A": 1.0, "a_c": 2.0, "b_c": 1.0,
               "a_p": 2.0, "b_p": 1.0, "a_d": 2.0, "b_d": 1.0,
               "a_q": 2.0, "b_q": 1.0}
@@ -114,6 +115,102 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             values.pop("alpha", None)
             values.pop("gamma", None)
         return ETASParameters(**values)
+
+    def _validate_fixed_etas(self, fixed_etas, active_names):
+        """Validate ETAS parameters kept fixed during the Gibbs run."""
+        fixed = {} if fixed_etas is None else dict(fixed_etas)
+        unknown = set(fixed).difference(active_names)
+        if unknown:
+            raise ValueError(
+                "fixed_etas contains unknown or inactive parameters: "
+                f"{sorted(unknown)}"
+            )
+
+        for name, value in fixed.items():
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"fixed_etas['{name}'] must be finite.")
+            if name in {"A", "alpha", "c", "d", "gamma"} and value <= 0.0:
+                raise ValueError(f"fixed_etas['{name}'] must be > 0.")
+            if name in {"p", "q"} and value <= 1.0:
+                raise ValueError(f"fixed_etas['{name}'] must be > 1.")
+            fixed[name] = value
+        return fixed
+
+    def _free_etas_names(self, names):
+        """Return the ETAS names from a block that are not fixed."""
+        return [name for name in names if name not in self.fixed_etas]
+
+    @staticmethod
+    def _etas_log_bound_name(name):
+        """Map an ETAS parameter name to its transformed bound key."""
+        return {"p": "p_m1", "q": "q_m1"}.get(name, name)
+
+    @staticmethod
+    def _etas_to_log(name, value):
+        """Transform an ETAS parameter to the proposal log scale."""
+        value = float(value)
+        if name in {"p", "q"}:
+            return np.log(value - 1.0)
+        return np.log(value)
+
+    @staticmethod
+    def _etas_from_log(name, log_value):
+        """Transform an ETAS proposal back to the natural scale."""
+        if name in {"p", "q"}:
+            return float(np.exp(log_value) + 1.0)
+        return float(np.exp(log_value))
+
+    def _current_etas_log_block(self, names):
+        """Current free ETAS block on the proposal log scale."""
+        return np.array([self._etas_to_log(name, self.theta_phi[name]) for name in names])
+
+    def _proposal_log_block(self, names, history, it):
+        """Draw an adaptive Metropolis proposal for the free ETAS coordinates."""
+        dim = len(names)
+        log_cur = self._current_etas_log_block(names)
+        history.append(log_cur.copy())
+
+        sd = 2.38 ** 2 / dim
+        if it > self.t0_etas and len(history) > self.t0_etas:
+            h = np.asarray(history, dtype=float)
+            if dim == 1:
+                std = np.sqrt(sd * np.var(h[:, 0], ddof=1) + self.eps_mh_etas)
+                step = np.array([std * float(ot.Normal().getRealization()[0])])
+            else:
+                cov = sd * np.cov(h.T) + self.eps_mh_etas * np.eye(dim)
+                step = np.array(
+                    ot.Normal(
+                        ot.Point(dim, 0.0),
+                        ot.CovarianceMatrix(cov.tolist()),
+                    ).getRealization()
+                )
+        else:
+            if dim == 1:
+                step = np.array([self.sigma_MH_etas * float(ot.Normal().getRealization()[0])])
+            else:
+                cov = self.sigma_MH_etas ** 2 * np.eye(dim)
+                step = np.array(
+                    ot.Normal(
+                        ot.Point(dim, 0.0),
+                        ot.CovarianceMatrix(cov.tolist()),
+                    ).getRealization()
+                )
+
+        log_star = log_cur + step
+        for name, value in zip(names, log_star):
+            lower, upper = self._LOG_BOUNDS[self._etas_log_bound_name(name)]
+            if not (lower <= value <= upper):
+                return log_cur, None
+        return log_cur, log_star
+
+    def _candidate_etas(self, names, log_star):
+        """Return theta_phi with proposed values inserted for a free block."""
+        values = dict(self.theta_phi)
+        for name, value in zip(names, log_star):
+            values[name] = self._etas_from_log(name, value)
+        return values
+
 
     def _compute_T_j(self, t, c=None, p=None):
         """Compute temporal truncation factors T_j for every event.
@@ -395,66 +492,30 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         return log_lik + log_pr
 
     def update_A_alpha(self, t, x, y, Z, history, it):
-        """Update ``(A, alpha)`` with adaptive Metropolis on the log scale.
-        
-        Parameters
-        ----------
-        t, x, y : array_like, shape (N,)
-            Event times and coordinates.
-        Z : array_like, shape (N,)
-            Current branching labels.
-        history : list
-            Previous log-parameter states; appended in place.
-        it : int
-            Current Gibbs iteration.
-        
-        Returns
-        -------
-        accepted : bool
-            Whether the proposal was accepted. In the unmarked model only ``A`` is
-            updated."""
-        use_mag = self.use_magnitudes
-        dim = 2 if use_mag else 1
-        sd = 2.38 ** 2 / dim
-        B = self._LOG_BOUNDS
+        """Update the free coordinates of ``(A, alpha)`` with adaptive MH."""
+        block_names = ["A", "alpha"] if self.use_magnitudes else ["A"]
+        free_names = self._free_etas_names(block_names)
+        if not free_names:
+            return False
 
+        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+        if log_star is None:
+            return False
+
+        candidate = self._candidate_etas(free_names, log_star)
         A_cur = self.theta_phi["A"]
         alpha_cur = self.theta_phi.get("alpha", 0.0)
-        log_cur = (np.array([np.log(A_cur), np.log(alpha_cur)]) if use_mag
-                   else np.array([np.log(A_cur)]))
-        history.append(log_cur.copy())
-
-        # Proposal
-        if it > self.t0_etas and len(history) > self.t0_etas:
-            h = np.array(history)
-            cov = (sd * np.cov(h.T) + self.eps_mh_etas * np.eye(dim)) if dim > 1 \
-                  else None
-            std = np.sqrt(sd * np.var(h, ddof=1) + self.eps_mh_etas) if dim == 1 else None
-        else:
-            cov = self.sigma_MH_etas ** 2 * np.eye(dim) if dim > 1 else None
-            std = self.sigma_MH_etas if dim == 1 else None
-
-        if dim == 1:
-            log_star = np.array([log_cur[0] + std * float(ot.Normal().getRealization()[0])])
-            if not (B["A"][0] <= log_star[0] <= B["A"][1]):
-                return False
-            A_s, alpha_s = np.exp(log_star[0]), 0.0
-        else:
-            log_star = log_cur + np.array(ot.Normal(ot.Point(dim, 0.0), ot.CovarianceMatrix(cov.tolist())).getRealization())
-            if not (B["A"][0] <= log_star[0] <= B["A"][1]):
-                return False
-            if not (B["alpha"][0] <= log_star[1] <= B["alpha"][1]):
-                return False
-            A_s, alpha_s = np.exp(log_star[0]), np.exp(log_star[1])
+        A_s = candidate["A"]
+        alpha_s = candidate.get("alpha", 0.0)
 
         lp_cur = self._log_posterior_A_alpha(A_cur, alpha_cur, t, x, y, Z)
         lp_star = self._log_posterior_A_alpha(A_s, alpha_s, t, x, y, Z)
         if not np.isfinite(lp_star):
             return False
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + np.sum(log_star - log_cur)):
-            self.theta_phi["A"] = A_s
-            if use_mag:
-                self.theta_phi["alpha"] = alpha_s
+        log_jacobian = np.sum(log_star - log_cur)
+        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+            for name in free_names:
+                self.theta_phi[name] = candidate[name]
             return True
         return False
 
@@ -523,50 +584,28 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         return log_lik + log_pr
 
     def update_c_p(self, t, x, y, Z, history, it):
-        """Update ``(c, p)`` with adaptive Metropolis.
-        
-        The proposal is Gaussian in ``(log(c), log(p-1))``.
-        
-        Parameters
-        ----------
-        t, x, y : array_like, shape (N,)
-            Event times and coordinates.
-        Z : array_like, shape (N,)
-            Current branching labels.
-        history : list
-            Previous transformed states; appended in place.
-        it : int
-            Current Gibbs iteration.
-        
-        Returns
-        -------
-        accepted : bool
-            Whether the proposal was accepted."""
-        dim, sd = 2, 2.38 ** 2 / 2
-        B = self._LOG_BOUNDS
-        log_cur = np.array([np.log(self.theta_phi["c"]),
-                            np.log(self.theta_phi["p"] - 1.0)])
-        history.append(log_cur.copy())
-
-        if it > self.t0_etas and len(history) > self.t0_etas:
-            cov = sd * np.cov(np.array(history).T) + self.eps_mh_etas * np.eye(dim)
-        else:
-            cov = self.sigma_MH_etas ** 2 * np.eye(dim)
-
-        log_star = log_cur + np.array(ot.Normal(ot.Point(dim, 0.0), ot.CovarianceMatrix(cov.tolist())).getRealization())
-        if not (B["c"][0] <= log_star[0] <= B["c"][1]):
+        """Update the free coordinates of ``(c, p)`` with adaptive MH."""
+        free_names = self._free_etas_names(["c", "p"])
+        if not free_names:
             return False
-        if not (B["p_m1"][0] <= log_star[1] <= B["p_m1"][1]):
-            return False
-        c_s, p_s = np.exp(log_star[0]), np.exp(log_star[1]) + 1.0
 
-        lp_cur = self._log_posterior_c_p(self.theta_phi["c"], self.theta_phi["p"], t, x, y, Z)
-        lp_star = self._log_posterior_c_p(c_s, p_s, t, x, y, Z)
+        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+        if log_star is None:
+            return False
+
+        candidate = self._candidate_etas(free_names, log_star)
+        lp_cur = self._log_posterior_c_p(
+            self.theta_phi["c"], self.theta_phi["p"], t, x, y, Z
+        )
+        lp_star = self._log_posterior_c_p(
+            candidate["c"], candidate["p"], t, x, y, Z
+        )
         if not np.isfinite(lp_star):
             return False
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + np.sum(log_star - log_cur)):
-            self.theta_phi["c"] = c_s
-            self.theta_phi["p"] = p_s
+        log_jacobian = np.sum(log_star - log_cur)
+        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+            for name in free_names:
+                self.theta_phi[name] = candidate[name]
             return True
         return False
 
@@ -640,69 +679,31 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         return log_lik + log_pr
 
     def update_d_q_gamma(self, t, x, y, Z, history, it):
-        """Update the spatial ETAS block with adaptive Metropolis.
-        
-        The proposal uses ``log(d)``, ``log(q-1)``, and, in the marked model,
-        ``log(gamma)``.
-        
-        Parameters
-        ----------
-        t, x, y : array_like, shape (N,)
-            Event times and coordinates.
-        Z : array_like, shape (N,)
-            Current branching labels.
-        history : list
-            Previous transformed states; appended in place.
-        it : int
-            Current Gibbs iteration.
-        
-        Returns
-        -------
-        accepted : bool
-            Whether the proposal was accepted."""
-        use_mag = self.use_magnitudes
-        dim = 3 if use_mag else 2
-        sd = 2.38 ** 2 / dim
-        B = self._LOG_BOUNDS
-
-        if use_mag:
-            log_cur = np.array([np.log(self.theta_phi["d"]),
-                                np.log(self.theta_phi["q"] - 1.0),
-                                np.log(self.theta_phi["gamma"])])
-        else:
-            log_cur = np.array([np.log(self.theta_phi["d"]),
-                                np.log(self.theta_phi["q"] - 1.0)])
-        history.append(log_cur.copy())
-
-        if it > self.t0_etas and len(history) > self.t0_etas:
-            cov = sd * np.cov(np.array(history).T) + self.eps_mh_etas * np.eye(dim)
-        else:
-            cov = self.sigma_MH_etas ** 2 * np.eye(dim)
-
-        log_star = log_cur + np.array(ot.Normal(ot.Point(dim, 0.0), ot.CovarianceMatrix(cov.tolist())).getRealization())
-        if not (B["d"][0] <= log_star[0] <= B["d"][1]):
+        """Update the free coordinates of the spatial ETAS block with adaptive MH."""
+        block_names = ["d", "q", "gamma"] if self.use_magnitudes else ["d", "q"]
+        free_names = self._free_etas_names(block_names)
+        if not free_names:
             return False
-        if not (B["q_m1"][0] <= log_star[1] <= B["q_m1"][1]):
-            return False
-        d_s = np.exp(log_star[0])
-        q_s = np.exp(log_star[1]) + 1.0
-        gamma_s = 0.0
-        if use_mag:
-            if not (B["gamma"][0] <= log_star[2] <= B["gamma"][1]):
-                return False
-            gamma_s = np.exp(log_star[2])
 
+        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+        if log_star is None:
+            return False
+
+        candidate = self._candidate_etas(free_names, log_star)
         lp_cur = self._log_posterior_d_q_gamma(
             self.theta_phi["d"], self.theta_phi["q"],
-            self.theta_phi.get("gamma", 0.0), t, x, y, Z)
-        lp_star = self._log_posterior_d_q_gamma(d_s, q_s, gamma_s, t, x, y, Z)
+            self.theta_phi.get("gamma", 0.0), t, x, y, Z
+        )
+        lp_star = self._log_posterior_d_q_gamma(
+            candidate["d"], candidate["q"],
+            candidate.get("gamma", 0.0), t, x, y, Z
+        )
         if not np.isfinite(lp_star):
             return False
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + np.sum(log_star - log_cur)):
-            self.theta_phi["d"] = d_s
-            self.theta_phi["q"] = q_s
-            if use_mag:
-                self.theta_phi["gamma"] = gamma_s
+        log_jacobian = np.sum(log_star - log_cur)
+        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+            for name in free_names:
+                self.theta_phi[name] = candidate[name]
             return True
         return False
 
@@ -782,11 +783,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
     def run(self, t, x, y, mala_step=0.05, n_iter=1000,
             learn_nu=False, learn_beta=False,
-            sample_z=True, known_z=None, sample_etas=True,
+            sample_z=True, known_z=None, sample_etas=True, fixed_etas=None,
             t0_nu=50, step_nu_init=0.1,
             verbose=True, verbose_every=100, use_calibration=True,
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
             compute_emu=False, emu_every=10, calibration_method="openturns",
+            calibration_target="homogeneous",
             plot_calibration_kde=False, calibration_kde_cmap="viridis",
             gp_backend="exact", sparse_gp=None):
         """Run the SPIN-Hawkes Gibbs sampler.
@@ -814,6 +816,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             One-based branching labels used as the initial/fixed branching state.
         sample_etas : bool, optional
             Update ETAS parameters. Set to ``False`` to keep theta fixed.
+        fixed_etas : dict or None, optional
+            ETAS parameters kept fixed while the other coordinates are sampled.
+            For example ``{"c": 0.02, "p": 1.3}``.
         t0_nu : int, optional
             Warm-up length for GP-hyperparameter adaptation.
         step_nu_init : float, optional
@@ -836,6 +841,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             Iterations between ``E_mu`` evaluations.
         calibration_method : {"sklearn", "openturns"}, optional
             GP fitter used by pre-run calibration.
+        calibration_target : {"homogeneous", "zone_corrected"}, optional
+            Calibration target used by the inherited SSGC background model.
         plot_calibration_kde : bool, optional
             Display the KDE used for calibration.
         calibration_kde_cmap : str or Colormap, optional
@@ -861,6 +868,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 mu_star_func=mu_star_func, grid_nx=grid_nx, grid_ny=grid_ny, thin=thin,
                 compute_emu=compute_emu, emu_every=emu_every,
                 calibration_method=calibration_method,
+                calibration_target=calibration_target,
                 plot_calibration_kde=plot_calibration_kde,
                 calibration_kde_cmap=calibration_kde_cmap,
                 gp_backend=gp_backend, sparse_gp=sparse_gp)
@@ -890,6 +898,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         tp_names = (["A", "alpha", "c", "p", "d", "q", "gamma"]
                     if self.use_magnitudes else ["A", "c", "p", "d", "q"])
+        self.fixed_etas = self._validate_fixed_etas(fixed_etas, tp_names)
+        for name, value in self.fixed_etas.items():
+            self.theta_phi[name] = value
+        etas_blocks = {
+            "A_alpha": ["A", "alpha"] if self.use_magnitudes else ["A"],
+            "c_p": ["c", "p"],
+            "d_q_gamma": ["d", "q", "gamma"] if self.use_magnitudes else ["d", "q"],
+        }
+        free_etas_blocks = {
+            key: self._free_etas_names(names) for key, names in etas_blocks.items()
+        }
         n_tp = len(tp_names)
 
         # ── Calibration GP ──────────────────────────────────────────────────
@@ -897,6 +916,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             if verbose: print("[Pre-run] Calibrating GP hyperparameters")
             _, _, eps_mle_all = self.calibrate_nu(
                 x, y, verbose=verbose, method=calibration_method,
+                target_mode=calibration_target,
                 plot_kde=plot_calibration_kde,
                 kde_cmap=calibration_kde_cmap,
             )
@@ -955,6 +975,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             if gp_backend == "sparse":
                 print(f"[Init] Sparse GP with {int(sparse_gp.m)} basis functions")
             print(f"[Init] ε = {np.round(eps_mle, 4)} | θ_φ = {self.theta_phi}")
+            if self.fixed_etas:
+                print(f"[Init] fixed θ_φ = {self.fixed_etas}")
             if self.use_magnitudes:
                 print(f"[Init] β = {self.beta} (learn={learn_beta}) | AM t0 = {self.t0_etas}")
 
@@ -1072,9 +1094,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
                 if sample_etas:
-                    acc["A_alpha"]   += int(self.update_A_alpha(t, x, y, Z, hAa, it))
-                    acc["c_p"]       += int(self.update_c_p(t, x, y, Z, hcp, it))
-                    acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
+                    if free_etas_blocks["A_alpha"]:
+                        acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                    if free_etas_blocks["c_p"]:
+                        acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
+                    if free_etas_blocks["d_q_gamma"]:
+                        acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
                 if learn_beta and sample_etas:
@@ -1093,11 +1118,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         f"bg={nb}/{N} "
                     )
                     if sample_etas:
-                        msg += (
-                            f"acc_Aα={acc_Aa:.0f}% "
-                            f"acc_cp={acc_cp:.0f}% "
-                            f"acc_dqγ={acc_dqg:.0f}%"
-                        )
+                        parts = []
+                        parts.append(f"acc_Aα={acc_Aa:.0f}%" if free_etas_blocks["A_alpha"] else "Aα=fixed")
+                        parts.append(f"acc_cp={acc_cp:.0f}%" if free_etas_blocks["c_p"] else "cp=fixed")
+                        parts.append(f"acc_dqγ={acc_dqg:.0f}%" if free_etas_blocks["d_q_gamma"] else "dqγ=fixed")
+                        msg += " ".join(parts)
                     else:
                         msg += "θ_fixed"
                     if learn_beta:
@@ -1158,7 +1183,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                   "d_q_gamma": "{d,q,γ}" if self.use_magnitudes else "{d,q}"}
             if sample_etas:
                 for k, v in acc.items():
-                    print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
+                    if free_etas_blocks[k]:
+                        print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
+                    else:
+                        print(f"  {bl[k]:14s}  : fixed")
             else:
                 print(f"  {'θ_φ fixed':14s}  : yes")
             if learn_beta:
@@ -1176,7 +1204,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "acceptance_eps":   ae/n_iter,
             "acceptance_nu":    an/n_iter if learn_nu else None,
             "acceptance_beta":  ab/n_iter if learn_beta else None,
-            "acceptance_etas":  {k: v/n_iter for k, v in acc.items()},
+            "acceptance_etas": {
+                k: (v / n_iter if free_etas_blocks[k] else None)
+                for k, v in acc.items()
+            },
             "last_state": {
                 "eps": ea, "nu": list(self.nu), "delta": list(self.delta),
                 "theta_phi": dict(self.theta_phi), "beta": self.beta,
@@ -1189,6 +1220,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "use_etas": True, "use_magnitudes": self.use_magnitudes,
             "learn_beta": learn_beta, "learn_nu": learn_nu,
             "sample_z": sample_z, "sample_etas": sample_etas,
+            "fixed_etas": dict(self.fixed_etas),
             "known_z": np.asarray(known_z, dtype=int) if known_z is not None else None,
             "am_history": {
                 "A_alpha":   np.array(hAa) if hAa else None,

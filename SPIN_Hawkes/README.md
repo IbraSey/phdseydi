@@ -26,37 +26,41 @@ cd SPIN-H
 ## Package layout
 
 ```text
+data/
+  catalog.py
+experiments/                    	  runnable experiment protocols
+  exp_ssgc/
+    experiment_1.py
+    experiment_2.py
+    experiment_3.py
+    experiment_4.py
+  exp_spinh/
+    experiment_5.py
+    experiment_6.py
+  first_test_ssgc.py                first SSGC test
+  first_test_spinh.py               first SPIN-H test
+figures/                        	  generated figures
+simulation/
+  process.py                        point-process simulation
+  tessellation.py                	  tessellation
+spatial/
+  domain.py
 spin_h/
-  figures/                        generated figures
-  experiments/                    runnable experiment protocols
-    exp_ssgc/
-      experiment_1.py
-      experiment_2.py
-      experiment_3.py
-      experiment_4.py
   models/
-    base.py                       common model interface
-    ssgc.py                       SSGC model
-    spinh.py                      SPIN-H model
-    kernels.py                    ETAS productivity, temporal and spatial kernels
+    base.py                       	common model interface
+    ssgc.py                      	  SSGC model
+    spinh.py                      	SPIN-H model
+    kernels.py                    	ETAS productivity, temporal and spatial kernels
   inference/
-    ssgc_gibbs.py                 SSGC Gibbs implementation
-    spinh_gibbs.py                SPIN-H Gibbs implementation
+    ssgc_gibbs.py                   SSGC Gibbs implementation
+    spinh_gibbs.py                  SPIN-H Gibbs implementation
     backends.py
-    results.py                    posterior summaries and diagnostics
-  simulation/
-    process.py                    point-process simulation
-    tessellation.py               tessellation
-  visualization/
-    plots.py
-  data/
-    catalog.py
-  spatial/
-    domain.py
-  config.py                       model and inference configuration
-  first_test_spinh.py              first SPIN-H test
-  how_to_use.md                    user guide
-  README.md
+    results.py                    	posterior summaries and diagnostics
+  config.py                       	model and inference configuration
+  how_to_use.md                     user guide
+visualization/
+  plots.py
+README.md
 ```
 
 
@@ -78,7 +82,7 @@ Vector figures are saved as PDF; raster figures are saved as PNG at **600 dpi** 
 If you use this repository, please cite the associated manuscript:
 
 ```bibtex
-@article{seydi:spin_h:2026,
+@article{seydi:package:2026,
     title = {XXX}, 
     author = {Ibrahim Seydi and Sophie Donnet and Merlin Keller and Joseph Muré and Julien Stoehr},
     year = {2026},

@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
-from SPIN_Hawkes import ETASParameters
+from package import ETASParameters
 from sklearn.exceptions import ConvergenceWarning
 
 try:
@@ -24,10 +24,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 EXPERIMENT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(PACKAGE_ROOT.parent))
+sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(EXPERIMENT_DIR))
 
-from SPIN_Hawkes import (
+from package import (
     GPParameters,
     SPINHGibbsConfig,
     SPINHModel,
@@ -224,7 +224,7 @@ VERBOSE = True
 VERBOSE_EVERY = 300
 LAMBDA_GRID_SIZE = 35
 
-RESULTS_DIR = PACKAGE_ROOT / "figures" / "experiments" / "exp_spin_h"
+RESULTS_DIR = PACKAGE_ROOT / "figures" / "experiments" / "exp_spinh"
 ERROR_PLOT_FLOOR = 1e-4
 
 
@@ -272,6 +272,7 @@ def run_realization(polygons, scenario, realization):
             learn_beta=True,
             beta_init=INITIAL_BETA,
             theta_priors=THETA_PRIORS,
+            fixed_etas={"alpha": scenario["etas"].alpha},
             sigma_mh_etas=SIGMA_MH_ETAS,
             sigma_mh_beta=SIGMA_MH_BETA,
             adaptation_start=200,
@@ -390,7 +391,7 @@ def plot_recovery_summary(records):
     axes[0].set_ylabel("Mean absolute relative error (log scale)")
     fig.suptitle("SPIN-H posterior recovery across increasing difficulty")
     fig.tight_layout()
-    save_figure(fig, "spin_h/experiment_5/posterior_recovery")
+    save_figure(fig, "package/experiment_5/posterior_recovery")
     plt.show()
     return fig
 
