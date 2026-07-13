@@ -43,20 +43,20 @@ LAMBDA_NU = 0.5
 DELTA = [1.5, 0.01]
 JITTER = 1e-5
 BURN_IN = 0.4
-N_ITER = 5000
-THIN = 3
-MALA_STEP = 0.095
+N_ITER = 100
+THIN = 2
+MALA_STEP = 0.05
 LEARN_NU = False
 USE_CALIBRATION = True
 T0_NU = 50
 STEP_NU_INIT = 0.0009
 VERBOSE = True
-VERBOSE_EVERY = 100
+VERBOSE_EVERY = 50
 SEED = 42
 NX, NY = 30, 30
 NX_POST, NY_POST = 60, 60
 XB, YB = (0.0, 2.0), (0.0, 2.0)
-N_CHAINS = 5
+N_CHAINS = 2
 
 
 # Profils de regions
@@ -76,14 +76,13 @@ PROFILES = {
 }
 
 T_BY_PROFILE = {
-    "1": {"A": 30.0, "B": 25.0, "C": 15.0},
-    "2": {"A": 60.0, "B": 40.0, "C": 40.0},
+    "1": {"A": 50.0, "B": 35.0, "C": 15.0},
+    "2": {"A": 80.0, "B": 60.0, "C": 40.0},
     "3": {"A": 20.0, "B": 25.0, "C": 15.0},
 }
 GRID_RES_BY_SETTING = {"A": 100,  "B": 300,  "C": 300}
 
 
-#%%
 # ====================
 # Fonctions latentes
 # ====================
@@ -149,7 +148,6 @@ def f_star_C(x, y):
     return (step + ridge).reshape(np.shape(x))
 
 
-#%%
 # =====================
 # Helpers picklables
 # =====================
@@ -172,7 +170,6 @@ def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
 
     return (mu_tilde * expit(f_func(x_flat, y_flat))).reshape(np.shape(x))
 
-#%%
 
 def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
               Xb, Yb, nu_init, lambda_nu, delta, jitter,
@@ -225,7 +222,6 @@ def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
 
     return results_k, list(sampler_k.nu)
 
-#%%
 # ===========================
 # Affichage des diagnostics
 # ===========================
@@ -390,20 +386,18 @@ def run_setting(setting_name, f_star_func, profile_name, savefigure,
 
     return all_results, all_outputs, all_nu_finals
 
-#%%
 
 # ================
 # ----- Main -----
 # ================
 if __name__ == "__main__":
 
-    #%%
-    SAVEFIGURE = True
-    F_STAR = {"A": f_star_A, "B": f_star_B, "C": f_star_C}
+    SAVEFIGURE = False
+    F_STAR = {"A": f_star_A, "B": f_star_B} # , "C": f_star_C
 
-    for profile_name in ["1", "2", "3"]:
+    for profile_name in ["1", "2"]: # , "3"
         # break
-        for setting_name in ["A", "B", "C"]:
+        for setting_name in ["A", "B"]: #, "C"
             # break
             run_setting(
                 setting_name=setting_name,

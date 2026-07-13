@@ -302,8 +302,7 @@ fit = model.gibbs(
         use_calibration=True,
         verbose=True,
         verbose_every=600,
-        learn_beta=True,
-        beta_init=2.0,
+        beta_init=2.3,
         sigma_mh_etas=0.05,
         sigma_mh_beta=0.1,
         adaptation_start=200,
@@ -379,14 +378,24 @@ melange de la chaine. `thin=1` ou `thin=2` est un bon point de depart.
 
 | Parametre | Role |
 |---|---|
-| `learn_beta` | Met a jour le parametre Gutenberg-Richter `beta` |
-| `beta_init` | Valeur initiale de `beta` |
+| `beta_init` | Valeur initiale de `beta` lorsqu'il est appris |
+| `fixed_beta` | Valeur fixe de `beta`; `None` apprend `beta` par defaut |
 | `beta_prior` | Hyperparametres Gamma `a_beta`, `b_beta` |
 | `theta_priors` | Hyperparametres Gamma des parametres ETAS |
+| `fixed_etas` | Valeurs ETAS fixees; les parametres absents sont appris |
 | `sigma_mh_etas` | Echelle initiale des propositions ETAS |
 | `sigma_mh_beta` | Echelle initiale de la proposition de `beta` |
 | `adaptation_start` | Debut de l'Adaptive Metropolis |
 | `proposal_jitter` | Regularisation numerique des covariances adaptatives |
+
+Par defaut, `beta` et tous les parametres ETAS absents de `fixed_etas` sont
+appris. Pour fixer explicitement le parametre de magnitude :
+
+```python
+config = SPINHGibbsConfig(fixed_beta=2.3)
+```
+
+Lorsque `fixed_beta` est renseigne, sa valeur remplace `beta_init`.
 
 Exemple de priors ETAS informatifs :
 
