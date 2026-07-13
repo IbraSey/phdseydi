@@ -1,3 +1,74 @@
+# %%
+
+#from SIGMA_GP_PP_Gibbs import *
+
+import os
+import sys
+
+# phebus_path = os.getenv("PHEBUS_PATH")
+# if not phebus_path or not os.path.isdir(phebus_path):
+#     raise EnvironmentError(
+#         "PHEBUS_PATH must be set to the directory containing the phebus package."
+#     )
+from pathlib import Path
+file_path = Path(__file__).resolve()
+ROOT = file_path.parent.parent
+phebus_path = ROOT / "lib_py"
+sys.path.insert(0, str(phebus_path) )
+
+
+import phebus
+
+# import sys, os
+# sys.path.append( os.getenv("PHEBUS_PATH")) # for importing phebus
+from phebus.pybus.frclass import FrenchDomainsSourceModel
+
+import pandas as pd
+
+
+#%%
+#############
+# Load Case #
+#############
+
+import os
+from phebus.pybus.frclass import FrenchDomainsSourceModel
+# phebus_path = os.path.abspath("./phebus")
+# phebus_root = "/home/g80884/Documents/phebus"
+# phebus_root = os.path.join( phebus_path, "phebus" )
+demo_path =  phebus_path / "phebus" / "demos" / "FrenchDomainsAnalysis"
+
+SM = FrenchDomainsSourceModel(
+    Mmin=3.,
+    PWD=demo_path,
+    FILE_DOMAINS= demo_path / "data" / "domains" / "domaines_xy.csv"
+)
+
+catalog = SM.catalog[SM.catalog.year >= 1965]
+
+D = np.vstack((catalog.X, catalog.Y, catalog.magnitude)).T
+
+T = max(catalog.year) - min(catalog.year)
+
+# Domains
+zones = [zone.get_polygon_xy() for zone in SM.zones]
+areas = np.array([zone.get_area_km2() for zone in SM.zones])
+zone_names = [zone.name for zone in SM.zones]
+
+# SM.reduce_catalog(SM.catalog, SM.magnitudes, SM.first_years, SM.last_year)
+
+# props = np.array([zone.reduced_catalog.counts.sum() for zone in SM.zones])
+
+# values = props / (T * areas) * 1e6
+
+# values = np.arange(len(zone_names))**2 + 1
+
+values = areas
+SM.plot_values_map( values, FIGURE_PATH=os.getcwd(),  FIGURE_NAME="lambdas_and_domains", catalog=catalog, coastline=SM.coastlines, scale=5., xticks= zone_names)
+
+
+
+
 #%%
 
 # import sys
@@ -9,35 +80,30 @@ import openturns as ot
 from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel
 
 
-DATA_PATH = ".../.../....csv"
+x_arr = catalog.X 
+y_arr = catalog.Y
+m_arr = catalog.magnitude
+t_arr = catalog.year
 
-df = pd.read_csv(DATA_PATH)
-x_arr = df["x"].to_numpy()
-y_arr = df["y"].to_numpy()
-t_arr = df["t"].to_numpy()
+domains = zones
 
-domains = [
-    # domain_1,
-    # domain_2,
-]
-
-X_BOUNDS = ...
-Y_BOUNDS = ...
-DURATION = ...
+X_BOUNDS = float()
+Y_BOUNDS = float()
+DURATION = T
 
 
-# Model and Gibbs configuration
+# Prior 
 NU_INIT = (5.0, 0.2)
 LAMBDA_NU = 0.5
 DELTA = (1.5, 0.01)
-JITTER = 1e-5
 
+# Model and Gibbs configuration
 MALA_STEP = 0.095
+JITTER = 1e-5
 LEARN_NU = False
 USE_CALIBRATION = True
 T0_NU = 50
 STEP_NU_INIT = 0.0009
-
 N_ITER = 2000
 THIN = 2
 BURN_IN = 0.5

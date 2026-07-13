@@ -5,3 +5,6 @@
 *.pdf
 *.jpg
 *.jpeg
+
+__pycache__/
+*.py[cod]

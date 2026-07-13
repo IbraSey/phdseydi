@@ -1,4 +1,4 @@
-#%% Imports
+#%% 
 
 from SIGMA_GP_PP_Gibbs import *
 
@@ -73,10 +73,7 @@ SM.plot_values_map( values, FIGURE_PATH=os.getcwd(),  FIGURE_NAME="lambdas_and_d
 ####################################
 
 # prior on zone effects
-T0 = 0.1*T
-lambda0 = 10.
-a = T0 * lambda0 / areas
-b = T0 / areas
+prior_weight = 0.1
 
 # Upper bound on size of augmented Poisson process
 Nmax = 15000#int(ot.Poisson(LambdaMax*T).computeQuantile(1-1e-10)[0])*3
@@ -94,8 +91,9 @@ D_select = D[select]
 
 #%% Build posterior sample
 gibbs.setD(D_select[:,:2])
-gibbs.calibrate_GP_and_set_prior()
+gibbs.calibrate_GP_and_set_prior(prior_weight=prior_weight)
 
+#%%
 savefile = "posterior_sample.csv"
 # Check first if inference has been run
 if os.path.exists(savefile):
