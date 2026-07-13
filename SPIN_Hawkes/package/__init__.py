@@ -18,11 +18,16 @@ from visualization import (
     save_figure,
 )
 
-from .config import ETASParameters, GPParameters, GibbsConfig, SPINHGibbsConfig
+from .config import (
+    ETASParameters,
+    GPParameters,
+    GibbsConfig,
+    SPINHGibbsConfig,
+    SPINHVIConfig,
+)
 from .inference import (
     GibbsResults,
     SPINHVI,
-    SPINHVIConfig,
     SPINHVIResults,
     SPINHVIState,
     SparseGP,

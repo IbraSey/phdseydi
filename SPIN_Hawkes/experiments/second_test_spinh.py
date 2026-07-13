@@ -25,11 +25,11 @@ from package import (
 
 X_BOUNDS = (0.0, 2.0)
 Y_BOUNDS = (0.0, 2.0)
-DURATION = 110.0
+DURATION = 200.0
 DOMAIN_INTENSITIES = (8.0, 1.0, 2.0, 8.0, 6.0, 2.0)
 SEED = 42
 
-N_ITER = 500
+N_ITER = 700
 TOLERANCE = 1e-6
 USE_SPARSE_GP = True
 MAKE_PLOTS = True
@@ -78,6 +78,7 @@ def latent_field(x, y):
         for weight, mean in zip(weights, means)
     )
 
+
 def print_parameter_summary(summary):
     print("\nVI ETAS summary")
     print(f"{'param':<8} {'true':>8} {'estimate':>10}")
@@ -94,7 +95,7 @@ def print_intensity_metrics(name, estimated, truth):
     print(f"RMSE = {np.sqrt(np.mean(error**2)):.4f}")
     print(f"MAE = {np.mean(np.abs(error)):.4f}")
     print(f"mean estim = {estimated.mean():.4f}")
-    print(f"mean true = {truth.mean():.4f}")
+    print(f"mean true  = {truth.mean():.4f}")
 
 
 def main():
@@ -154,15 +155,17 @@ def main():
             full_gp_max_events=1200,
             latent_poisson_damping=0.35,
             latent_poisson_max_multiplier=1.0,
+            spatial_compensator_grid=10,
             etas_update_start=25,
+            etas_update_every=20,
+            etas_initial_relative_variance=0.02,
             eps_bounds=(-20.0, 6.0),
             f_bounds=(-12.0, 12.0),
-            learn_beta=True,
-            beta_init=2.0,
+            beta_init=2.3,
             theta_priors=THETA_PRIORS,
-            #fixed_etas={"alpha": TRUE_ETAS.alpha},
             parameter_damping=0.5,
-            max_optimizer_iter=80,
+            max_optimizer_iter=5,
+            etas_quadrature_nodes=4,
             random_seed=SEED,
         ),
     )
