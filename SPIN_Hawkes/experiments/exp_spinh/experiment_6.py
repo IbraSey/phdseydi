@@ -66,7 +66,7 @@ from experiment_5 import (
 )
 
 
-SCENARIO_NAMES = ("easy_compact_structured", "hard_diffuse_triggering")
+SCENARIO_NAMES = ("simple_well_conditioned", "complex_diffuse_triggering")
 SCENARIOS = [scenario for scenario in ALL_SCENARIOS if scenario["name"] in SCENARIO_NAMES]
 
 N_REALIZATIONS = 2
@@ -86,7 +86,6 @@ MODES = [
         "name": "full_gibbs",
         "description": "sample Z and theta",
         "sample_z": True,
-        "sample_etas": True,
         "known_z": False,
         "true_theta": False,
     },
@@ -94,7 +93,6 @@ MODES = [
         "name": "oracle_theta_sample_z",
         "description": "theta known, sample Z",
         "sample_z": True,
-        "sample_etas": False,
         "known_z": False,
         "true_theta": True,
     },
@@ -102,7 +100,6 @@ MODES = [
         "name": "oracle_z_sample_theta",
         "description": "Z known, sample theta",
         "sample_z": False,
-        "sample_etas": True,
         "known_z": True,
         "true_theta": False,
     },
@@ -189,12 +186,14 @@ def run_mode(polygons, scenario, simulation, realization, mode):
             verbose=VERBOSE,
             verbose_every=VERBOSE_EVERY,
             use_calibration=True,
-            learn_beta=True,
-            beta_init=scenario["beta"] if mode["true_theta"] else INITIAL_BETA,
+            beta_init=INITIAL_BETA,
+            fixed_beta=scenario["beta"] if mode["true_theta"] else None,
             theta_priors=THETA_PRIORS,
             sample_z=mode["sample_z"],
             known_z=simulation.branching_labels if mode["known_z"] else None,
-            sample_etas=mode["sample_etas"],
+            fixed_etas=(
+                scenario["etas"].as_dict() if mode["true_theta"] else {}
+            ),
             sigma_mh_etas=SIGMA_MH_ETAS,
             sigma_mh_beta=SIGMA_MH_BETA,
             adaptation_start=200,

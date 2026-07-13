@@ -32,6 +32,18 @@ class SPINHVIResults:
     def etas_mean(self) -> ETASParameters:
         return self.state.etas.parameters_mean
 
+    def etas_gamma_parameters(self) -> dict:
+        """Return shape/rate summaries for learned ETAS Gamma factors."""
+        return {
+            name: factor.as_dict()
+            for name, factor in self.state.etas.gamma_factors.items()
+        }
+
+    def beta_gamma_parameters(self) -> dict | None:
+        """Return shape/rate summary for q(beta), or None when beta is fixed."""
+        factor = self.state.etas.beta_gamma
+        return None if factor is None else factor.as_dict()
+
     def summary(self) -> dict:
         """Return posterior means and diagnostics in a compact dictionary."""
         return {
@@ -55,6 +67,9 @@ class SPINHVIResults:
             "parent_probabilities": self.state.branching.probabilities.copy(),
             "theta_phi_hat": self.state.etas.parameters_mean.as_dict(),
             "beta_hat": self.beta_mean(),
+            "theta_phi_gamma": self.etas_gamma_parameters(),
+            "beta_gamma": self.beta_gamma_parameters(),
+            "fixed_etas": dict(self.state.etas.fixed_etas),
             "latent_poisson_expected_counts": (
                 self.state.latent_poisson.expected_counts_by_domain.copy()
             ),
@@ -304,10 +319,15 @@ class GibbsResults(Mapping):
         for jitter in (self.model.jitter, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4):
             try:
                 covariance_ot = ot.CovarianceMatrix(
-                    (conditional_covariance + jitter * np.eye(x_flat.size)).tolist()
+                    (
+                        conditional_covariance
+                        + jitter * np.eye(x_flat.size)
+                    ).tolist()
                 )
                 latent_samples = np.asarray(
-                    ot.Normal(ot.Point(mean.tolist()), covariance_ot).getSample(n_samples)
+                    ot.Normal(
+                        ot.Point(mean.tolist()), covariance_ot
+                    ).getSample(n_samples)
                 ).T
                 break
             except Exception as error:
@@ -794,7 +814,7 @@ class GibbsResults(Mapping):
         """Plot and summarize the posterior SSGC background intensity."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         mesh, vertices = self._make_mesh(nx, ny)
-        if vertices.shape[0] > 22500:
+        if vertices.shape[0] > 10000:
             raise ValueError(f"Mesh too large: {vertices.shape[0]} points")
 
         x_grid = vertices[:, 0]
@@ -952,7 +972,12 @@ class GibbsResults(Mapping):
             chain = self.etas_chain
             names = self.raw.get("theta_phi_names", [])
             chains = [(name, chain[:, index]) for index, name in enumerate(names)]
-            if self.raw.get("beta") is not None:
+            if (
+                self.raw.get("beta") is not None
+                and self.raw.get(
+                    "sample_beta", self.raw.get("acceptance_beta") is not None
+                )
+            ):
                 chains.append(("beta", np.asarray(self.raw["beta"])))
             tex = {
                 "A": r"$A$", "alpha": r"$\alpha$", "c": r"$c$", "p": r"$p$",
@@ -1052,7 +1077,12 @@ class GibbsResults(Mapping):
             names = self.raw.get("theta_phi_names", [])
             for index, name in enumerate(names):
                 plots.append((name, self.etas_chain[burn:, index]))
-            if self.raw.get("beta") is not None:
+            if (
+                self.raw.get("beta") is not None
+                and self.raw.get(
+                    "sample_beta", self.raw.get("acceptance_beta") is not None
+                )
+            ):
                 plots.append((r"$\beta$", np.asarray(self.raw["beta"])[burn:]))
 
         fig, axes = plt.subplots(len(plots), 1, figsize=(figsize[0], 3.0 * len(plots)), squeeze=False)

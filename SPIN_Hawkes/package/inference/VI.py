@@ -1,129 +1,15 @@
-"""Simple hybrid CAVI inference for the SPIN-H model.
-
-The implementation follows the Polya-Gamma augmented updates used by SPIN-H,
-but keeps the first usable version intentionally modest:
-
-- q(Z) is categorical for each event;
-- q(omega) is represented through its Polya-Gamma expectation;
-- q(pi_S) is represented by deterministic quadrature expected counts;
-- q(epsilon) is updated by a Laplace/Newton step;
-- q(f) is a Gaussian approximation at observed locations;
-- ETAS and beta are updated as weighted MAP point estimates with SciPy.
-
-This is therefore a practical CAVI/MAP hybrid rather than a fully conjugate
-mean-field implementation for every ETAS parameter. Parameters can be fixed with
-``fixed_etas`` and ``fixed_beta`` in the same spirit as the Gibbs sampler.
-"""
-
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.optimize import minimize, minimize_scalar
-from scipy.special import expit, logsumexp
+from scipy.optimize import minimize
+from scipy.special import digamma, gammaln, logsumexp, roots_genlaguerre
+from scipy.stats import gamma as gamma_distribution
 
-from package.config import ETASParameters
+from package.config import ETASParameters, SPINHVIConfig
 from data.catalog import EventCatalog
 from ..models.spinh import SPINHModel
 from .backends import SparseGP
 from .results import SPINHVIResults
-
-
-ETAS_PARAMETER_NAMES = ("A", "alpha", "c", "p", "d", "q", "gamma")
-
-
-@dataclass(frozen=True)
-class SPINHVIConfig:
-    """Configuration for the simple SPIN-H CAVI/MAP hybrid routine."""
-
-    n_iter: int = 200
-    tolerance: float = 1e-4
-    verbose: bool = True
-    verbose_every: int = 10
-    random_seed: int | None = None
-
-    update_z: bool = True
-    update_polya_gamma: bool = True
-    update_latent_poisson: bool = True
-    update_gp: bool = True
-    update_eps: bool = True
-    update_etas: bool = True
-    learn_beta: bool = True
-
-    fixed_etas: dict[str, float] = field(default_factory=dict)
-    fixed_beta: float | None = None
-    beta_init: float = 2.3
-    beta_prior: dict[str, float] = field(
-        default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
-    )
-    theta_priors: dict[str, float] = field(default_factory=dict)
-
-    quadrature_nx: int = 30
-    quadrature_ny: int = 30
-    eps_newton_steps: int = 8
-    eps_damping: float = 1.0
-    eps_bounds: tuple[float, float] = (-20.0, 8.0)
-    f_bounds: tuple[float, float] = (-15.0, 15.0)
-    latent_poisson_damping: float = 0.5
-    latent_poisson_max_multiplier: float | None = 1.5
-    etas_update_start: int = 10
-    parameter_damping: float = 0.6
-    max_optimizer_iter: int = 80
-    full_gp_max_events: int = 800
-    gp_backend: str = "exact"
-    sparse_gp: object | None = None
-    spatial_compensator_grid: int = 0
-    jitter: float = 1e-6
-
-    def __post_init__(self):
-        if self.n_iter <= 0:
-            raise ValueError("n_iter must be positive.")
-        if self.tolerance <= 0:
-            raise ValueError("tolerance must be positive.")
-        if self.verbose_every <= 0:
-            raise ValueError("verbose_every must be positive.")
-        if self.quadrature_nx <= 1 or self.quadrature_ny <= 1:
-            raise ValueError("quadrature grid sizes must be greater than one.")
-        if self.eps_newton_steps <= 0:
-            raise ValueError("eps_newton_steps must be positive.")
-        if not 0 < self.eps_damping <= 1:
-            raise ValueError("eps_damping must be in (0, 1].")
-        if self.eps_bounds[0] >= self.eps_bounds[1]:
-            raise ValueError("eps_bounds must be increasing.")
-        if self.f_bounds[0] >= self.f_bounds[1]:
-            raise ValueError("f_bounds must be increasing.")
-        if not 0 < self.latent_poisson_damping <= 1:
-            raise ValueError("latent_poisson_damping must be in (0, 1].")
-        if (
-            self.latent_poisson_max_multiplier is not None
-            and self.latent_poisson_max_multiplier <= 0
-        ):
-            raise ValueError("latent_poisson_max_multiplier must be positive or None.")
-        if self.etas_update_start < 0:
-            raise ValueError("etas_update_start must be non-negative.")
-        if not 0 < self.parameter_damping <= 1:
-            raise ValueError("parameter_damping must be in (0, 1].")
-        if self.max_optimizer_iter <= 0:
-            raise ValueError("max_optimizer_iter must be positive.")
-        if self.full_gp_max_events <= 0:
-            raise ValueError("full_gp_max_events must be positive.")
-        if str(self.gp_backend).lower() not in {"exact", "sparse"}:
-            raise ValueError("gp_backend must be 'exact' or 'sparse'.")
-        if self.sparse_gp is not None and str(self.gp_backend).lower() != "sparse":
-            raise ValueError("sparse_gp requires gp_backend='sparse'.")
-        if self.spatial_compensator_grid < 0:
-            raise ValueError("spatial_compensator_grid must be non-negative.")
-        if self.jitter <= 0:
-            raise ValueError("jitter must be positive.")
-        if self.beta_init <= 0:
-            raise ValueError("beta_init must be positive.")
-        if self.fixed_beta is not None and self.fixed_beta <= 0:
-            raise ValueError("fixed_beta must be positive.")
-        unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
-        if unknown:
-            raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown)}")
-        for name, value in self.fixed_etas.items():
-            if not isinstance(value, (int, float)):
-                raise ValueError(f"fixed_etas[{name!r}] must be numeric.")
 
 
 @dataclass
@@ -190,11 +76,58 @@ class EpsilonFactor:
 
 
 @dataclass
+class GammaFactor:
+    """Gamma(shape, rate) variational factor for one positive scalar."""
+
+    shape: float
+    rate: float
+
+    def __post_init__(self):
+        self.shape = float(self.shape)
+        self.rate = float(self.rate)
+        if self.shape <= 0 or self.rate <= 0:
+            raise ValueError("GammaFactor shape and rate must be positive.")
+
+    @property
+    def mean(self) -> float:
+        return self.shape / self.rate
+
+    @property
+    def expected_log(self) -> float:
+        return float(digamma(self.shape) - np.log(self.rate))
+
+    @property
+    def entropy(self) -> float:
+        return float(
+            self.shape
+            - np.log(self.rate)
+            + gammaln(self.shape)
+            + (1.0 - self.shape) * digamma(self.shape)
+        )
+
+    def damped(self, proposed: "GammaFactor", damping: float) -> "GammaFactor":
+        return GammaFactor(
+            shape=(1.0 - damping) * self.shape + damping * proposed.shape,
+            rate=(1.0 - damping) * self.rate + damping * proposed.rate,
+        )
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "shape": float(self.shape),
+            "rate": float(self.rate),
+            "mean": float(self.mean),
+            "expected_log": float(self.expected_log),
+        }
+
+
+@dataclass
 class ETASFactor:
-    """Point-estimate variational block for ETAS and magnitude parameters."""
+    """Gamma variational block for ETAS and magnitude parameters."""
 
     parameters_mean: ETASParameters
     beta_mean: float
+    gamma_factors: dict[str, GammaFactor] = field(default_factory=dict)
+    beta_gamma: GammaFactor | None = None
     fixed_etas: dict[str, float] = field(default_factory=dict)
 
 
@@ -459,53 +392,243 @@ class SPINHVI:
             names.extend(["alpha", "gamma"])
         return [name for name in names if name not in self.config.fixed_etas]
 
-    def _etas_optimizer_bounds(self, names: list[str]) -> list[tuple[float, float]]:
-        raw_bounds = {
-            "A": (1e-4, 5.0),
-            "alpha": (1e-6, 3.0),
-            "c": (1e-4, 1.0),
-            "p": (0.05, 4.0),
-            "d": (1e-4, 2.0),
-            "q": (0.05, 5.0),
-            "gamma": (1e-6, 3.0),
-        }
-        return [(np.log(raw_bounds[name][0]), np.log(raw_bounds[name][1])) for name in names]
+    @staticmethod
+    def _factor_name(parameter_name: str) -> str:
+        return {
+            "p": "p_minus_1",
+            "q": "q_minus_1",
+        }.get(parameter_name, parameter_name)
 
-    def _params_to_vector(self, params: ETASParameters, names: list[str]) -> np.ndarray:
-        values = []
-        data = params.as_dict()
-        for name in names:
-            value = max(float(data[name]), self.config.jitter)
-            if name in {"p", "q"}:
-                values.append(np.log(max(value - 1.0, self.config.jitter)))
-            else:
-                values.append(np.log(value))
-        return np.asarray(values, dtype=float)
+    @staticmethod
+    def _parameter_name(factor_name: str) -> str:
+        return {
+            "p_minus_1": "p",
+            "q_minus_1": "q",
+        }.get(factor_name, factor_name)
 
-    def _vector_to_params(self, vector: np.ndarray, names: list[str]) -> ETASParameters:
-        values = self.state.etas.parameters_mean.as_dict()
-        for name, raw in zip(names, vector):
-            value = float(np.exp(np.clip(raw, -30.0, 30.0)))
-            values[name] = 1.0 + value if name in {"p", "q"} else value
-        values.update(self.config.fixed_etas)
-        if not self.model.etas_parameters.marked:
-            values.pop("alpha", None)
-            values.pop("gamma", None)
-        return ETASParameters(**values)
+    def _free_etas_factor_names(self, include_A: bool = True) -> list[str]:
+        names = [self._factor_name(name) for name in self._free_etas_names()]
+        if not include_A:
+            names = [name for name in names if name != "A"]
+        return names
 
-    def _damped_parameters(
-        self, current: ETASParameters, proposed: ETASParameters
+    def _fixed_or_factor_value(self, name: str, moment: str = "mean") -> float:
+        parameter_name = self._parameter_name(name)
+        if parameter_name in self.config.fixed_etas:
+            value = float(self.config.fixed_etas[parameter_name])
+            if moment == "log":
+                return np.log(max(value, self.config.jitter))
+            if name in {"p_minus_1", "q_minus_1"}:
+                shifted = max(value - 1.0, self.config.jitter)
+                return np.log(shifted) if moment == "log_shifted" else shifted
+            return np.log(max(value - 1.0, self.config.jitter)) if moment == "log_shifted" else value
+        factor_name = self._factor_name(parameter_name)
+        factor = self.state.etas.gamma_factors[factor_name]
+        if moment == "log":
+            return factor.expected_log
+        if moment == "log_shifted":
+            return factor.expected_log
+        return factor.mean
+
+    def _etas_mean_from_factors(
+        self,
+        factors: dict[str, GammaFactor] | None = None,
     ) -> ETASParameters:
-        damping = self.config.parameter_damping
-        current_values = current.as_dict()
-        proposed_values = proposed.as_dict()
+        factors = self.state.etas.gamma_factors if factors is None else factors
+        current = self.state.etas.parameters_mean.as_dict()
         values = {}
-        for name, value in proposed_values.items():
-            if name in self.config.fixed_etas:
-                values[name] = self.config.fixed_etas[name]
-            else:
-                values[name] = (1.0 - damping) * current_values[name] + damping * value
-        return ETASParameters(**values)
+        for name in ["A", "c", "d"]:
+            values[name] = (
+                float(self.config.fixed_etas[name])
+                if name in self.config.fixed_etas
+                else factors[name].mean
+            )
+        for name, factor_name in [("p", "p_minus_1"), ("q", "q_minus_1")]:
+            values[name] = (
+                float(self.config.fixed_etas[name])
+                if name in self.config.fixed_etas
+                else 1.0 + factors[factor_name].mean
+            )
+        if self.model.etas_parameters.marked:
+            for name in ["alpha", "gamma"]:
+                values[name] = (
+                    float(self.config.fixed_etas[name])
+                    if name in self.config.fixed_etas
+                    else factors[name].mean
+                )
+        else:
+            current.pop("alpha", None)
+            current.pop("gamma", None)
+        current.update(values)
+        return ETASParameters(**current)
+
+    def _sync_etas_means(self):
+        self.state.etas.parameters_mean = self._parameters_with_fixed(
+            self._etas_mean_from_factors()
+        )
+        if self.state.etas.beta_gamma is not None:
+            self.state.etas.beta_mean = self.state.etas.beta_gamma.mean
+
+    @staticmethod
+    def _gamma_prior_log_density(value: float, a: float, b: float) -> float:
+        if value <= 0:
+            return -np.inf
+        return float(a * np.log(b) - gammaln(a) + (a - 1.0) * np.log(value) - b * value)
+
+    @staticmethod
+    def _gamma_prior_entropy_term(factor: GammaFactor, a: float, b: float) -> float:
+        expected_log_prior = (
+            a * np.log(b)
+            - gammaln(a)
+            + (a - 1.0) * factor.expected_log
+            - b * factor.mean
+        )
+        return float(expected_log_prior + factor.entropy)
+
+    def _gamma_factor_quadrature(
+        self,
+        factor: GammaFactor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_nodes = self.config.etas_quadrature_nodes
+        if factor.shape < 160.0:
+            nodes, weights = roots_genlaguerre(n_nodes, factor.shape - 1.0)
+            weight_sum = float(np.sum(weights))
+            if (
+                np.all(np.isfinite(nodes))
+                and np.all(np.isfinite(weights))
+                and np.isfinite(weight_sum)
+                and weight_sum > 0.0
+            ):
+                return nodes / factor.rate, weights / weight_sum
+
+        # Generalized-Laguerre weights can overflow when shape is very large.
+        # Integrating over Gamma quantiles is less exact but remains stable.
+        quantile_nodes, quantile_weights = np.polynomial.legendre.leggauss(n_nodes)
+        probabilities = 0.5 * (quantile_nodes + 1.0)
+        values = gamma_distribution.ppf(
+            probabilities,
+            a=factor.shape,
+            scale=1.0 / factor.rate,
+        )
+        return values, 0.5 * quantile_weights
+
+    def _gamma_quadrature(self, factor_name: str) -> tuple[np.ndarray, np.ndarray]:
+        parameter_name = self._parameter_name(factor_name)
+        if parameter_name in self.config.fixed_etas:
+            value = float(self.config.fixed_etas[parameter_name])
+            if factor_name in {"p_minus_1", "q_minus_1"}:
+                value -= 1.0
+            return np.asarray([value], dtype=float), np.asarray([1.0], dtype=float)
+        factor = self.state.etas.gamma_factors[factor_name]
+        return self._gamma_factor_quadrature(factor)
+
+    def _positive_quadrature(
+        self,
+        factor: GammaFactor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self._gamma_factor_quadrature(factor)
+
+    def _expected_log_dt_plus_c(self, dt: np.ndarray) -> np.ndarray:
+        if "c" in self.config.fixed_etas:
+            return np.log(dt + float(self.config.fixed_etas["c"]))
+        c_nodes, c_weights = self._gamma_quadrature("c")
+        values = np.zeros_like(dt, dtype=float)
+        for c_value, weight in zip(c_nodes, c_weights):
+            values += weight * np.log(dt + c_value)
+        return values
+
+    def _expected_temporal_compensator(self) -> np.ndarray:
+        remaining = np.maximum(self.model.duration - self.catalog.t, 0.0)
+        c_nodes, c_weights = self._gamma_quadrature("c")
+        p_nodes, p_weights = self._gamma_quadrature("p_minus_1")
+        expectation = np.zeros_like(remaining, dtype=float)
+        for c_value, c_weight in zip(c_nodes, c_weights):
+            log_ratio = np.log(c_value) - np.log(remaining + c_value)
+            for p_minus_1, p_weight in zip(p_nodes, p_weights):
+                expectation += c_weight * p_weight * (
+                    1.0 - np.exp(np.clip(p_minus_1 * log_ratio, -60.0, 0.0))
+                )
+        return np.clip(expectation, 0.0, 1.0)
+
+    def _expected_exp_alpha_dm(self, dm: np.ndarray) -> np.ndarray:
+        if not self.model.etas_parameters.marked:
+            return np.ones_like(dm, dtype=float)
+        if "alpha" in self.config.fixed_etas:
+            return np.exp(np.clip(float(self.config.fixed_etas["alpha"]) * dm, -60.0, 60.0))
+        alpha_nodes, alpha_weights = self._gamma_quadrature("alpha")
+        values = np.zeros_like(dm, dtype=float)
+        for alpha, weight in zip(alpha_nodes, alpha_weights):
+            values += weight * np.exp(np.clip(alpha * dm, -60.0, 60.0))
+        return values
+
+    def _expected_log_spatial_tail(
+        self,
+        r2: np.ndarray,
+        dm: np.ndarray,
+    ) -> np.ndarray:
+        d_nodes, d_weights = self._gamma_quadrature("d")
+        gamma_nodes = np.asarray([0.0], dtype=float)
+        gamma_weights = np.asarray([1.0], dtype=float)
+        if self.model.etas_parameters.marked:
+            gamma_nodes, gamma_weights = self._gamma_quadrature("gamma")
+        values = np.zeros_like(r2, dtype=float)
+        for d_value, d_weight in zip(d_nodes, d_weights):
+            for gamma_value, gamma_weight in zip(gamma_nodes, gamma_weights):
+                scale = d_value * np.exp(np.clip(gamma_value * dm, -60.0, 60.0))
+                values += d_weight * gamma_weight * np.log1p(r2 / np.maximum(scale, self.config.jitter))
+        return values
+
+    def _pair_expected_log_etas(self, child_idx, parent_idx) -> np.ndarray:
+        child_idx = np.atleast_1d(np.asarray(child_idx, dtype=int))
+        parent_idx = np.atleast_1d(np.asarray(parent_idx, dtype=int))
+        if child_idx.size == 1 and parent_idx.size > 1:
+            child_idx = np.full(parent_idx.shape, child_idx.item(), dtype=int)
+        elif parent_idx.size == 1 and child_idx.size > 1:
+            parent_idx = np.full(child_idx.shape, parent_idx.item(), dtype=int)
+        elif child_idx.size != parent_idx.size:
+            raise ValueError("child_idx and parent_idx must be broadcastable.")
+
+        dt = self.catalog.t[child_idx] - self.catalog.t[parent_idx]
+        valid = dt > 0
+        out = np.full(dt.shape, -np.inf, dtype=float)
+        if not np.any(valid):
+            return out
+
+        dx = self.catalog.x[child_idx[valid]] - self.catalog.x[parent_idx[valid]]
+        dy = self.catalog.y[child_idx[valid]] - self.catalog.y[parent_idx[valid]]
+        r2 = dx**2 + dy**2
+        dm = self._magnitudes()[parent_idx[valid]] - self.model.magnitude_min
+        alpha_mean = (
+            0.0
+            if not self.model.etas_parameters.marked
+            else self._fixed_or_factor_value("alpha")
+        )
+        gamma_mean = (
+            0.0
+            if not self.model.etas_parameters.marked
+            else self._fixed_or_factor_value("gamma")
+        )
+        p_minus_1_mean = self._fixed_or_factor_value("p_minus_1")
+        q_minus_1_mean = self._fixed_or_factor_value("q_minus_1")
+        temporal = (
+            self._fixed_or_factor_value("p_minus_1", "log_shifted")
+            + p_minus_1_mean * self._fixed_or_factor_value("c", "log")
+            - (1.0 + p_minus_1_mean) * self._expected_log_dt_plus_c(dt[valid])
+        )
+        spatial = (
+            self._fixed_or_factor_value("q_minus_1", "log_shifted")
+            - np.log(np.pi)
+            - self._fixed_or_factor_value("d", "log")
+            - gamma_mean * dm
+            - (1.0 + q_minus_1_mean) * self._expected_log_spatial_tail(r2, dm)
+        )
+        out[valid] = (
+            self._fixed_or_factor_value("A", "log")
+            + alpha_mean * dm
+            + temporal
+            + spatial
+        )
+        return out
     
     def _triggering_compensator(self, params: ETASParameters) -> float:
         magnitudes = self._magnitudes()
@@ -525,57 +648,108 @@ class SPINHVI:
             spatial = np.ones(len(self.catalog), dtype=float)
         return float(np.sum(productivity * temporal * spatial))
     
-    def _etas_log_prior(self, params: ETASParameters) -> float:
-        values = params.as_dict()
-        total = 0.0
-        for name, value in values.items():
-            shifted = value - 1.0 if name in {"p", "q"} else value
-            if shifted <= 0:
-                return -np.inf
-            a = self.priors.get(f"a_{name}", 1.0)
-            b = self.priors.get(f"b_{name}", 0.0)
-            total += (a - 1.0) * np.log(shifted) - b * shifted
-        return float(total)
+    def _expected_spatial_compensator(self) -> np.ndarray:
+        if self.config.spatial_compensator_grid <= 0:
+            return np.ones(len(self.catalog), dtype=float)
+        params = self.state.etas.parameters_mean
+        return self.model.spatial_compensator(
+            self.catalog.x,
+            self.catalog.y,
+            self._magnitudes(),
+            params,
+            n_grid=self.config.spatial_compensator_grid,
+        )
 
-    def _etas_log_posterior(self, params: ETASParameters) -> float:
-        values = params.as_dict()
-        if any(value <= 0 for name, value in values.items() if name != "A"):
-            return -np.inf
-        if values["A"] <= 0 or values["p"] <= 1 or values["q"] <= 1:
-            return -np.inf
+    def _triggering_compensator_without_A(self) -> float:
+        magnitudes = self._magnitudes()
+        dm = magnitudes - self.model.magnitude_min
+        productivity = self._expected_exp_alpha_dm(dm)
+        temporal = self._expected_temporal_compensator()
+        spatial = self._expected_spatial_compensator()
+        return float(np.sum(productivity * temporal * spatial))
+
+    def _etas_expected_log_likelihood_terms(self) -> dict[str, float]:
         q_parent = np.tril(self.state.branching.probabilities[:, 1:], k=-1)
         child_idx, parent_idx = np.nonzero(q_parent > 0)
         weights = q_parent[child_idx, parent_idx]
         if weights.size:
             pair_ll = float(
-                np.sum(weights * self._pair_log_etas(child_idx, parent_idx, params))
+                np.sum(weights * self._pair_expected_log_etas(child_idx, parent_idx))
             )
         else:
             pair_ll = 0.0
-        compensator = self._triggering_compensator(params)
-        return pair_ll - compensator + self._etas_log_prior(params)
+        A_mean = self._fixed_or_factor_value("A")
+        compensator_without_A = self._triggering_compensator_without_A()
+        compensator = A_mean * compensator_without_A
+        return {
+            "etas_parent_log_likelihood": pair_ll,
+            "etas_triggering_compensator": -float(compensator),
+            "etas_expected_log_likelihood": pair_ll - compensator,
+            "etas_compensator_without_A": float(compensator_without_A),
+            "etas_A_mean": float(A_mean),
+        }
+
+    def _etas_expected_log_likelihood(self) -> float:
+        return self._etas_expected_log_likelihood_terms()[
+            "etas_expected_log_likelihood"
+        ]
+
+    def _etas_prior_entropy_elbo(self) -> float:
+        total = 0.0
+        values = self.state.etas.parameters_mean.as_dict()
+        for name, value in values.items():
+            factor_name = self._factor_name(name)
+            shifted = value - 1.0 if name in {"p", "q"} else value
+            a = self.priors.get(f"a_{name}", 1.0)
+            b = self.priors.get(f"b_{name}", 1.0)
+            if name in self.config.fixed_etas or factor_name not in self.state.etas.gamma_factors:
+                total += self._gamma_prior_log_density(shifted, a, b)
+            else:
+                total += self._gamma_prior_entropy_term(
+                    self.state.etas.gamma_factors[factor_name],
+                    a,
+                    b,
+                )
+        return float(total)
+
+    def _etas_elbo(self) -> float:
+        return self._etas_expected_log_likelihood() + self._etas_prior_entropy_elbo()
     
 
     # ********************************************* OUTILS MARK *********************************************
-    def _beta_log_posterior(self):
+    def _expected_log_truncated_beta_normalizer(self, factor: GammaFactor, width: float) -> float:
+        nodes, weights = self._positive_quadrature(factor)
+        values = np.log(np.maximum(1.0 - np.exp(-nodes * width), self.config.jitter))
+        return float(np.sum(weights * values))
+
+    def _beta_elbo(self):
         if self.catalog.magnitudes is None:
             return 0.0
-        beta = float(self.state.etas.beta_mean)
-        if beta <= 0:
-            return -np.inf
         magnitudes = self.catalog.magnitudes
         lower = self.model.magnitude_min
         upper = self.model.magnitude_max
         excess = magnitudes - lower
         a = self.beta_prior.get("a_beta", 2.0)
         b = self.beta_prior.get("b_beta", 1.0)
-        value = (a - 1.0 + len(magnitudes)) * np.log(beta) - beta * (
-            b + np.sum(excess)
-        )
+        beta_factor = self.state.etas.beta_gamma
+        if beta_factor is None:
+            beta = float(self.state.etas.beta_mean)
+            value = len(magnitudes) * np.log(beta) - beta * np.sum(excess)
+            value += self._gamma_prior_log_density(beta, a, b)
+            if upper is not None:
+                width = max(upper - lower, self.config.jitter)
+                value -= len(magnitudes) * np.log(
+                    max(1.0 - np.exp(-beta * width), self.config.jitter)
+                )
+            return float(value)
+        value = len(magnitudes) * beta_factor.expected_log - beta_factor.mean * np.sum(excess)
         if upper is not None:
             width = max(upper - lower, self.config.jitter)
-            normalizer = max(1.0 - np.exp(-beta * width), self.config.jitter)
-            value -= len(magnitudes) * np.log(normalizer)
+            value -= len(magnitudes) * self._expected_log_truncated_beta_normalizer(
+                beta_factor,
+                width,
+            )
+        value += self._gamma_prior_entropy_term(beta_factor, a, b)
         return float(value)
 
 
@@ -589,19 +763,18 @@ class SPINHVI:
         probabilities = np.zeros((n_events, n_events + 1), dtype=float)
         eps = self.state.eps.mean
         f_mean = self.state.gp.f_data_mean
-        f_second = f_mean**2 + self.state.gp.f_data_var
         omega = self.state.polya_gamma.observed_mean
-        bg_log = (
-            eps[self.domain_index]
-            + 0.5 * f_mean
-            - 0.5 * omega * f_second
-            - np.log(2.0)
+        bg_log = eps[self.domain_index] + self._augmented_log_sigmoid_expectation(
+            f_mean,
+            self.state.gp.f_data_var,
+            omega,
+            sign=1.0,
+            omega_tilt=self.state.polya_gamma.observed_tilt,
         )
-        params = self.state.etas.parameters_mean
         for i in range(n_events):
             weights = [bg_log[i]]
             if i > 0:
-                weights.extend(self._pair_log_etas(i, np.arange(i), params).tolist())
+                weights.extend(self._pair_expected_log_etas(i, np.arange(i)).tolist())
             probabilities[i, : i + 1] = np.exp(weights - logsumexp(weights))
         self.state.branching.probabilities = probabilities
 
@@ -754,15 +927,49 @@ class SPINHVI:
         self.state.gp.coefficients_mean = None
         self.state.gp.coefficients_covariance = None
 
-    def _update_etas(self):
-        free_names = self._free_etas_names()
-        if not free_names:
+    def _update_etas(self, optimize_nonconjugate: bool = True):
+        if "A" not in self.config.fixed_etas and "A" in self.state.etas.gamma_factors:
+            q_parent = np.tril(self.state.branching.probabilities[:, 1:], k=-1)
+            expected_offspring = float(np.sum(q_parent))
+            a = self.priors.get("a_A", 1.0)
+            b = self.priors.get("b_A", 1.0)
+            proposed = GammaFactor(
+                shape=max(a + expected_offspring, self.config.jitter),
+                rate=max(b + self._triggering_compensator_without_A(), self.config.jitter),
+            )
+            current = self.state.etas.gamma_factors["A"]
+            self.state.etas.gamma_factors["A"] = current.damped(
+                proposed,
+                self.config.parameter_damping,
+            )
+            self._sync_etas_means()
+
+        free_names = self._free_etas_factor_names(include_A=False)
+        if not free_names or not optimize_nonconjugate:
+            self._sync_etas_means()
             return
-        start = self._params_to_vector(self.state.etas.parameters_mean, free_names)
+
+        start = []
+        for name in free_names:
+            factor = self.state.etas.gamma_factors[name]
+            start.extend([np.log(factor.shape), np.log(factor.rate)])
+        start = np.asarray(start, dtype=float)
+
+        def factors_from_vector(vector):
+            proposed = dict(self.state.etas.gamma_factors)
+            for index, name in enumerate(free_names):
+                shape = float(np.exp(np.clip(vector[2 * index], -20.0, 20.0)))
+                rate = float(np.exp(np.clip(vector[2 * index + 1], -20.0, 20.0)))
+                proposed[name] = GammaFactor(shape=max(shape, self.config.jitter), rate=max(rate, self.config.jitter))
+            return proposed
+
+        current_factors = self.state.etas.gamma_factors
+        current_params = self.state.etas.parameters_mean
 
         def negative_elbo_block(vector):
-            params = self._vector_to_params(vector, free_names)
-            value = self._etas_log_posterior(params)
+            self.state.etas.gamma_factors = factors_from_vector(vector)
+            self._sync_etas_means()
+            value = self._etas_elbo()
             if not np.isfinite(value):
                 return 1e100
             return -value
@@ -771,47 +978,66 @@ class SPINHVI:
             negative_elbo_block,
             start,
             method="L-BFGS-B",
-            bounds=self._etas_optimizer_bounds(free_names),
-            options={"maxiter": self.config.max_optimizer_iter, "ftol": 1e-6},
+            bounds=[(np.log(1e-3), np.log(1e3)), (np.log(1e-3), np.log(1e5))] * len(free_names),
+            options={
+                "maxiter": self.config.max_optimizer_iter,
+                "maxfun": max(40, 6 * self.config.max_optimizer_iter),
+                "maxls": 5,
+                "ftol": 1e-5,
+            },
         )
+        self.state.etas.gamma_factors = current_factors
+        self.state.etas.parameters_mean = current_params
         if not result.success and not np.isfinite(result.fun):
+            self._sync_etas_means()
             return
-        proposed = self._vector_to_params(result.x, free_names)
-        current = self.state.etas.parameters_mean
-        damped = self._damped_parameters(current, proposed)
-        self.state.etas.parameters_mean = self._parameters_with_fixed(damped)
+        proposed_factors = factors_from_vector(result.x)
+        for name in free_names:
+            self.state.etas.gamma_factors[name] = self.state.etas.gamma_factors[name].damped(
+                proposed_factors[name],
+                self.config.parameter_damping,
+            )
+        self._sync_etas_means()
 
     def _update_beta(self):
-        if self.catalog.magnitudes is None:
+        beta_factor = self.state.etas.beta_gamma
+        if self.catalog.magnitudes is None or beta_factor is None:
             return
-        magnitudes = self.catalog.magnitudes
-        lower = self.model.magnitude_min
-        upper = self.model.magnitude_max
-        excess = magnitudes - lower
-        a = self.beta_prior.get("a_beta", 2.0)
-        b = self.beta_prior.get("b_beta", 1.0)
-        width = None if upper is None else max(upper - lower, self.config.jitter)
+        start = np.asarray([np.log(beta_factor.shape), np.log(beta_factor.rate)], dtype=float)
+        current = self.state.etas.beta_gamma
+        current_mean = self.state.etas.beta_mean
 
-        def negative_elbo_block(log_beta):
-            beta = float(np.exp(log_beta))
-            value = (a - 1.0 + len(magnitudes)) * np.log(beta) - beta * (
-                b + np.sum(excess)
-            )
-            if width is not None:
-                normalizer = max(1.0 - np.exp(-beta * width), self.config.jitter)
-                value -= len(magnitudes) * np.log(normalizer)
+        def negative_elbo_block(vector):
+            shape = float(np.exp(np.clip(vector[0], -20.0, 20.0)))
+            rate = float(np.exp(np.clip(vector[1], -20.0, 20.0)))
+            self.state.etas.beta_gamma = GammaFactor(shape=max(shape, self.config.jitter), rate=max(rate, self.config.jitter))
+            self._sync_etas_means()
+            value = self._beta_elbo()
+            if not np.isfinite(value):
+                return 1e100
             return -value
 
-        result = minimize_scalar(
+        result = minimize(
             negative_elbo_block,
-            bounds=(np.log(1e-3), np.log(50.0)),
-            method="bounded",
-            options={"maxiter": self.config.max_optimizer_iter},
+            start,
+            method="L-BFGS-B",
+            bounds=[(np.log(1e-3), np.log(1e3)), (np.log(1e-3), np.log(1e5))],
+            options={
+                "maxiter": max(25, self.config.max_optimizer_iter),
+                "maxfun": max(100, 6 * self.config.max_optimizer_iter),
+                "maxls": 10,
+                "ftol": 1e-5,
+            },
         )
-        if result.success:
-            beta = float(np.exp(result.x))
-            damping = self.config.parameter_damping
-            self.state.etas.beta_mean = (1.0 - damping) * self.state.etas.beta_mean + damping * beta
+        self.state.etas.beta_gamma = current
+        self.state.etas.beta_mean = current_mean
+        if result.success or np.isfinite(result.fun):
+            proposed = GammaFactor(
+                shape=float(np.exp(np.clip(result.x[0], -20.0, 20.0))),
+                rate=float(np.exp(np.clip(result.x[1], -20.0, 20.0))),
+            )
+            self.state.etas.beta_gamma = proposed
+            self._sync_etas_means()
     
 
 
@@ -819,12 +1045,26 @@ class SPINHVI:
     # ----------------------------------------------- FIT -----------------------------------------------
     # ===================================================================================================
 
+    def _initial_gamma_factor(
+        self,
+        mean: float,
+        relative_variance: float | None = None,
+    ) -> GammaFactor:
+        mean = max(float(mean), self.config.jitter)
+        if relative_variance is None:
+            relative_variance = self.config.etas_initial_relative_variance
+        shape = max(1.0 / relative_variance, self.config.jitter)
+        rate = shape / mean
+        return GammaFactor(shape=shape, rate=rate)
+
     def initialize_state(self) -> SPINHVIState:
         n_events = len(self.catalog)
         n_domains = self.model.n_domains
         counts = np.bincount(self.domain_index, minlength=n_domains).astype(float)
         exposure = self.model.duration * np.asarray(self.model.domains.areas, dtype=float)
-        eps_mean = np.log((counts + 0.5) / np.maximum(exposure, self.config.jitter))
+        # With f=0, sigmoid(f)=1/2, so the Poisson envelope starts at twice
+        # the observed rate. This matches the Gibbs initialization.
+        eps_mean = np.log(2.0 * (counts + 0.5) / np.maximum(exposure, self.config.jitter))
         eps_cov = self.model.epsilon_prior_covariance()
         f_mean = np.zeros(n_events, dtype=float)
         f_var = np.full(n_events, self.model.gp_prior.variance, dtype=float)
@@ -844,6 +1084,17 @@ class SPINHVI:
             if self.config.fixed_beta is not None
             else float(self.config.beta_init)
         )
+        gamma_factors: dict[str, GammaFactor] = {}
+        initial_values = params.as_dict()
+        for name in self._free_etas_names():
+            factor_name = self._factor_name(name)
+            value = initial_values[name]
+            if name in {"p", "q"}:
+                value -= 1.0
+            gamma_factors[factor_name] = self._initial_gamma_factor(value)
+        beta_gamma = None
+        if self.config.fixed_beta is None:
+            beta_gamma = self._initial_gamma_factor(beta)
         return SPINHVIState(
             branching=BranchingFactor.background_initialization(n_events),
             polya_gamma=PolyaGammaFactor(
@@ -872,6 +1123,8 @@ class SPINHVI:
             etas=ETASFactor(
                 parameters_mean=params,
                 beta_mean=beta,
+                gamma_factors=gamma_factors,
+                beta_gamma=beta_gamma,
                 fixed_etas=dict(self.config.fixed_etas),
             ),
         )
@@ -890,7 +1143,6 @@ class SPINHVI:
         elbo_trace: list[float] = []
         previous = -np.inf
         converged = False
-        last_elbo_terms: dict[str, float] = {}
         for iteration in range(self.config.n_iter):
             if self.config.update_polya_gamma:
                 self._update_polya_gamma()
@@ -903,11 +1155,20 @@ class SPINHVI:
             if self.config.update_gp:
                 self._update_gp()
             if self.config.update_etas and iteration >= self.config.etas_update_start:
-                self._update_etas()
-            if self.config.learn_beta and self.config.fixed_beta is None:
+                optimize_nonconjugate = (
+                    (iteration - self.config.etas_update_start)
+                    % self.config.etas_update_every
+                    == 0
+                )
+                self._update_etas(optimize_nonconjugate=optimize_nonconjugate)
+            # The magnitude likelihood is independent of all other VI blocks.
+            if (
+                iteration == 0
+                and self.config.fixed_beta is None
+            ):
                 self._update_beta()
 
-            elbo, last_elbo_terms = self._elbo()
+            elbo, _ = self._elbo()
             elbo_trace.append(elbo)
             if self.config.verbose and iteration % self.config.verbose_every == 0:
                 self._print_progress(iteration, elbo)
@@ -921,7 +1182,6 @@ class SPINHVI:
             "converged": converged,
             "n_iter_run": len(elbo_trace),
             "expected_latent_poisson_count": self.state.latent_poisson.expected_count,
-            "elbo_terms": last_elbo_terms,
         }
         return SPINHVIResults(
             self.state,
@@ -1073,8 +1333,9 @@ class SPINHVI:
         return expected_log_prior + entropy
 
     def _elbo(self) -> tuple[float, dict[str, float]]:
-        etas = self._etas_log_posterior(self.state.etas.parameters_mean)
-        beta = self._beta_log_posterior()
+        etas_likelihood_terms = self._etas_expected_log_likelihood_terms()
+        etas_prior_entropy = self._etas_prior_entropy_elbo()
+        beta = self._beta_elbo()
         terms = {
             "background_observed_augmented": self._background_observation_elbo(),
             "branching_entropy": self._branching_entropy(),
@@ -1082,10 +1343,30 @@ class SPINHVI:
             "poisson_envelope_compensator": self._poisson_envelope_compensator_elbo(),
             "epsilon_prior_entropy": self._epsilon_prior_elbo(),
             "gp_prior_entropy": self._gp_prior_elbo(),
-            "etas_map": etas if np.isfinite(etas) else -1e50,
-            "beta_map": beta if np.isfinite(beta) else -1e50,
+            "etas_parent_log_likelihood": etas_likelihood_terms[
+                "etas_parent_log_likelihood"
+            ],
+            "etas_triggering_compensator": etas_likelihood_terms[
+                "etas_triggering_compensator"
+            ],
+            "etas_prior_entropy": etas_prior_entropy,
+            "beta_expected_likelihood_prior_entropy": beta,
         }
-        return float(sum(terms.values())), terms
+        non_finite = {
+            name: value for name, value in terms.items() if not np.isfinite(value)
+        }
+        if non_finite:
+            details = ", ".join(
+                f"{name}={value!r}" for name, value in non_finite.items()
+            )
+            raise FloatingPointError(f"Non-finite ELBO term(s): {details}")
 
-
-
+        total = float(sum(terms.values()))
+        if not np.isfinite(total):
+            raise FloatingPointError(f"Non-finite ELBO total: {total!r}")
+        terms["etas_expected_complete_likelihood_prior_entropy"] = (
+            terms["etas_parent_log_likelihood"]
+            + terms["etas_triggering_compensator"]
+            + terms["etas_prior_entropy"]
+        )
+        return total, terms

@@ -42,6 +42,44 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKern
 # -------------------------------------------- GIBBS POUR SSGC --------------------------------------------
 # =========================================================================================================
 
+def build_sparse_gp_safe(hypers, X_bounds, Y_bounds, coverage_margin=1.5):
+        """Construit un sparseGP puis force L1, L2 à couvrir le domaine avec marge,
+        indépendamment du terme qui dominait le max() interne."""
+        sparse_gp = sparseGP(hypers)
+
+        xmin, xmax = X_bounds
+        ymin, ymax = Y_bounds
+        L1_floor = coverage_margin * 0.5 * (xmax - xmin)
+        L2_floor = coverage_margin * 0.5 * (ymax - ymin)
+
+        if sparse_gp.L1 < L1_floor or sparse_gp.L2 < L2_floor:
+            L1_new = int(np.ceil(max(sparse_gp.L1, L1_floor)))
+            L2_new = int(np.ceil(max(sparse_gp.L2, L2_floor)))
+            # Recalculer m1, m2, S, Delta avec le L1/L2 corrigé
+            sparse_gp.L1, sparse_gp.L2 = L1_new, L2_new
+            sparse_gp.m1 = int(np.ceil(1.75 * sparse_gp.L1 / sparse_gp.l1))
+            sparse_gp.m2 = int(np.ceil(1.75 * sparse_gp.L2 / sparse_gp.l2))
+            sparse_gp.m = sparse_gp.m1 * sparse_gp.m2
+            sparse_gp.S = np.zeros((2, sparse_gp.m), int)
+            sparse_gp.S[0] = np.repeat(np.arange(sparse_gp.m1), sparse_gp.m2)
+            sparse_gp.S[1] = list(range(sparse_gp.m2)) * sparse_gp.m1
+            nu = hypers[-1]
+            sparse_gp.Delta = 2*np.pi*nu*sparse_gp.l1*sparse_gp.l2*np.exp(
+                -0.125*np.pi**2*((sparse_gp.S[0]*sparse_gp.l1/sparse_gp.L1)**2
+                                + (sparse_gp.S[1]*sparse_gp.l2/sparse_gp.L2)**2)
+            )
+            sparse_gp.sqrt_Delta = np.sqrt(sparse_gp.Delta).reshape(1, -1)
+            # IMPORTANT : recréer les fonctions OT memoizées, sinon elles restent liées
+            # aux anciennes closures m/S/Delta capturées à la création initiale
+            sparse_gp.regressorOT = ot.MemoizeFunction(
+                ot.PythonFunction(2, sparse_gp.m, sparse_gp.regressorPy)
+            )
+            sparse_gp.evaluateOT = ot.MemoizeFunction(
+                ot.PythonFunction(sparse_gp.m + 2, 1, sparse_gp.evaluatePy)
+            )
+        return sparse_gp
+
+
 class SSGC_GibbsSampler:
     """Gibbs sampler for the informative Spatially Structured sigmoidal Gaussian Cox process (SSGC)
     
@@ -675,6 +713,7 @@ class SSGC_GibbsSampler:
         # Return one realization of a multivariate Normal
         return myNormal.getRealization()
 
+
     def sample_Pi_S(self, x, y, eps, sparse_gp, gp_coeffs, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
         """Sample a new realization of the latent marked Poisson process π_S.
  
@@ -1222,9 +1261,15 @@ class SSGC_GibbsSampler:
         upper = coords.max(axis=0)
         c1, c2 = 0.5 * (lower + upper)
         s1, s2 = 0.5 * (upper - lower)
+
         v_sq, l_ot = self.nu
         hypers = (l_ot, l_ot, c1, c2, s1, s2, v_sq)
         sparse_gp = sparseGP(hypers)
+        # sparse_gp = build_sparse_gp_safe(
+        #     hypers, (self.X_bounds[0], self.X_bounds[1]),
+        #     (self.Y_bounds[0], self.Y_bounds[1]), coverage_margin=1.5
+        # )
+        # self.sparse_gp = sparse_gp
 
         if learn_nu and verbose:
            print("[Pre-run] nu will be updated at each iteration (Adaptive MH).")

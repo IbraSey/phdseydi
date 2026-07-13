@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from package.config import ETASParameters, SPINHGibbsConfig
+from package.config import ETASParameters, SPINHGibbsConfig, SPINHVIConfig
 from data.catalog import EventCatalog
 from .kernels import ETASKernel
 from .ssgc import SSGCModel
@@ -67,7 +67,11 @@ class SPINHModel(SSGCModel):
             model=self,
             theta_phi_priors=config.theta_priors,
             m=catalog.magnitudes if self.etas_parameters.marked else None,
-            beta_init=config.beta_init,
+            beta_init=(
+                config.beta_init
+                if config.fixed_beta is None
+                else config.fixed_beta
+            ),
             beta_priors=config.beta_prior,
             sigma_MH_etas=config.sigma_mh_etas,
             sigma_MH_beta=config.sigma_mh_beta,
@@ -82,10 +86,9 @@ class SPINHModel(SSGCModel):
             gp_backend,
             sparse_gp=sparse_gp,
             reference_intensity=reference_intensity,
-            learn_beta=config.learn_beta,
+            fixed_beta=config.fixed_beta,
             sample_z=config.sample_z,
             known_z=config.known_z,
-            sample_etas=config.sample_etas,
             fixed_etas=config.fixed_etas,
         )
 
@@ -95,7 +98,7 @@ class SPINHModel(SSGCModel):
         The model remains unchanged. The returned SPINHVIResults object contains
         variational posterior summaries for Z, epsilon, the GP and ETAS blocks.
         """
-        from ..inference.VI import SPINHVI, SPINHVIConfig
+        from ..inference.VI import SPINHVI
 
         if config is None:
             config = SPINHVIConfig(random_seed=rng_seed)

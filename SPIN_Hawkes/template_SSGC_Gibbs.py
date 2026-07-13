@@ -88,9 +88,9 @@ print(
 )
 
 
-# =============================================================================
-# Model and Gibbs configuration
-# =============================================================================
+# ==============================
+# Model and Gibbs configs
+# ==============================
 NU_INIT = (5.0, 0.2)
 LAMBDA_NU = 0.5
 DELTA = (1.5, 0.1)
@@ -159,7 +159,7 @@ summary = fit.summary(burn_in=BURN_IN)
 print("\nPosterior means")
 for name, estimate in zip(domain_names, summary["eps_hat"]):
     print(f"{name:<6} eps = {estimate:.4f}")
-print(f"nu  = {summary['nu_hat']}")
+print(f"nu = {summary['nu_hat']}")
 print(f"acceptance rates = {fit.acceptance_rates}")
 
 fit.plot_traces(

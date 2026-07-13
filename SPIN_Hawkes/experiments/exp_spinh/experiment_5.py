@@ -1,4 +1,4 @@
-"""Experiment 5"""
+"""Experiment 5: SPIN-H recovery from simple to weakly identified data."""
 
 #%%
 
@@ -56,7 +56,7 @@ INITIAL_ETAS = ETASParameters(
     q=1.7,
     gamma=0.3,
 )
-INITIAL_BETA = 2.0
+INITIAL_BETA = 2.3
 
 THETA_PRIORS = {
     "a_A": 5.0, "b_A": 10.0,
@@ -70,22 +70,22 @@ THETA_PRIORS = {
 
 SCENARIOS = [
     {
-        "name": "easy_compact_structured",
+        "name": "simple_well_conditioned",
         "difficulty": 1,
-        "duration": 55.0,
+        "duration": 66.0,
         "mus": (8.0, 1.0, 2.0, 8.0, 7.0, 2.0),
         "field_scale": 0.9,
         "mala_step": 0.11,
         "etas": ETASParameters(
-            A=0.55, alpha=0.8, c=0.04, p=1.55,
-            d=0.025, q=2.25, gamma=0.35,
+            A=0.4, alpha=0.6, c=0.03, p=1.35,
+            d=0.06, q=1.7, gamma=0.3,
         ),
         "beta": 2.3,
     },
     {
         "name": "medium_reference",
         "difficulty": 2,
-        "duration": 60.0,
+        "duration": 48.0,
         "mus": (10.0, 1.0, 2.0, 10.0, 8.0, 2.0),
         "field_scale": 1.0,
         "mala_step": 0.115,
@@ -96,9 +96,9 @@ SCENARIOS = [
         "beta": 2.3,
     },
     {
-        "name": "hard_diffuse_triggering",
+        "name": "complex_diffuse_triggering",
         "difficulty": 3,
-        "duration": 60.0,
+        "duration": 53.0,
         "mus": (5.0, 4.0, 4.5, 5.0, 4.0, 4.5),
         "field_scale": 0.45,
         "mala_step": 0.095,
@@ -109,9 +109,9 @@ SCENARIOS = [
         "beta": 2.15,
     },
     {
-        "name": "hard_weak_triggering",
+        "name": "complex_few_offspring",
         "difficulty": 4,
-        "duration": 60.0,
+        "duration": 47.0,
         "mus": (6.0, 5.5, 5.0, 6.0, 5.5, 5.0),
         "field_scale": 0.25,
         "mala_step": 0.085,
@@ -269,10 +269,8 @@ def run_realization(polygons, scenario, realization):
             verbose=VERBOSE,
             verbose_every=VERBOSE_EVERY,
             use_calibration=True,
-            learn_beta=True,
             beta_init=INITIAL_BETA,
             theta_priors=THETA_PRIORS,
-            fixed_etas={"alpha": scenario["etas"].alpha},
             sigma_mh_etas=SIGMA_MH_ETAS,
             sigma_mh_beta=SIGMA_MH_BETA,
             adaptation_start=200,

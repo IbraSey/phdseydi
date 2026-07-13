@@ -782,8 +782,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
     # ─────────────────────────────────────────────────────────
 
     def run(self, t, x, y, mala_step=0.05, n_iter=1000,
-            learn_nu=False, learn_beta=False,
-            sample_z=True, known_z=None, sample_etas=True, fixed_etas=None,
+            learn_nu=False, fixed_beta=None,
+            sample_z=True, known_z=None, fixed_etas=None,
             t0_nu=50, step_nu_init=0.1,
             verbose=True, verbose_every=100, use_calibration=True,
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
@@ -808,14 +808,13 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             Number of Gibbs iterations.
         learn_nu : bool, optional
             Update GP hyperparameters.
-        learn_beta : bool, optional
-            Update the Gutenberg-Richter rate. Ignored in the unmarked model.
+        fixed_beta : float or None, optional
+            Fixed Gutenberg-Richter rate. When ``None``, beta is sampled from
+            its posterior, starting from ``beta_init``.
         sample_z : bool, optional
             Sample branching labels. Set to ``False`` to keep ``known_z`` fixed.
         known_z : array_like or None, optional
             One-based branching labels used as the initial/fixed branching state.
-        sample_etas : bool, optional
-            Update ETAS parameters. Set to ``False`` to keep theta fixed.
         fixed_etas : dict or None, optional
             ETAS parameters kept fixed while the other coordinates are sampled.
             For example ``{"c": 0.02, "p": 1.3}``.
@@ -879,7 +878,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         N = len(t)
         sample_z = bool(sample_z)
-        sample_etas = bool(sample_etas)
         self._t_obs_arr = np.asarray([float(v) for v in t], dtype=float)
         self._x_obs_arr = np.asarray([float(v) for v in x], dtype=float)
         self._y_obs_arr = np.asarray([float(v) for v in y], dtype=float)
@@ -891,10 +889,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         dy = self._y_obs_arr[:, None] - self._y_obs_arr[None, :]
         self._etas_r2_mat = dx * dx + dy * dy
         self._etas_dm = (self.m - self.m_c) if self.m is not None else np.zeros(N)
-        if learn_beta and not self.use_magnitudes:
-            if verbose:
-                print("[Warning] learn_beta ignoré : pas de magnitudes")
-            learn_beta = False
+        if fixed_beta is not None:
+            fixed_beta = float(fixed_beta)
+            if fixed_beta <= 0.0:
+                raise ValueError("fixed_beta must be positive.")
+            self.beta = fixed_beta
+        sample_beta = bool(self.use_magnitudes and fixed_beta is None)
 
         tp_names = (["A", "alpha", "c", "p", "d", "q", "gamma"]
                     if self.use_magnitudes else ["A", "c", "p", "d", "q"])
@@ -909,6 +909,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         free_etas_blocks = {
             key: self._free_etas_names(names) for key, names in etas_blocks.items()
         }
+        sample_theta = any(free_etas_blocks.values())
         n_tp = len(tp_names)
 
         # ── Calibration GP ──────────────────────────────────────────────────
@@ -969,8 +970,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             mode  = "Hawkes marqué" if self.use_magnitudes else "Hawkes ST"
             flags = [f for f in ["learn_ν" if learn_nu else "",
                                   "sample_Z" if sample_z else "fixed_Z",
-                                  "sample_θ" if sample_etas else "fixed_θ",
-                                  "learn_β" if learn_beta and sample_etas else ""] if f]
+                                  "sample_θ" if sample_theta else "fixed_θ",
+                                  ("sample_β" if sample_beta else "fixed_β")
+                                  if self.use_magnitudes else ""] if f]
             print(f"[Init] {mode} | θ_φ = {tp_names} | {', '.join(flags) or '—'}")
             if gp_backend == "sparse":
                 print(f"[Init] Sparse GP with {int(sparse_gp.m)} basis functions")
@@ -978,7 +980,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             if self.fixed_etas:
                 print(f"[Init] fixed θ_φ = {self.fixed_etas}")
             if self.use_magnitudes:
-                print(f"[Init] β = {self.beta} (learn={learn_beta}) | AM t0 = {self.t0_etas}")
+                beta_mode = "sampled" if sample_beta else "fixed"
+                print(f"[Init] β = {self.beta} ({beta_mode}) | AM t0 = {self.t0_etas}")
 
         # ── Grille E_μ optionnelle ───────────────────────────────────────────
         compute_emu = bool(compute_emu and mu_star_func is not None)
@@ -1004,7 +1007,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         nu_ch    = np.zeros((ns, 2))
         Z_ch     = np.zeros((ns, N))
         tp_ch    = np.zeros((ns, n_tp))
-        beta_ch  = np.zeros(ns) if learn_beta else None
+        beta_ch  = np.zeros(ns) if self.use_magnitudes else None
         gp_coeffs_ch = (
             np.zeros((ns, int(sparse_gp.m))) if gp_backend == "sparse" else None
         )
@@ -1093,16 +1096,15 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     Z = self.update_Z(t, x, y, ea, f_data)
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
-                if sample_etas:
-                    if free_etas_blocks["A_alpha"]:
-                        acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
-                    if free_etas_blocks["c_p"]:
-                        acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
-                    if free_etas_blocks["d_q_gamma"]:
-                        acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
+                if free_etas_blocks["A_alpha"]:
+                    acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                if free_etas_blocks["c_p"]:
+                    acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
+                if free_etas_blocks["d_q_gamma"]:
+                    acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
-                if learn_beta and sample_etas:
+                if sample_beta:
                     ab += int(self.update_beta(hb, it))
 
                 # ── Verbose ───────────────────────────────────────────────────
@@ -1117,7 +1119,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         f"acc_eps={ae/denom*100:.0f}% "
                         f"bg={nb}/{N} "
                     )
-                    if sample_etas:
+                    if sample_theta:
                         parts = []
                         parts.append(f"acc_Aα={acc_Aa:.0f}%" if free_etas_blocks["A_alpha"] else "Aα=fixed")
                         parts.append(f"acc_cp={acc_cp:.0f}%" if free_etas_blocks["c_p"] else "cp=fixed")
@@ -1125,8 +1127,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         msg += " ".join(parts)
                     else:
                         msg += "θ_fixed"
-                    if learn_beta:
-                        if sample_etas:
+                    if self.use_magnitudes:
+                        if sample_beta:
                             msg += f" β={self.beta:.3f} acc_β={ab/denom*100:.0f}%"
                         else:
                             msg += f" β={self.beta:.3f} β_fixed"
@@ -1181,7 +1183,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             bl = {"A_alpha": "{A,α}" if self.use_magnitudes else "{A}",
                   "c_p":     "{c,p}",
                   "d_q_gamma": "{d,q,γ}" if self.use_magnitudes else "{d,q}"}
-            if sample_etas:
+            if sample_theta:
                 for k, v in acc.items():
                     if free_etas_blocks[k]:
                         print(f"  {bl[k]:14s}  : {v/n_iter*100:.1f}%")
@@ -1189,8 +1191,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         print(f"  {bl[k]:14s}  : fixed")
             else:
                 print(f"  {'θ_φ fixed':14s}  : yes")
-            if learn_beta:
-                if sample_etas:
+            if self.use_magnitudes:
+                if sample_beta:
                     print(f"  {'β':14s}  : {ab/n_iter*100:.1f}%")
                 else:
                     print(f"  {'β fixed':14s}  : yes")
@@ -1203,7 +1205,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "E_mu": Emu,
             "acceptance_eps":   ae/n_iter,
             "acceptance_nu":    an/n_iter if learn_nu else None,
-            "acceptance_beta":  ab/n_iter if learn_beta else None,
+            "acceptance_beta":  ab/n_iter if sample_beta else None,
             "acceptance_etas": {
                 k: (v / n_iter if free_etas_blocks[k] else None)
                 for k, v in acc.items()
@@ -1218,8 +1220,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "gp_coeffs": gp_coeffs_ch[:si] if gp_coeffs_ch is not None else None,
             "sparse_gp": sparse_gp if gp_backend == "sparse" else None,
             "use_etas": True, "use_magnitudes": self.use_magnitudes,
-            "learn_beta": learn_beta, "learn_nu": learn_nu,
-            "sample_z": sample_z, "sample_etas": sample_etas,
+            "sample_beta": sample_beta,
+            "fixed_beta": fixed_beta if self.use_magnitudes else None,
+            "learn_nu": learn_nu,
+            "sample_z": sample_z,
             "fixed_etas": dict(self.fixed_etas),
             "known_z": np.asarray(known_z, dtype=int) if known_z is not None else None,
             "am_history": {
