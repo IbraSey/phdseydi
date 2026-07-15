@@ -90,10 +90,11 @@ X_BOUNDS = (min(c[:, 0].min() for c in coords), max(c[:, 0].max() for c in coord
 Y_BOUNDS = (min(c[:, 1].min() for c in coords), max(c[:, 1].max() for c in coords))
 DURATION = T
 
+#print(X_BOUNDS, Y_BOUNDS)
 # Parametres du modele
 # Coordinates are in kilometres. A value of 0.2 km creates tens of millions
 # of Fourier modes over France; 100 km gives a tractable regional GP basis.
-NU_INIT   = (5.0, 70.0)
+NU_INIT   = (2.0, 0.5)
 LAMBDA_NU = 0.5
 DELTA     = (1.5, 0.1)
 JITTER    = 1e-5
@@ -101,7 +102,7 @@ JITTER    = 1e-5
 # Parametres du Gibbs
 MALA_STEP    = 0.055
 LEARN_NU     = False
-USE_CALIBRATION = False
+USE_CALIBRATION = True
 T0_NU        = 50
 STEP_NU_INIT = 0.0009
 
@@ -118,7 +119,7 @@ USE_SPARSEGP  = True
 MAKE_PLOTS    = True
 N_POSTERIOR_DRAWS = 200
 
-
+#%%
 # -------------------------------------------------------------------------
 ####################################
 # Build Catalog and Model          #
