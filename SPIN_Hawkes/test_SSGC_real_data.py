@@ -1,119 +1,141 @@
-#%% Imports
+# %% Imports
 
-import os
-import sys
-import numpy as np
-import pandas as pd
-import openturns as ot
-import matplotlib.pyplot as plt
-import seaborn as sns
-import shapely
 from pathlib import Path
 
-from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pyproj
+import seaborn as sns
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
 
-# Résolution du chemin vers phebus
-file_path = Path(__file__).resolve()
-ROOT = file_path.parent.parent
-phebus_path = ROOT / "lib_py"
-sys.path.insert(0, str(phebus_path))
-
-from phebus.pybus.frclass import FrenchDomainsSourceModel
+from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel, SparseGP
 
 
-#%%
-#############
-# Load Case #
-#############
+def resolve_use_case_path():
+    script_dir = Path(__file__).resolve().parent
+    for candidate in (script_dir / "use_case", script_dir.parent / "use_case"):
+        if (candidate / "catalog.csv").is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find use_case/catalog.csv next to the repository."
+    )
 
-demo_path = phebus_path / "phebus" / "demos" / "FrenchDomainsAnalysis"
 
-SM = FrenchDomainsSourceModel(
-    Mmin=3.,
-    PWD=demo_path,
-    FILE_DOMAINS=demo_path / "data" / "domains" / "domaines_xy.csv",
+def project_coordinates(longitude, latitude):
+    transformer = pyproj.Transformer.from_crs(
+        "EPSG:4326", "EPSG:2154", always_xy=True
+    )
+    x, y = transformer.transform(longitude, latitude)
+    return np.asarray(x, dtype=float) * 1e-3, np.asarray(y, dtype=float) * 1e-3
+
+
+def load_coastlines(path):
+    coordinates = np.loadtxt(path)
+    separators = np.where(np.any(~np.isfinite(coordinates), axis=1))[0]
+    coastlines = []
+    start = 0
+    for stop in np.append(separators, len(coordinates)):
+        segment = coordinates[start:stop]
+        if len(segment):
+            x, y = project_coordinates(segment[:, 0], segment[:, 1])
+            coastlines.append(np.vstack((x, y)))
+        start = stop + 1
+    return coastlines
+
+
+
+
+# ==========================================================================================
+# ========================================== MAIN ==========================================
+# ==========================================================================================
+
+# Load the bundled French seismicity case
+
+USE_CASE_PATH = resolve_use_case_path()
+catalog_df = pd.read_csv(USE_CASE_PATH / "catalog.csv")
+catalog_df = catalog_df[
+    (catalog_df["year"] >= 1965) & (catalog_df["magnitude"] >= 3.0)
+].copy()
+catalog_x, catalog_y = project_coordinates(
+    catalog_df["longitude"].to_numpy(),
+    catalog_df["latitude"].to_numpy(),
 )
+catalog_df["X"] = catalog_x
+catalog_df["Y"] = catalog_y
 
-catalog_df = SM.catalog[SM.catalog.year >= 1965]
+domain_df = pd.read_csv(USE_CASE_PATH / "domaines_xy.csv")
+zones = []
+zone_names = []
+for zone_name, frame in domain_df.groupby("CODE_GTR", sort=False):
+    x, y = project_coordinates(frame["X"].to_numpy(), frame["Y"].to_numpy())
+    polygon = Polygon(np.column_stack((x, y)))
+    zones.append(polygon if polygon.is_valid else polygon.buffer(0))
+    zone_names.append(str(zone_name))
 
-D = np.vstack((catalog_df.X, catalog_df.Y, catalog_df.magnitude)).T
-
-T = max(catalog_df.year) - min(catalog_df.year)
-
-# Zones / domaines
-zones     = [zone.get_polygon_xy() for zone in SM.zones]
-areas     = np.array([zone.get_area_km2() for zone in SM.zones])
-zone_names = [zone.name for zone in SM.zones]
-
-# Visualisation des domaines avec les superficies
-SM.plot_values_map(
-    areas,
-    FIGURE_PATH=os.getcwd(),
-    FIGURE_NAME="lambdas_and_domains",
-    catalog=catalog_df,
-    coastline=SM.coastlines,
-    scale=5.,
-    xticks=zone_names,
-)
+coastlines = load_coastlines(USE_CASE_PATH / "coastlines_france.txt")
+D = catalog_df[["X", "Y", "magnitude"]].to_numpy()
+T = float(catalog_df["year"].max() - catalog_df["year"].min())
 
 
-#%%
+# -------------------------------------------------------------------------
 ####################################
 # Define Prior and Bounds          #
 ####################################
 
-# Bornes spatiales déduites de l'union des zones
+# Bornes spatiales deduites de l'union des zones
 coords   = [np.array(z.exterior.coords) for z in zones]
 X_BOUNDS = (min(c[:, 0].min() for c in coords), max(c[:, 0].max() for c in coords))
 Y_BOUNDS = (min(c[:, 1].min() for c in coords), max(c[:, 1].max() for c in coords))
 DURATION = T
 
-# Paramètres du modèle
-NU_INIT   = (5.0, 0.2)
+# Parametres du modele
+# Coordinates are in kilometres. A value of 0.2 km creates tens of millions
+# of Fourier modes over France; 100 km gives a tractable regional GP basis.
+NU_INIT   = (5.0, 70.0)
 LAMBDA_NU = 0.5
-DELTA     = (1.5, 0.01)
+DELTA     = (1.5, 0.1)
 JITTER    = 1e-5
 
-# Paramètres du Gibbs
-MALA_STEP    = 0.095
+# Parametres du Gibbs
+MALA_STEP    = 0.055
 LEARN_NU     = False
-USE_CALIBRATION = True
+USE_CALIBRATION = False
 T0_NU        = 50
 STEP_NU_INIT = 0.0009
 
-N_ITER        = 2000
-THIN          = 2
+N_ITER        = 3000
+THIN          = 5
 BURN_IN       = 0.5
-NX, NY        = 20, 20
-NX_POST, NY_POST = 60, 60
+NX_POST, NY_POST = 70, 70
 
 SEED          = 42
 VERBOSE       = True
-VERBOSE_EVERY = 100
-SAVE_FIGURE   = False
+VERBOSE_EVERY = 300
+SAVE_FIGURE   = True
 USE_SPARSEGP  = True
+MAKE_PLOTS    = True
+N_POSTERIOR_DRAWS = 200
 
 
-#%%
+# -------------------------------------------------------------------------
 ####################################
 # Build Catalog and Model          #
 ####################################
 
 # Filtre spatial : on garde uniquement les points dans l'union des domaines
-# zones sont déjà des Polygon shapely (retournés par get_polygon_xy())
-domain_union = shapely.unary_union(zones)
-select   = [domain_union.contains(shapely.Point(xy)) for xy in D[:, :2]]
+domain_union = unary_union(zones)
+select = [domain_union.covers(Point(xy)) for xy in D[:, :2]]
 D_select = D[select]
 
 catalog = EventCatalog(
-    t=np.zeros(len(D_select)),   # pas de dimension temporelle ici (PP spatial pur)
+    t=np.zeros(len(D_select)),
     x=D_select[:, 0],
     y=D_select[:, 1],
 )
 
-# Légère érosion des polygones pour éviter les intersections numériques de bord
-# (les zones adjacentes partagent des arêtes communes dont l'intersection a une
-#  aire > 0 en virgule flottante, ce qui déclenche le check anti-overlap du modèle)
+# Slight erosion prevents numerical overlaps along shared polygon boundaries.
 zones_shrunk = [z.buffer(-1e-5) for z in zones]
 
 model = SSGCModel.from_polygons(
@@ -129,6 +151,17 @@ model = SSGCModel.from_polygons(
     jitter=JITTER,
 )
 
+gp_backend = "sparse" if USE_SPARSEGP else "exact"
+sparse_gp = None
+if USE_SPARSEGP and not USE_CALIBRATION:
+    sparse_gp = SparseGP.from_bounds(
+        X_BOUNDS,
+        Y_BOUNDS,
+        variance=NU_INIT[0],
+        length_scale=NU_INIT[1],
+    )
+    print(f"Sparse GP basis: m={sparse_gp.m}")
+
 config = GibbsConfig(
     n_iter=N_ITER,
     thin=THIN,
@@ -139,42 +172,43 @@ config = GibbsConfig(
     step_nu_init=STEP_NU_INIT,
     verbose=VERBOSE,
     verbose_every=VERBOSE_EVERY,
-    grid_nx=NX,
-    grid_ny=NY,
     compute_emu=False,
 )
 
 
-#%%
+# -------------------------------------------------------------------------
 ####################################
-# Run Gibbs (with save/load cache) #
+# Run Gibbs                        #
 ####################################
 
-savefile = "posterior_sample.csv"
+fit = model.gibbs(
+    catalog,
+    config=config,
+    gp_backend=gp_backend,
+    sparse_gp=sparse_gp,
+    reference_intensity=None,
+    rng_seed=SEED,
+)
 
-if os.path.exists(savefile):
-    print(f"File {savefile} already exists — loading cached sample.")
-    sample = pd.read_csv(savefile, index_col=0).to_numpy()
-else:
-    fit = model.gibbs(
-        catalog,
-        config=config,
-        gp_backend="sparse" if USE_SPARSEGP else "exact",
-        rng_seed=SEED,
-    )
+summary = fit.summary(burn_in=BURN_IN)
+print("\nPosterior means")
+print(f"eps = {summary['eps_hat']}")
+print(f"nu = {summary['nu_hat']}")
+print(f"acceptance rates = {fit.acceptance_rates}")
 
-    summary = fit.summary(burn_in=BURN_IN)
-    print("\nPosterior means")
-    print(f"  eps = {summary['eps_hat']}")
-    print(f"  nu  = {summary['nu_hat']}")
-    print(f"  acceptance rates = {fit.acceptance_rates}")
+burn = int(BURN_IN * fit.eps_chain.shape[0])
+posterior = pd.DataFrame(
+    {
+        "N_Pi": fit.latent_point_counts[burn:],
+        **{
+            f"lambda_{name}": np.exp(fit.eps_chain[burn:, index])
+            for index, name in enumerate(zone_names)
+        },
+    }
+)
+posterior.to_csv("posterior_sample.csv", index=False)
 
-    # Récupération du sample brut (post burn-in) depuis fit
-    # Adapter le nom d'attribut si nécessaire (fit.samples, fit.chain, ...)
-    sample = fit.get_sample(burn_in=BURN_IN)   # shape (S, param_dim)
-    pd.DataFrame(data=sample).to_csv(savefile)
-
-    # Diagnostics de convergence via les outils de la nouvelle API
+if MAKE_PLOTS:
     fit.plot_traces(
         burn_in=BURN_IN,
         savefigure=SAVE_FIGURE,
@@ -187,105 +221,79 @@ else:
     )
 
 
-#%%
+# -------------------------------------------------------------------------
 ############################
 # Seaborn pairplot         #
 ############################
 
-# Indices des composantes à afficher : N_tot + lambda_j (à adapter selon gibbs_indices)
-# Si le fit expose un attribut gibbs_indices compatible avec l'ancienne API :
-#   components = [fit.gibbs_indices.Pi_indices[-1]] + fit.gibbs_indices.lambda_indices
-#   names = [r"$N_{tot}$"] + [r"$\lambda_{%s}$" % j for j in range(1, len(zones) + 1)]
-# Sinon utiliser les indices bruts ci-dessous (dernières J+1 colonnes par convention) :
-
-J          = len(zones)
-components = list(range(-(J + 1), 0))   # à ajuster selon la structure réelle de sample
-names      = [r"$N_{tot}$"] + [r"$\lambda_{%s}$" % j for j in range(1, J + 1)]
-
-sns.pairplot(pd.DataFrame(data=sample[:, components], columns=names))
-plt.savefig("pairplot.png")
-plt.close()
+if MAKE_PLOTS:
+    sns.pairplot(posterior)
+    plt.savefig("pairplot.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
 
-#%%
+# -------------------------------------------------------------------------
 ###############################################################
 # Posterior intensity on prediction grid                      #
 ###############################################################
 
-gridsize = 500
+gridsize_x, gridsize_y = NX_POST, NY_POST
 xx, yy = np.meshgrid(
-    np.linspace(X_BOUNDS[0], X_BOUNDS[1], gridsize),
-    np.linspace(Y_BOUNDS[0], Y_BOUNDS[1], gridsize),
+    np.linspace(X_BOUNDS[0], X_BOUNDS[1], gridsize_x),
+    np.linspace(Y_BOUNDS[0], Y_BOUNDS[1], gridsize_y),
 )
-XY_new = np.vstack((xx.ravel(), yy.ravel())).T
-
-# Accès aux composantes du modèle ajusté
-# (adapter les noms d'attributs si l'API diffère de l'ancienne SSGC_Gibbs)
-sparse_gp    = fit.model.sparse_gp      # ou fit.sparse_gp selon l'API
-gibbs_indices = fit.gibbs_indices        # ou fit.model.gibbs_indices
-
-M     = np.array(sparse_gp.regressorOT(XY_new))   # (N_grid, M_basis)
-U_new = np.array(fit.model.U_OT(XY_new))           # (N_grid, J) membership weights
-
-Z_new         = np.zeros((len(sample), len(XY_new)))
-intensity_new = np.zeros((len(sample), len(XY_new)))
-
-for i in range(len(sample)):
-    sample_i  = sample[i]
-    epsilon_i = sample_i[gibbs_indices.epsilon_indices]
-    lambda_i  = sample_i[gibbs_indices.lambda_indices]
-
-    Z_new[i]         = np.dot(M, epsilon_i).ravel()
-    sigm_i           = np.array(sigmoid(ot.Sample(Z_new[i].reshape(-1, 1)))).ravel()
-    Lambda_i         = (lambda_i * U_new).sum(axis=1)
-    intensity_new[i] = sigm_i * Lambda_i
-
-intensity_mean = intensity_new.mean(axis=0).reshape(gridsize, gridsize) * T
-intensity_std  = intensity_new.std(axis=0).reshape(gridsize, gridsize) * T
+available_draws = fit.eps_chain.shape[0] - burn
+n_draws = min(N_POSTERIOR_DRAWS, available_draws)
+intensity_samples = fit.background_intensity_samples(
+    xx.ravel(),
+    yy.ravel(),
+    burn_in=BURN_IN,
+    n_samples=n_draws,
+)
+intensity_mean = intensity_samples.mean(axis=1).reshape(yy.shape) * T
+intensity_std = intensity_samples.std(axis=1).reshape(yy.shape) * T
 
 levels_joint = np.linspace(
     min(intensity_mean.min(), intensity_std.min()),
     max(intensity_mean.max(), intensity_std.max()),
-    gridsize,
+    40,
 )
 
 
-#%% Plot — Posterior mean
+# Plot - Posterior mean
+if MAKE_PLOTS:
+    fig = plt.figure(figsize=(10, 10))
+    plt.contourf(xx, yy, intensity_mean, levels_joint)
+    plt.colorbar()
+    plt.scatter(
+        D_select[:, 0], D_select[:, 1],
+        s=np.sqrt(D_select[:, 2]),
+        c="r", marker="o", alpha=0.35,
+    )
+    for line in coastlines:
+        plt.plot(line[0], line[1], "w", linewidth=1.0)
+    plt.title("Seismic intensity - posterior mean", fontsize=20)
+    plt.tight_layout()
+    plt.savefig("intensity_post_mean.png", dpi=150)
+    plt.close()
 
-fig = plt.figure(figsize=(10, 10))
-plt.contourf(xx, yy, intensity_mean, levels_joint)
-plt.colorbar()
-plt.scatter(
-    D_select[:, 0], D_select[:, 1],
-    s=np.sqrt(D_select[:, 2]),
-    c='r', marker='o',
-    alpha=(1. / D_select[:, 2]) / max(1. / D_select[:, 2]),
-)
-for line in SM.coastlines:
-    plt.plot(line[0], line[1], 'w', linewidth=1.5)
-plt.title("Seismic intensity — Posterior mean", fontsize=20)
-plt.tight_layout()
-plt.savefig("intensity_post_mean.png")
-plt.close()
 
-
-#%% Plot — Posterior std
-
-fig = plt.figure(figsize=(10, 10))
-plt.contourf(xx, yy, intensity_std, levels_joint)
-plt.colorbar()
-plt.scatter(
-    D_select[:, 0], D_select[:, 1],
-    s=np.sqrt(D_select[:, 2]),
-    c='r', marker='o',
-    alpha=(1. / D_select[:, 2]) / max(1. / D_select[:, 2]),
-)
-for line in SM.coastlines:
-    plt.plot(line[0], line[1], 'w', linewidth=1.5)
-plt.title("Seismic intensity — Posterior std", fontsize=20)
-plt.tight_layout()
-plt.savefig("intensity_post_mean_std.png")
-plt.close()
+# Plot - Posterior std
+if MAKE_PLOTS:
+    fig = plt.figure(figsize=(10, 10))
+    plt.contourf(xx, yy, intensity_std, levels_joint)
+    plt.colorbar()
+    plt.scatter(
+        D_select[:, 0], D_select[:, 1],
+        s=np.sqrt(D_select[:, 2]),
+        c="r", marker="o", alpha=0.35,
+    )
+    for line in coastlines:
+        plt.plot(line[0], line[1], "w", linewidth=1.0)
+    plt.title("Seismic intensity - posterior standard deviation", fontsize=20)
+    plt.tight_layout()
+    plt.savefig("intensity_post_mean_std.png", dpi=150)
+    plt.close()
 
 
 # %%
