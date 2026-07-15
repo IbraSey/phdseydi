@@ -788,7 +788,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             verbose=True, verbose_every=100, use_calibration=True,
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
             compute_emu=False, emu_every=10, calibration_method="openturns",
-            calibration_target="homogeneous",
             plot_calibration_kde=False, calibration_kde_cmap="viridis",
             gp_backend="exact", sparse_gp=None):
         """Run the SPIN-Hawkes Gibbs sampler.
@@ -840,8 +839,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             Iterations between ``E_mu`` evaluations.
         calibration_method : {"sklearn", "openturns"}, optional
             GP fitter used by pre-run calibration.
-        calibration_target : {"homogeneous", "zone_corrected"}, optional
-            Calibration target used by the inherited SSGC background model.
         plot_calibration_kde : bool, optional
             Display the KDE used for calibration.
         calibration_kde_cmap : str or Colormap, optional
@@ -867,7 +864,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 mu_star_func=mu_star_func, grid_nx=grid_nx, grid_ny=grid_ny, thin=thin,
                 compute_emu=compute_emu, emu_every=emu_every,
                 calibration_method=calibration_method,
-                calibration_target=calibration_target,
                 plot_calibration_kde=plot_calibration_kde,
                 calibration_kde_cmap=calibration_kde_cmap,
                 gp_backend=gp_backend, sparse_gp=sparse_gp)
@@ -917,7 +913,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             if verbose: print("[Pre-run] Calibrating GP hyperparameters")
             _, _, eps_mle_all = self.calibrate_nu(
                 x, y, verbose=verbose, method=calibration_method,
-                target_mode=calibration_target,
                 plot_kde=plot_calibration_kde,
                 kde_cmap=calibration_kde_cmap,
             )
