@@ -60,7 +60,6 @@ class PointProcessModel(ABC):
             "thin": config.thin,
             "compute_emu": config.compute_emu,
             "emu_every": config.emu_every,
-            "calibration_method": config.calibration_method,
         }
         if sparse_gp is not None and gp_backend != "sparse":
             raise ValueError("sparse_gp requires gp_backend='sparse'.")

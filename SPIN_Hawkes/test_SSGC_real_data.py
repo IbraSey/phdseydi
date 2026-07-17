@@ -53,10 +53,12 @@ def load_coastlines(path):
 
 # Load the bundled French seismicity case
 
+YEAR = 1965
+M_C = 3.0
 USE_CASE_PATH = resolve_use_case_path()
 catalog_df = pd.read_csv(USE_CASE_PATH / "catalog.csv")
 catalog_df = catalog_df[
-    (catalog_df["year"] >= 1965) & (catalog_df["magnitude"] >= 3.0)
+    (catalog_df["year"] >= YEAR) & (catalog_df["magnitude"] >= M_C)
 ].copy()
 catalog_x, catalog_y = project_coordinates(
     catalog_df["longitude"].to_numpy(),
@@ -85,19 +87,16 @@ T = float(catalog_df["year"].max() - catalog_df["year"].min())
 ####################################
 
 # Bornes spatiales deduites de l'union des zones
-coords   = [np.array(z.exterior.coords) for z in zones]
+coords = [np.array(z.exterior.coords) for z in zones]
 X_BOUNDS = (min(c[:, 0].min() for c in coords), max(c[:, 0].max() for c in coords))
 Y_BOUNDS = (min(c[:, 1].min() for c in coords), max(c[:, 1].max() for c in coords))
 DURATION = T
-
 #print(X_BOUNDS, Y_BOUNDS)
+
 # Parametres du modele
-# Coordinates are in kilometres. A value of 0.2 km creates tens of millions
-# of Fourier modes over France; 100 km gives a tractable regional GP basis.
 NU_INIT   = (2.0, 0.5)
 LAMBDA_NU = 0.5
-DELTA     = (1.5, 0.1)
-JITTER    = 1e-5
+DELTA     = (10.0, 0.50)
 
 # Parametres du Gibbs
 MALA_STEP    = 0.055
@@ -106,18 +105,19 @@ USE_CALIBRATION = True
 T0_NU        = 50
 STEP_NU_INIT = 0.0009
 
-N_ITER        = 3000
+N_ITER        = 10000
 THIN          = 5
 BURN_IN       = 0.5
-NX_POST, NY_POST = 70, 70
+NX_POST, NY_POST = 120, 120
 
 SEED          = 42
 VERBOSE       = True
-VERBOSE_EVERY = 300
+VERBOSE_EVERY = int(N_ITER/10)
 SAVE_FIGURE   = True
 USE_SPARSEGP  = True
 MAKE_PLOTS    = True
-N_POSTERIOR_DRAWS = 200
+N_POSTERIOR_DRAWS = 500
+JITTER        = 1e-5
 
 #%%
 # -------------------------------------------------------------------------
@@ -144,7 +144,6 @@ model = SSGCModel.from_polygons(
     duration=DURATION,
     x_bounds=X_BOUNDS,
     y_bounds=Y_BOUNDS,
-    initial_log_intensities=0.0,
     gp_prior=GPParameters(variance=NU_INIT[0], length_scale=NU_INIT[1]),
     eps_prior_variance=DELTA[0],
     eps_prior_length_scale=DELTA[1],
@@ -217,6 +216,7 @@ if MAKE_PLOTS:
     )
     fit.plot_acf(
         burn_in=BURN_IN,
+        max_lag=int(burn/THIN),
         savefigure=SAVE_FIGURE,
         title_savefig="ssgc/template_v1/acf",
     )
