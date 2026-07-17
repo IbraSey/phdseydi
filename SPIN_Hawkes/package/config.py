@@ -55,7 +55,6 @@ class GibbsConfig:
     thin: int = 1
     mala_step: float = 0.25
     learn_nu: bool = False
-    calibration_method: str = "openturns"
     use_calibration: bool = True
     verbose: bool = True
     verbose_every: int = 100
@@ -71,8 +70,6 @@ class GibbsConfig:
             raise ValueError("n_iter and thin must be positive.")
         if self.mala_step <= 0 or self.verbose_every <= 0:
             raise ValueError("mala_step and verbose_every must be positive.")
-        if self.calibration_method not in {"sklearn", "openturns"}:
-            raise ValueError("calibration_method must be 'sklearn' or 'openturns'.")
 
 
 @dataclass(frozen=True)

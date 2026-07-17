@@ -5,8 +5,6 @@ import numpy as np
 import openturns as ot
 import openturns.experimental as otexp
 from polyagamma import random_polyagamma
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 
@@ -499,8 +497,8 @@ class SSGC_GibbsSampler:
 
         return f_D0, f_Df, D_f, K_ff
 
-    def _sample_poisson_envelope(self, eps, max_candidates_per_domain=1000,
-                                 max_candidates=2000):
+    def _sample_poisson_envelope(self, eps, max_candidates_per_domain=20000,
+                                 max_candidates=20000):
         """Sample the piecewise-homogeneous Poisson envelope locations.
 
         Parameters
@@ -623,7 +621,7 @@ class SSGC_GibbsSampler:
         return ot.Normal(mean, ot.CovarianceMatrix(covariance.tolist())).getRealization()
 
     def sample_Pi_S_sparse(self, eps, sparse_gp, gp_coeffs,
-                           max_candidates_per_domain=1000, max_candidates=2000):
+                           max_candidates_per_domain=20000, max_candidates=20000):
         """Sample ``Pi_S`` using a sparse basis representation of the GP."""
         self._validate_sparse_gp(sparse_gp)
         XY_cand = self._sample_poisson_envelope(
@@ -645,7 +643,7 @@ class SSGC_GibbsSampler:
         values = np.column_stack([np.asarray(XY_cand)[mask], omega])
         return ot.Sample(values.tolist())
 
-    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_DOMAINS=1000, LIM_CANDIDATES=2000):
+    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_DOMAINS=20000, LIM_CANDIDATES=20000):
         """Sample the latent marked thinned Poisson process ``Pi_S``.
         
         On each zone ``S_j``, the envelope intensity ``mu_tilde = exp(eps_j)`` is
@@ -667,9 +665,9 @@ class SSGC_GibbsSampler:
         eps : ot.Point or array_like, shape (J,)
             Current zonal log-intensities.
         LIM_CANDIDATES_DOMAINS : int, optional
-            Maximum envelope count retained per zone, by default ``1000``.
+            Maximum envelope count retained per zone, by default ``3000``.
         LIM_CANDIDATES : int, optional
-            Maximum envelope count retained globally, by default ``2000``.
+            Maximum envelope count retained globally, by default ``5000``.
         
         Returns
         -------
@@ -920,7 +918,7 @@ class SSGC_GibbsSampler:
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
-    def calibrate_nu(self, x, y, verbose=True, plot_kde=True, method=False, kde_cmap='viridis'):
+    def calibrate_nu(self, x, y, verbose=True, plot_kde=False, kde_cmap="viridis"):
         """Heuristic calibration of GP hyperparameters via linearised sigmoid inversion.
  
         Under the approximation σ(f) ≈ ½ + ¼f (valid for small v), the model
@@ -930,138 +928,81 @@ class SSGC_GibbsSampler:
  
         where p̂ is a KDE estimate of the spatial density. The hyperparameters
         (v², ℓ) are then obtained by maximising the marginal likelihood of a
-        GP regression model fitted to z, using scikit-learn's
-        GaussianProcessRegressor.
- 
-        The variance v² is constrained to remain below 0.58² ≈ 0.34 to ensure
-        the linearisation remains valid at the 99% confidence level (see
-        Appendix B of the paper).
+        GP regression model fitted to z.
  
         Parameters
         ----------
         x, y : array_like, shape (N,)
             Spatial coordinates of observed events.
         verbose : bool, optional
-            If True, print calibrated values (default True).
+            If True, print calibrated values.
         plot_kde : bool, optional
-            If True, plot KDE (default False).
-        method : bool, optional
-            default False
- 
+            If True, plot the KDE.
         Returns
         -------
         v : float
-            Calibrated marginal standard deviation of the GP (√v²).
+            Calibrated GP amplitude stored as ``v²`` by the sampler.
         l_ot : float
-            Calibrated length-scale in the OpenTURNS convention (ℓ_OT = ℓ_sklearn · √2).
+            Calibrated length scale.
         eps_mle : ndarray, shape (J,)
             MLE of zonal log-intensities (computed as a by-product).
         """
-        N_obs = len(x)
-        obs_pts = np.array([[float(x[i]), float(y[i])] for i in range(N_obs)])
-
-        # KDE -> p_hat aux points observés
-        sample_ot = ot.Sample(obs_pts)
-        ks = ot.KernelSmoothing()
-        kde = ks.build(sample_ot)
-        p_hat = np.array(kde.computePDF(sample_ot)).flatten()
+        obs_pts = np.column_stack([
+            np.asarray([float(v) for v in x]),
+            np.asarray([float(v) for v in y]),
+        ])
+        sample_ot = ot.Sample(obs_pts.tolist())
+        kde = ot.KernelSmoothing().build(sample_ot)
+        p_hat = np.asarray(kde.computePDF(sample_ot), dtype=float).reshape(-1)
         
         if plot_kde:
-            graph = kde.drawPDF([self.X_bounds[0], self.Y_bounds[0]], [self.X_bounds[1], self.Y_bounds[1]]) 
-            graph.add(ot.Cloud( np.vstack((x, y)).T ))
-            view = View(graph)
-            view.show()
-            view.save("kde.png")
+            gx = np.linspace(self.X_bounds[0], self.X_bounds[1], 80)
+            gy = np.linspace(self.Y_bounds[0], self.Y_bounds[1], 80)
+            GX, GY = np.meshgrid(gx, gy)
+            grid = ot.Sample(np.column_stack([GX.ravel(), GY.ravel()]).tolist())
+            density = np.asarray(kde.computePDF(grid), dtype=float).reshape(GX.shape)
+            fig, ax = plt.subplots(figsize=(6, 5))
+            contour = ax.contourf(GX, GY, density, levels=20, cmap=kde_cmap)
+            ax.scatter(
+                obs_pts[:, 0], obs_pts[:, 1], s=10, c="white",
+                edgecolors="black", linewidths=0.3,
+            )
+            fig.colorbar(contour, ax=ax, label="KDE density")
+            ax.set_title("Kernel-density estimate")
+            ax.set_xlim(self.X_bounds)
+            ax.set_ylim(self.Y_bounds)
+            plt.tight_layout()
+            plt.show()
 
-
-        # # KDE leave-one-out aux points observés
-        # sample_ot = ot.Sample(obs_pts)
-        # ks = ot.KernelSmoothing()
-        # h = ks.computeSilvermanBandwidth(sample_ot)
-        # kde_full = ks.build(sample_ot, h)
-        # p_hat_full = np.array(kde_full.computePDF(sample_ot)).flatten()
-        # K0 = 1.0 / (2.0 * np.pi * float(h[0]) * float(h[1]))
-        # p_hat = (N_obs * p_hat_full - K0) / (N_obs - 1)
-        # p_hat = np.maximum(p_hat, 1e-10)
-
-        # eps MLE (conservé pour initialisation du sampler)
         eps_mle = self.estimate_eps_mle(x, y)
         if verbose:
             print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
 
-        # Aire totale du domaine
-        D_area = sum(self.polygons[j].area for j in range(self.J))
+        domain_area = float(sum(poly.area for poly in self.polygons))
+        target = 2.0 * domain_area * p_hat - 2.0
 
-        # Cible : z(x,y) = 2|D| p_hat(x,y) - 2
-        z = 2.0 * D_area * p_hat - 2.0
-        #print(z)
-
-        # GP regression
-        if method and False:
-            print("using_scikit_learn")
-            kernel = (
-                C(0.1, (1e-3, 0.58 ** 2))
-                #C(0.1, (1e-3, 2.0))
-                * RBF(length_scale=0.3, length_scale_bounds=(1e-2, 5.0))
-                + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-4, 1.0))
-            )
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-            gp.fit(obs_pts, z)
-
-            k_params = gp.kernel_.get_params()
-            v_sq = float(k_params["k1__k1__constant_value"])
-            l = float(k_params["k1__k2__length_scale"])
-            v = np.sqrt(v_sq)
-            l_ot = l * np.sqrt(2.0)
-            self.nu = ot.Point([v_sq, l_ot])
-        else:
-            print("using_OT")
-            dimension = 2
-            basis = ot.ConstantBasisFactory(dimension).build()
-            covarianceModel = ot.SquaredExponential( [1.]*dimension, [1.])
-            # covarianceModel =  ot.IsotropicCovarianceModel(ot.SquaredExponential( [1.], [1.]), dimension)
-            fitter_algo = otexp.GaussianProcessFitter(sample_ot, z.reshape(-1, 1),covarianceModel, basis)
-            # fitter_algo.setOptimizationAlgorithm(ot.NLopt("LN_COBYLA"))
-            fitter_algo.run()
-            fitter_result = fitter_algo.getResult().getCovarianceModel()
-            l_ot = min(fitter_result.getScale())
-            v_sq = fitter_result.getAmplitude()[0]
-            self.nu = ot.Point([v_sq, l_ot])
+        dimension = 2
+        basis = ot.ConstantBasisFactory(dimension).build()
+        covariance_model = ot.SquaredExponential(
+            [1.0] * dimension, [1.0]
+        )
+        fitter = otexp.GaussianProcessFitter(
+            sample_ot,
+            ot.Sample(target.reshape(-1, 1).tolist()),
+            covariance_model,
+            basis,
+        )
+        fitter.run()
+        fitted_covariance = fitter.getResult().getCovarianceModel()
+        l_ot = float(np.min(np.asarray(fitted_covariance.getScale(), dtype=float)))
+        v_sq = float(fitted_covariance.getAmplitude()[0])
+        self.nu = ot.Point([v_sq, l_ot])
         
         if verbose:
-            print(f"[calibrate_nu] v_sq = {np.round(v_sq, 4)} ; l_ot = {l_ot:.4f}")
+            print(f"[calibrate_nu] v_sq = {v_sq:.4f} ; l_ot = {l_ot:.4f}")
 
         return v_sq, l_ot, eps_mle
     
-    
-
-    # def calibrate_nu(self, x, y, grid_size=50, verbose=True):
-    #     """
-
-    #     """
-    #     xmin, xmax = self.X_bounds
-    #     ymin, ymax = self.Y_bounds
-
-    #     # Grid 
-    #     gx = np.linspace(xmin, xmax, grid_size)
-    #     gy = np.linspace(ymin, ymax, grid_size)
-    #     GX, GY = np.meshgrid(gx, gy)
-    #     grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-    #     ot_grid = ot.Sample(grid_pts)
-
-    #     # KDE -> p_hat 
-    #     sample_ot = ot.Sample([[float(x[i]), float(y[i])] for i in range(len(x))])
-    #     ks = ot.KernelSmoothing()
-    #     kde = ks.build(sample_ot)
-    #     p_hat = np.array(kde.computePDF(ot_grid)).flatten()
-
-    #     # eps par MLE 
-    #     eps_mle = self.estimate_eps_mle(x, y)
-
-    #     if verbose:
-    #         print(f"[calibrate_nu] eps_mle = {np.round(eps_mle, 4)}")
-
-    #     # Target : z(x,y) = 2*N*|S_j|/N_j * p_hat - 2 
 
 
     # =================================================================================================
@@ -1071,7 +1012,7 @@ class SSGC_GibbsSampler:
     def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
-        compute_emu=True, emu_every=10, calibration_method="openturns",
+        compute_emu=True, emu_every=10,
         plot_calibration_kde=False, calibration_kde_cmap="viridis",
         gp_backend="exact", sparse_gp=None): 
         """Run the augmented SSGC Gibbs sampler.
@@ -1110,8 +1051,6 @@ class SSGC_GibbsSampler:
             Compute ``E_mu`` when a reference intensity is provided.
         emu_every : int, optional
             Compute ``E_mu`` every ``emu_every`` iterations.
-        calibration_method : {"sklearn", "openturns"}, optional
-            GP fitter used by the optional pre-run calibration.
         plot_calibration_kde : bool, optional
             Display the KDE used by calibration.
         calibration_kde_cmap : str or Colormap, optional
@@ -1138,7 +1077,7 @@ class SSGC_GibbsSampler:
             if verbose:
                 print("[Pre-run] Calibrating GP hyperparameters")
             _, _, eps_mle = self.calibrate_nu(
-                x, y, verbose=verbose, method=calibration_method,
+                x, y, verbose=verbose,
                 plot_kde=plot_calibration_kde,
                 kde_cmap=calibration_kde_cmap,
             )
