@@ -497,27 +497,18 @@ class SSGC_GibbsSampler:
 
         return f_D0, f_Df, D_f, K_ff
 
-    def _sample_poisson_envelope(self, eps, max_candidates_per_domain=20000,
-                                 max_candidates=20000):
+    def _sample_poisson_envelope(self, eps):
         """Sample the piecewise-homogeneous Poisson envelope locations.
 
         Parameters
         ----------
         eps : array_like, shape (J,)
             Current domain log-intensities.
-        max_candidates_per_domain : int or None, optional
-            Per-domain safety limit. ``None`` disables this limit.
-        max_candidates : int or None, optional
-            Global safety limit. ``None`` disables this limit.
-
         Returns
         -------
         XY_cand : ot.Sample, shape (M, 2)
             Envelope locations sampled uniformly within each domain.
 
-        Notes
-        -----
-        Reaching either safety limit truncates the exact Poisson envelope law.
         """
         candidates = []
         for j in range(self.J):
@@ -526,8 +517,6 @@ class SSGC_GibbsSampler:
             xmin, ymin, xmax, ymax = raw_polygon.bounds
             mean_count = self.T * raw_polygon.area * np.exp(float(eps[j]))
             n_candidates = int(ot.Poisson(mean_count).getRealization()[0])
-            if max_candidates_per_domain is not None:
-                n_candidates = min(n_candidates, int(max_candidates_per_domain))
             if n_candidates == 0:
                 continue
 
@@ -545,8 +534,6 @@ class SSGC_GibbsSampler:
                             break
             candidates.extend(accepted)
 
-        if max_candidates is not None and len(candidates) > int(max_candidates):
-            candidates = candidates[:int(max_candidates)]
         return ot.Sample(candidates) if candidates else ot.Sample(0, 2)
 
     @staticmethod
@@ -620,14 +607,10 @@ class SSGC_GibbsSampler:
         covariance = 0.5 * (covariance + covariance.T) + self.jitter * np.eye(m)
         return ot.Normal(mean, ot.CovarianceMatrix(covariance.tolist())).getRealization()
 
-    def sample_Pi_S_sparse(self, eps, sparse_gp, gp_coeffs,
-                           max_candidates_per_domain=20000, max_candidates=20000):
+    def sample_Pi_S_sparse(self, eps, sparse_gp, gp_coeffs):
         """Sample ``Pi_S`` using a sparse basis representation of the GP."""
         self._validate_sparse_gp(sparse_gp)
-        XY_cand = self._sample_poisson_envelope(
-            eps, max_candidates_per_domain=max_candidates_per_domain,
-            max_candidates=max_candidates,
-        )
+        XY_cand = self._sample_poisson_envelope(eps)
         n_candidates = XY_cand.getSize()
         if n_candidates == 0:
             return ot.Sample(0, 3)
@@ -643,7 +626,7 @@ class SSGC_GibbsSampler:
         values = np.column_stack([np.asarray(XY_cand)[mask], omega])
         return ot.Sample(values.tolist())
 
-    def sample_Pi_S(self, x, y, f_data, eps, LIM_CANDIDATES_DOMAINS=20000, LIM_CANDIDATES=20000):
+    def sample_Pi_S(self, x, y, f_data, eps):
         """Sample the latent marked thinned Poisson process ``Pi_S``.
         
         On each zone ``S_j``, the envelope intensity ``mu_tilde = exp(eps_j)`` is
@@ -664,28 +647,15 @@ class SSGC_GibbsSampler:
             Current GP values at those conditioning locations.
         eps : ot.Point or array_like, shape (J,)
             Current zonal log-intensities.
-        LIM_CANDIDATES_DOMAINS : int, optional
-            Maximum envelope count retained per zone, by default ``3000``.
-        LIM_CANDIDATES : int, optional
-            Maximum envelope count retained globally, by default ``5000``.
-        
         Returns
         -------
         Pi_S : ot.Sample, shape (M, 3)
             Retained locations and Polya-Gamma marks in columns ``(x, y, omega)``.
         
-        Notes
-        -----
-        Finite candidate limits protect memory but truncate the exact Poisson law when
-        reached. They should be set above all plausible envelope counts for exact
-        simulation."""
+        """
         N = len(x)
         XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
-        XY_cand = self._sample_poisson_envelope(
-            eps,
-            max_candidates_per_domain=LIM_CANDIDATES_DOMAINS,
-            max_candidates=LIM_CANDIDATES,
-        )
+        XY_cand = self._sample_poisson_envelope(eps)
         N_cand = XY_cand.getSize()
         if N_cand == 0:
             return ot.Sample(0, 3)
