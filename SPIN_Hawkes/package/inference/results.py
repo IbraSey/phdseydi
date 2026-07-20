@@ -799,8 +799,8 @@ class GibbsResults(Mapping):
     def posterior_intensity(
         self,
         burn_in: float | None = None,
-        nx=70,
-        ny=70,
+        nx=100,
+        ny=100,
         cmap="viridis",
         event_cmap="plasma",
         savefigure=False,
@@ -814,7 +814,7 @@ class GibbsResults(Mapping):
         """Plot and summarize the posterior SSGC background intensity."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         mesh, vertices = self._make_mesh(nx, ny)
-        if vertices.shape[0] > 20000:
+        if vertices.shape[0] > 50000:
             raise ValueError(f"Mesh too large: {vertices.shape[0]} points")
 
         x_grid = vertices[:, 0]

@@ -952,10 +952,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     raise ValueError("known_z must only reference earlier parents.")
             Z = ot.Point(known_z_arr.astype(float).tolist())
 
-        # ── Fix B3 : eps_mle recalculé sur les background events uniquement ─
+        # Initialize the envelope from background counts and sigma(0) = 1/2.
         N_j_bg, _ = self._count_events_per_zone(x, y, Z, ot.Sample(0, 3))
         areas_j   = np.array([self.polygons[j].area for j in range(self.J)])
-        eps_mle   = np.log(np.maximum(N_j_bg / (self.T * areas_j), 1e-6))
+        eps_mle   = np.log(np.maximum(2.0 * N_j_bg / (self.T * areas_j), 1e-6))
         eps       = ot.Point(eps_mle.tolist())
 
         if verbose:

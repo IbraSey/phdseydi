@@ -1,7 +1,8 @@
-# %% Imports
-
+# %% 
+# ===========================================
+# ================= IMPORTS =================
+# ===========================================
 from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -9,10 +10,12 @@ import pyproj
 import seaborn as sns
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
-
 from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel, SparseGP
 
 
+# ===========================================
+# ================= HELPERS =================
+# ===========================================
 def resolve_use_case_path():
     script_dir = Path(__file__).resolve().parent
     for candidate in (script_dir / "use_case", script_dir.parent / "use_case"):
@@ -46,10 +49,9 @@ def load_coastlines(path):
 
 
 
-
-# ==========================================================================================
-# ========================================== MAIN ==========================================
-# ==========================================================================================
+# ==========================================================
+# ========================== MAIN ==========================
+# ==========================================================
 
 # Load the bundled French seismicity case
 
@@ -82,9 +84,9 @@ T = float(catalog_df["year"].max() - catalog_df["year"].min())
 
 
 # -------------------------------------------------------------------------
-####################################
-# Define Prior and Bounds          #
-####################################
+###########################
+# Define Prior and Bounds #
+###########################
 
 # Bornes spatiales deduites de l'union des zones
 coords = [np.array(z.exterior.coords) for z in zones]
@@ -94,36 +96,35 @@ DURATION = T
 #print(X_BOUNDS, Y_BOUNDS)
 
 # Parametres du modele
-NU_INIT   = (2.0, 0.5)
+NU_INIT = (2.0, 0.5)
 LAMBDA_NU = 0.5
-DELTA     = (10.0, 0.50)
+DELTA = (10.0, 03.0)
 
 # Parametres du Gibbs
-MALA_STEP    = 0.055
-LEARN_NU     = False
+MALA_STEP = 0.055
+LEARN_NU = False
 USE_CALIBRATION = True
-T0_NU        = 50
+T0_NU = 50
 STEP_NU_INIT = 0.0009
 
-N_ITER        = 10000
-THIN          = 5
-BURN_IN       = 0.5
-NX_POST, NY_POST = 150, 150
+N_ITER = 10000
+THIN = 5
+BURN_IN = 0.5
+NX_POST, NY_POST = 200, 200
 
-SEED          = 42
-VERBOSE       = True
+SEED = 42
+VERBOSE = True
 VERBOSE_EVERY = int(N_ITER/10)
-SAVE_FIGURE   = True
-USE_SPARSEGP  = True
-MAKE_PLOTS    = True
+SAVE_FIGURE = True
+USE_SPARSEGP = True
+MAKE_PLOTS = True
 N_POSTERIOR_DRAWS = 500
-JITTER        = 1e-5
+JITTER = 1e-5
 
 #%%
-# -------------------------------------------------------------------------
-####################################
-# Build Catalog and Model          #
-####################################
+###########################
+# Build Catalog and Model #
+###########################
 
 # Filtre spatial : on garde uniquement les points dans l'union des domaines
 domain_union = unary_union(zones)
@@ -155,8 +156,7 @@ gp_backend = "sparse" if USE_SPARSEGP else "exact"
 sparse_gp = None
 if USE_SPARSEGP and not USE_CALIBRATION:
     sparse_gp = SparseGP.from_bounds(
-        X_BOUNDS,
-        Y_BOUNDS,
+        X_BOUNDS, Y_BOUNDS,
         variance=NU_INIT[0],
         length_scale=NU_INIT[1],
     )
@@ -168,18 +168,14 @@ config = GibbsConfig(
     mala_step=MALA_STEP,
     learn_nu=LEARN_NU,
     use_calibration=USE_CALIBRATION,
-    t0_nu=T0_NU,
-    step_nu_init=STEP_NU_INIT,
     verbose=VERBOSE,
     verbose_every=VERBOSE_EVERY,
-    compute_emu=False,
 )
 
 
-# -------------------------------------------------------------------------
-####################################
-# Run Gibbs                        #
-####################################
+#############
+# Run Gibbs #
+#############
 
 fit = model.gibbs(
     catalog,
@@ -220,23 +216,14 @@ if MAKE_PLOTS:
         savefigure=SAVE_FIGURE,
         title_savefig="ssgc/template_v1/acf",
     )
-
-
-# -------------------------------------------------------------------------
-############################
-# Seaborn pairplot         #
-############################
-
-if MAKE_PLOTS:
     sns.pairplot(posterior)
     plt.savefig("pairplot.png", dpi=150, bbox_inches="tight")
     plt.close()
 
 
-# -------------------------------------------------------------------------
-###############################################################
-# Posterior intensity on prediction grid                      #
-###############################################################
+##########################################
+# Posterior intensity on prediction grid #
+##########################################
 
 gridsize_x, gridsize_y = NX_POST, NY_POST
 xx, yy = np.meshgrid(
