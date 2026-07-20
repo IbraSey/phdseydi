@@ -140,16 +140,12 @@ class SPINHVIConfig:
     quadrature_nx: int = 30
     quadrature_ny: int = 30
     eps_newton_steps: int = 8
-    eps_damping: float = 1.0
     eps_bounds: tuple[float, float] = (-20.0, 8.0)
     f_bounds: tuple[float, float] = (-15.0, 15.0)
-    latent_poisson_damping: float = 0.5
-    latent_poisson_max_multiplier: float | None = 1.5
     etas_update_start: int = 10
     etas_update_every: int = 20
     etas_initial_relative_variance: float = 0.05
-    parameter_damping: float = 0.6
-    max_optimizer_iter: int = 8
+    max_optimizer_iter: int = 20
     etas_quadrature_nodes: int = 8
     full_gp_max_events: int = 800
     gp_backend: str = "exact"
@@ -168,27 +164,16 @@ class SPINHVIConfig:
             raise ValueError("quadrature grid sizes must be greater than one.")
         if self.eps_newton_steps <= 0:
             raise ValueError("eps_newton_steps must be positive.")
-        if not 0 < self.eps_damping <= 1:
-            raise ValueError("eps_damping must be in (0, 1].")
         if self.eps_bounds[0] >= self.eps_bounds[1]:
             raise ValueError("eps_bounds must be increasing.")
         if self.f_bounds[0] >= self.f_bounds[1]:
             raise ValueError("f_bounds must be increasing.")
-        if not 0 < self.latent_poisson_damping <= 1:
-            raise ValueError("latent_poisson_damping must be in (0, 1].")
-        if (
-            self.latent_poisson_max_multiplier is not None
-            and self.latent_poisson_max_multiplier <= 0
-        ):
-            raise ValueError("latent_poisson_max_multiplier must be positive or None.")
         if self.etas_update_start < 0:
             raise ValueError("etas_update_start must be non-negative.")
         if self.etas_update_every <= 0:
             raise ValueError("etas_update_every must be positive.")
         if self.etas_initial_relative_variance <= 0:
             raise ValueError("etas_initial_relative_variance must be positive.")
-        if not 0 < self.parameter_damping <= 1:
-            raise ValueError("parameter_damping must be in (0, 1].")
         if self.max_optimizer_iter <= 0:
             raise ValueError("max_optimizer_iter must be positive.")
         if self.etas_quadrature_nodes <= 1:

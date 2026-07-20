@@ -108,7 +108,7 @@ STEP_NU_INIT = 0.0009
 N_ITER        = 10000
 THIN          = 5
 BURN_IN       = 0.5
-NX_POST, NY_POST = 120, 120
+NX_POST, NY_POST = 150, 150
 
 SEED          = 42
 VERBOSE       = True
