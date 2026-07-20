@@ -857,12 +857,13 @@ class SSGC_GibbsSampler:
     def estimate_eps_mle(self, x, y):
         """Estimate the sub-domain log-intensities by maximum likelihood.
  
-        For each zone S_j, the MLE of ε_j under a homogeneous Poisson model is:
+        For each zone S_j, initialize the envelope log-intensity as:
  
-            ε̂_j = log(N_j / (T |S_j|))
+            ε̂_j = log(2 N_j / (T |S_j|))
  
-        where N_j is the observed count in sub-domain j. A floor of 1e-6 is applied
-        to the rate to avoid log(0).
+        where N_j is the observed count in sub-domain j. The factor two corrects
+        for the initial sigmoid value σ(0) = 1/2. A floor of 1e-6 is applied to
+        the envelope rate to avoid log(0).
  
         Parameters
         ----------
@@ -872,7 +873,7 @@ class SSGC_GibbsSampler:
         Returns
         -------
         eps_mle : ndarray, shape (J,)
-            Maximum likelihood estimates of the domain log-intensities.
+            Initial envelope log-intensity estimates.
         """
         counts = np.zeros(self.J)
         for i in range(len(x)):
@@ -884,7 +885,7 @@ class SSGC_GibbsSampler:
         eps_mle = np.zeros(self.J)
         for j in range(self.J):
             area_j = self.polygons[j].area
-            rate_j = max(counts[j] / (self.T * area_j), 1e-6)
+            rate_j = max(2.0 * counts[j] / (self.T * area_j), 1e-6)
             eps_mle[j] = np.log(rate_j) 
         return eps_mle
     
