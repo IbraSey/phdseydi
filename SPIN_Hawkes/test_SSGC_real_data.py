@@ -221,6 +221,7 @@ if MAKE_PLOTS:
     plt.close()
 
 
+
 ##########################################
 # Posterior intensity on prediction grid #
 ##########################################
