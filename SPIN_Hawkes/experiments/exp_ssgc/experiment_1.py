@@ -7,28 +7,25 @@ Profiles 1, 2, 3 x Settings A, B
 # =========
 # Imports
 # =========
-import warnings
 import gc
 import sys
-from sklearn.exceptions import ConvergenceWarning
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
+import warnings
+
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+
 import numpy as np
 import openturns as ot
 import matplotlib.pyplot as plt
-from functools import partial
 from pathlib import Path
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint, box as shapely_box
 from shapely.prepared import prep
-from joblib import Parallel, delayed
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from package import (
-    EventCatalog,
     GPParameters,
     GibbsConfig,
     SSGCModel,
@@ -52,19 +49,17 @@ N_ITER           = 200
 THIN             = 3
 LEARN_NU         = False
 USE_CALIB        = True
-USE_SPARSE_GP    = True
 T0_NU            = 50
 STEP_NU_INIT     = 0.0009
 VERBOSE          = True
 VERBOSE_EVERY    = 50
 SEED             = 42
-NX, NY           = 30, 30
 NX_POST, NY_POST = 60, 60
-POSTERIOR_N_MC = 150
+POSTERIOR_N_MC = 200
 CLOSE_FIGURES  = True
 XB, YB           = (0.0, 2.0), (0.0, 2.0)
 N_CHAINS         = 2
-N_JOBS           = 1
+GP_BACKEND       = "sparse"
 
 
 MALA_STEP = {
@@ -127,9 +122,9 @@ PROFILE_3 = {
 }
 
 T_BY_PROFILE = {
-    "1": {"A": 180, "B": 95}, 
-    "2": {"A": 160, "B": 135}, 
-    "3": {"A": 50, "B": 50},
+    "1": {"A": 100, "B": 55},
+    "2": {"A": 100, "B": 85},
+    "3": {"A": 35, "B": 35},
 }
 GRID_RES_BY_SETTING = {"A": 100, "B": 200}
 
@@ -166,109 +161,106 @@ def f_star_B(x, y):
 F_STAR = {"A": f_star_A, "B": f_star_B}
 
 
-# =============================================
-# Helpers picklables (parallélisation joblib)
-# =============================================
-def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
-    from scipy.special import expit
-    from shapely.prepared import prep
-    from shapely.geometry import Point as ShapelyPoint
-    import numpy as np
+# =========================
+# Construction des modèles
+# =========================
+def make_reference_intensity(zones, mus, latent_field):
+    prepared_zones = [prep(zone) for zone in zones]
 
-    x_flat = np.atleast_1d(x).flatten()
-    y_flat = np.atleast_1d(y).flatten()
-    mu_tilde = np.zeros(len(x_flat))
-    unassigned = np.ones(len(x_flat), dtype=bool)
+    def reference_intensity(x, y):
+        x_values, y_values = np.broadcast_arrays(
+            np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        )
+        flat_x = x_values.reshape(-1)
+        flat_y = y_values.reshape(-1)
+        baseline = np.zeros(flat_x.size, dtype=float)
+        unassigned = np.ones(flat_x.size, dtype=bool)
 
-    for j, pz in enumerate([prep(z) for z in zones_raw]):
-        idx = np.where(unassigned)[0]
-        if len(idx) == 0:
-            break
-        inside = idx[[pz.covers(ShapelyPoint(x_flat[i], y_flat[i])) for i in idx]]
-        if len(inside) > 0:
-            mu_tilde[inside] = mus_vec[j]
-            unassigned[inside] = False
+        for intensity, zone in zip(mus, prepared_zones):
+            indices = np.flatnonzero(unassigned)
+            if indices.size == 0:
+                break
+            inside = np.fromiter(
+                (
+                    zone.covers(ShapelyPoint(flat_x[i], flat_y[i]))
+                    for i in indices
+                ),
+                dtype=bool,
+                count=indices.size,
+            )
+            selected = indices[inside]
+            baseline[selected] = intensity
+            unassigned[selected] = False
 
-    return (mu_tilde * expit(f_func(x_flat, y_flat))).reshape(np.shape(x))
+        values = baseline * expit(latent_field(flat_x, flat_y))
+        return values.reshape(x_values.shape)
+
+    return reference_intensity
 
 
-def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
-              Xb, Yb, nu_init, lambda_nu, delta, jitter,
-              mala_step, t0_nu, step_nu_init,
-              n_iter, thin, verbose, verbose_every,
-              mu_star_func, nx, ny):
-    chain_seed = seed + k
-    model = SSGCModel.from_polygons(
-        polygons=zones_raw,
-        duration=T,
-        x_bounds=Xb,
-        y_bounds=Yb,
+def make_model(zones, duration):
+    return SSGCModel.from_polygons(
+        polygons=zones,
+        duration=duration,
+        x_bounds=XB,
+        y_bounds=YB,
         initial_log_intensities=0.0,
-        gp_prior=GPParameters(*nu_init),
-        eps_prior_variance=delta[0],
-        eps_prior_length_scale=delta[1],
-        nu_prior_rate=lambda_nu,
-        jitter=jitter,
+        gp_prior=GPParameters(
+            variance=NU_INIT[0], length_scale=NU_INIT[1]
+        ),
+        eps_prior_variance=DELTA[0],
+        eps_prior_length_scale=DELTA[1],
+        nu_prior_rate=LAMBDA_NU,
+        jitter=JITTER,
     )
-    config = GibbsConfig(
+
+
+def make_gibbs_config(mala_step):
+    return GibbsConfig(
+        n_iter=N_ITER,
+        thin=THIN,
         mala_step=mala_step,
         learn_nu=LEARN_NU,
-        t0_nu=t0_nu,
-        step_nu_init=step_nu_init,
-        n_iter=n_iter,
-        thin=thin,
-        verbose=verbose,
-        verbose_every=verbose_every,
         use_calibration=USE_CALIB,
-        grid_nx=nx,
-        grid_ny=ny,
+        verbose=VERBOSE,
+        verbose_every=VERBOSE_EVERY,
+        t0_nu=T0_NU,
+        step_nu_init=STEP_NU_INIT,
         compute_emu=False,
     )
-    catalog = EventCatalog(t=t_arr, x=x_arr, y=y_arr)
-    results_k = model.gibbs(
+
+
+def run_chain(chain_index, zones, catalog, duration, mala_step, reference_intensity):
+    chain_seed = SEED + chain_index
+    model = make_model(zones, duration)
+    result = model.gibbs(
         catalog,
-        config=config,
+        config=make_gibbs_config(mala_step),
         rng_seed=chain_seed,
-        reference_intensity=mu_star_func,
-        gp_backend="sparse" if USE_SPARSE_GP else "exact",
+        reference_intensity=reference_intensity,
+        gp_backend=GP_BACKEND,
     )
-    print(f"  [Chain {k+1}] done (seed={chain_seed})")
-    return results_k
+    print(f"  [Chain {chain_index + 1}] done (seed={chain_seed})")
+    return result
 
 
-def launch_chains(zones_raw_list, x_arr, y_arr, t_arr, T,
-                  mala_step, mu_star_func):
-    """Lance N_CHAINS chaînes indépendantes.
-
-    OpenTURNS objects stored in GibbsResults are not robustly picklable, so the
-    default is sequential execution. Use process parallelism only if the worker
-    return object is reduced to pure NumPy/Python data.
-    """
-    if N_JOBS == 1:
-        return [
-            run_chain(
-                k, SEED, zones_raw_list,
-                x_arr, y_arr, t_arr, T,
-                XB, YB, NU_INIT, LAMBDA_NU, DELTA, JITTER,
-                mala_step, T0_NU, STEP_NU_INIT,
-                N_ITER, THIN, VERBOSE, VERBOSE_EVERY,
-                mu_star_func, NX, NY,
-            )
-            for k in range(N_CHAINS)
-        ]
-
-    chain_outputs = Parallel(n_jobs=N_JOBS, prefer="processes")(
-        delayed(run_chain)(
-            k, SEED, zones_raw_list,
-            x_arr, y_arr, t_arr, T,
-            XB, YB, NU_INIT, LAMBDA_NU, DELTA, JITTER,
-            mala_step, T0_NU, STEP_NU_INIT,
-            N_ITER, THIN, VERBOSE, VERBOSE_EVERY,
-            mu_star_func, NX, NY,
+def launch_chains(zones, catalog, duration, mala_step, reference_intensity):
+    """Run independent chains sequentially; Gibbs results contain OT objects."""
+    return [
+        run_chain(
+            chain_index,
+            zones,
+            catalog,
+            duration,
+            mala_step,
+            reference_intensity,
         )
-        for k in range(N_CHAINS)
-    )
-    return list(chain_outputs)
+        for chain_index in range(N_CHAINS)
+    ]
+
+
+def reference_chain(results):
+    return results[len(results) // 2]
 
 
 # ===============
@@ -356,12 +348,6 @@ def print_metrics_table(records):
 # ==========================================
 def run_exp1_config(profile, setting_name, cmap_voronoi="cividis",
                     cmap_intensities="inferno", savefigure=False):
-    import warnings
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
-
     f_star_func  = F_STAR[setting_name]
     T            = T_BY_PROFILE[profile["name"]][setting_name]
     profile_name = profile["name"]
@@ -401,35 +387,26 @@ def run_exp1_config(profile, setting_name, cmap_voronoi="cividis",
         title_savefig=f"ssgc/experiment_1/exp1_dashboard_{profile_name}{setting_name}",
     )
 
-    X_data = simulation.sample
-    N = X_data.getSize()
-    x_arr = np.array([float(X_data[i, 0]) for i in range(N)])
-    y_arr = np.array([float(X_data[i, 1]) for i in range(N)])
-    t_arr = np.array([float(X_data[i, 2]) for i in range(N)])
-    zones_raw_list = list(simulation.domains.polygons)
-    mus_vec_list   = list(simulation.baseline_intensities)
-
-    mu_star_for_workers = partial(
-        mu_star_func_picklable,
-        zones_raw=zones_raw_list,
-        mus_vec=mus_vec_list,
-        f_func=f_star_func,
+    catalog = simulation.catalog
+    zones = list(simulation.domains.polygons)
+    reference_intensity = make_reference_intensity(
+        zones,
+        simulation.baseline_intensities,
+        f_star_func,
     )
 
     records = []
-    k_ref = N_CHAINS // 2
 
     # =========================================================
     # Modèle 1 — SSGC (J zones)
     # =========================================================
-    print(f"\n  >> SSGC (J={len(zones_raw_list)})  — mala_step={step_ssgc}")
+    print(f"\n  >> SSGC (J={len(zones)})  — mala_step={step_ssgc}")
     results_ssgc = launch_chains(
-        zones_raw_list, x_arr, y_arr, t_arr, T,
-        step_ssgc, mu_star_for_workers,
+        zones, catalog, T, step_ssgc, reference_intensity,
     )
-    out_ssgc = results_ssgc[k_ref].posterior_intensity(
+    out_ssgc = reference_chain(results_ssgc).posterior_intensity(
         nx=NX_POST, ny=NY_POST, burn_in=BURN_IN, cmap=cmap_intensities,
-        mu_star_func=mu_star_for_workers,
+        mu_star_func=reference_intensity,
         savefigure=savefigure, savefigure_Emu=savefigure,
         title_savefig=f"ssgc/experiment_1/exp1_intensity_SSGC_{profile_name}{setting_name}",
         title_savefig_Emu=f"ssgc/experiment_1/exp1_Emu_SSGC_{profile_name}{setting_name}",
@@ -450,12 +427,11 @@ def run_exp1_config(profile, setting_name, cmap_voronoi="cividis",
     zones_single = [domain_poly]
 
     results_sgcp = launch_chains(
-        zones_single, x_arr, y_arr, t_arr, T,
-        step_sgcp, mu_star_for_workers,
+        zones_single, catalog, T, step_sgcp, reference_intensity,
     )
-    out_sgcp = results_sgcp[k_ref].posterior_intensity(
+    out_sgcp = reference_chain(results_sgcp).posterior_intensity(
         nx=NX_POST, ny=NY_POST, burn_in=BURN_IN, cmap=cmap_intensities,
-        mu_star_func=mu_star_for_workers,
+        mu_star_func=reference_intensity,
         savefigure=savefigure, savefigure_Emu=savefigure,
         title_savefig=f"ssgc/experiment_1/exp1_intensity_SGCP_{profile_name}{setting_name}",
         title_savefig_Emu=f"ssgc/experiment_1/exp1_Emu_SGCP_{profile_name}{setting_name}",
@@ -472,9 +448,9 @@ def run_exp1_config(profile, setting_name, cmap_voronoi="cividis",
     # Modèle 3 — KDE (pas de posterior)
     # =========================================================
     print(f"\n  >> KDE")
-    mu_kde, GX, GY = compute_kde_intensity(x_arr, y_arr, T)
+    mu_kde, GX, GY = compute_kde_intensity(catalog.x, catalog.y, T)
     grid_pts = np.column_stack([GX.ravel(), GY.ravel()])
-    mu_star_grid = mu_star_for_workers(grid_pts[:, 0], grid_pts[:, 1])
+    mu_star_grid = reference_intensity(grid_pts[:, 0], grid_pts[:, 1])
     kde_metrics = compute_kde_metrics(mu_kde, mu_star_grid)
     records.append({
         "profile": profile_name, "setting": setting_name,

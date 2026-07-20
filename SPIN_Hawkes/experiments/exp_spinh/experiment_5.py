@@ -11,14 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
 from package import ETASParameters
-from sklearn.exceptions import ConvergenceWarning
 
 try:
     from joblib import Parallel, delayed
 except ImportError:
     Parallel = delayed = None
 
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
