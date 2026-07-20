@@ -17,14 +17,12 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.exceptions import ConvergenceWarning
 
 try:
     from joblib import Parallel, delayed
 except ImportError:
     Parallel = delayed = None
 
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 

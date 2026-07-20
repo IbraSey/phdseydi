@@ -36,7 +36,6 @@ MALA_STEP = 0.06
 USE_SPARSE_GP = True
 MAKE_PLOTS = True
 USE_CALIBRATION = True
-CALIBRATION_TARGET = "homogeneous"
 GRID_SIZE = 60
 POST_GRID = 60
 POSTERIOR_N_MC = 100
@@ -114,8 +113,6 @@ def main():
             verbose=True,
             verbose_every=max(1, N_ITER // 10),
             use_calibration=USE_CALIBRATION,
-            calibration_method="openturns",
-            calibration_target=CALIBRATION_TARGET,
             grid_nx=30,
             grid_ny=30,
             compute_emu=False,
