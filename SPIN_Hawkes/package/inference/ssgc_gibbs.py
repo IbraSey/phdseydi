@@ -3,7 +3,7 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
-import openturns.experimental as otexp
+import openturns as otexp
 from polyagamma import random_polyagamma
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint

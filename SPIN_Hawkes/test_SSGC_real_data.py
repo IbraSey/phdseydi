@@ -11,7 +11,7 @@ import seaborn as sns
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel, SparseGP
-
+import openturns as ot
 
 # ===========================================
 # ================= HELPERS =================
@@ -107,7 +107,7 @@ USE_CALIBRATION = True
 T0_NU = 50
 STEP_NU_INIT = 0.0009
 
-N_ITER = 10000
+N_ITER = 5000
 THIN = 5
 BURN_IN = 0.5
 NX_POST, NY_POST = 200, 200
@@ -182,7 +182,6 @@ fit = model.gibbs(
     config=config,
     gp_backend=gp_backend,
     sparse_gp=sparse_gp,
-    reference_intensity=None,
     rng_seed=SEED,
 )
 
