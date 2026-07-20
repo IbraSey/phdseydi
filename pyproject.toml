@@ -1,7 +1,7 @@
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
+ 
 [project]
 name = "phdseydi"
 version = "0.1.0"
@@ -21,16 +21,55 @@ dependencies = [
     "arviz",
     "properscoring",
 ]
-
+ 
 [tool.uv.sources]
 phebus = { path = "./phebus", editable = true }
-
+ 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["Code Gibbs GPETAS", "spatial_density_estimation*", "SPIN_Hawkes*"]
-
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+ 
+# Toutes les dépendances ci-dessous sont résolues via conda-forge (aucun appel à PyPI).
+# Elles reprennent celles de [project.dependencies] ci-dessus, en syntaxe pixi/conda.
+
+[tool.pixi.dependencies]
+python = ">=3.12"
+openturns = ">=1.23"
+scipy = ">=1.11.4"
+numpy = ">=1.26.4"
+pandas = "*"
+matplotlib = "*"
+seaborn = "*"
+shapely = "*"
+scikit-learn = "*"
+polyagamma = "*"
+arviz = "*"
+properscoring = "*"
+ipykernel = ">=7.3.0,<8"
+pyproj = ">=3.7.2,<4"
+ 
+[tool.pixi.feature.dev.dependencies]
+pytest = ">=9.1.1"
+ 
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+ 
+# Rend le code de ton projet importable SANS passer par une installation
+# pip/PyPI editable : on ajoute simplement la racine du projet au PYTHONPATH
+# au moment de l'activation de l'environnement pixi.
+
+[tool.pixi.activation]
+env = { PYTHONPATH = "$PIXI_PROJECT_ROOT" }
+ 
+[tool.pixi.tasks]
+

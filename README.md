@@ -97,14 +97,23 @@ git submodule update
 
 ### Etape 2 : Installation des autres dépendances uv
 
-Les dépendances du projet sont listées dans le fichier *pyproject.toml*. Celui-ci est utilisé par *uv* pour créer un environnement virtuel à la racine du dépôt (dossier *.venv*) contenant tous les paquets Python requis, grâce aux commandes suivantes :
+Les dépendances du projet sont listées dans le fichier *pyproject.toml*. Celui-ci est utilisé par *pixi* pour créer un environnement virtuel à la racine du dépôt (dossier *.venv*) contenant tous les paquets Python requis, grâce aux commandes suivantes :
 
 ```bash
-# Installer uv si ce n'est pas déjà fait
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Installer pixi si ce n'est pas déjà fait
+curl -fsSL https://pixi.sh/install.sh | sh
 
 # Depuis la racine du projet
-uv sync
+pixi install --locked
+
+# Rentrer dans l'env
+pixi shell
+
+# Lancer une commande
+pixi run
+
+# Ajouter une dépendance (mets à jour le pyproject.toml)
+pixi add 
 ```
 
 
