@@ -7,6 +7,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
+from matplotlib.colors import LogNorm
 from scipy.special import expit
 
 from package.config import ETASParameters
@@ -76,6 +77,182 @@ class SPINHVIResults:
             "elbo_trace": np.asarray(self.elbo_trace, dtype=float),
             "diagnostics": dict(self.diagnostics),
         }
+
+    def plot_etas_kernel_dispersion(
+        self,
+        time_lags=None,
+        distances=None,
+        parent_magnitude: float | None = None,
+        reference_parameters: ETASParameters | None = None,
+        n_time: int = 200,
+        show: bool = True,
+    ) -> dict:
+        """Compare temporal and spatio-temporal ETAS kernel dispersion.
+
+        The displayed kernel is evaluated at the variational posterior means.
+        The spatial factor depends on the selected parent magnitude.
+        """
+        kernel = getattr(self.model, "etas_kernel", None)
+        if kernel is None:
+            raise TypeError("The fitted model does not define an ETAS kernel.")
+
+        parameters = self.etas_mean()
+        if parent_magnitude is None:
+            magnitudes = np.asarray(self.catalog.magnitudes, dtype=float)
+            parent_magnitude = (
+                float(np.median(magnitudes))
+                if magnitudes.size
+                else float(self.model.magnitude_min)
+            )
+        parent_magnitude = float(parent_magnitude)
+        if not np.isfinite(parent_magnitude):
+            raise ValueError("parent_magnitude must be finite.")
+
+        if time_lags is None:
+            if n_time < 2:
+                raise ValueError("n_time must be at least 2.")
+            c_values = [parameters.c]
+            if reference_parameters is not None:
+                c_values.append(reference_parameters.c)
+            lower = max(min(c_values) * 1e-2, self.model.duration * 1e-6, 1e-8)
+            upper = max(float(self.model.duration), 10.0 * lower)
+            time_lags = np.geomspace(lower, upper, int(n_time))
+        else:
+            time_lags = np.sort(np.asarray(time_lags, dtype=float).reshape(-1))
+            if time_lags.size == 0 or np.any(~np.isfinite(time_lags)):
+                raise ValueError("time_lags must contain finite values.")
+            if np.any(time_lags <= 0.0):
+                raise ValueError("time_lags must be strictly positive.")
+
+        if distances is None:
+            magnitude = np.asarray([parent_magnitude], dtype=float)
+            scales = [
+                float(
+                    kernel.spatial.scale(
+                        magnitude, parameters, self.model.magnitude_min
+                    )[0]
+                )
+            ]
+            if reference_parameters is not None:
+                scales.append(
+                    float(
+                        kernel.spatial.scale(
+                            magnitude,
+                            reference_parameters,
+                            self.model.magnitude_min,
+                        )[0]
+                    )
+                )
+            characteristic_radius = np.sqrt(max(scales))
+            distances = characteristic_radius * np.asarray(
+                [0.0, 0.5, 1.0, 2.0, 4.0]
+            )
+        else:
+            distances = np.asarray(distances, dtype=float).reshape(-1)
+            if distances.size == 0 or np.any(~np.isfinite(distances)):
+                raise ValueError("distances must contain finite values.")
+            if np.any(distances < 0.0):
+                raise ValueError("distances must be non-negative.")
+
+        parent_magnitudes = np.full(distances.shape, parent_magnitude)
+
+        def evaluate(current_parameters):
+            phi_t = kernel.temporal.evaluate(time_lags, current_parameters)
+            phi_s = kernel.spatial.evaluate(
+                distances**2,
+                parent_magnitudes,
+                current_parameters,
+                self.model.magnitude_min,
+            )
+            return phi_t, phi_s, phi_t[:, None] * phi_s[None, :]
+
+        phi_t, phi_s, phi_st = evaluate(parameters)
+        reference = (
+            None if reference_parameters is None else evaluate(reference_parameters)
+        )
+
+        figure, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+        axes[0].plot(time_lags, phi_t, label="VI plug-in estimate")
+        if reference is not None:
+            axes[0].plot(time_lags, reference[0], "--", label="Reference")
+        axes[0].set(
+            xscale="log",
+            yscale="log",
+            xlabel="Time lag",
+            ylabel=r"$\phi_t(\tau)$",
+        )
+        axes[0].set_title("Temporal dispersion")
+        axes[0].legend()
+
+        colors = plt.cm.viridis(np.linspace(0.05, 0.9, distances.size))
+        for index, (distance, color) in enumerate(zip(distances, colors)):
+            label = f"r={distance:.3g}"
+            axes[1].plot(time_lags, phi_st[:, index], color=color, label=label)
+            if reference is not None:
+                axes[1].plot(
+                    time_lags,
+                    reference[2][:, index],
+                    "--",
+                    color=color,
+                    alpha=0.8,
+                )
+        axes[1].set(
+            xscale="log",
+            yscale="log",
+            xlabel="Time lag",
+            ylabel=r"$\phi_t(\tau)\phi_s(r\mid m)$",
+        )
+        axes[1].set_title("Spatio-temporal dispersion")
+        axes[1].legend(fontsize="small")
+
+        positive_values = phi_st[phi_st > 0.0]
+        if positive_values.size == 0 or np.any(~np.isfinite(phi_st)):
+            raise ValueError("The evaluated ETAS kernel is not finite and positive.")
+        vmin = float(positive_values.min())
+        vmax = float(positive_values.max())
+        if vmax <= vmin:
+            vmax = np.nextafter(vmin, np.inf)
+        image = axes[2].pcolormesh(
+            time_lags,
+            distances,
+            phi_st.T,
+            shading="auto",
+            cmap="magma",
+            norm=LogNorm(vmin=vmin, vmax=vmax),
+        )
+        axes[2].set(xscale="log", xlabel="Time lag", ylabel="Distance")
+        axes[2].set_title("Kernel at VI parameter means")
+        figure.colorbar(
+            image,
+            ax=axes[2],
+            label=r"$\phi_t(\tau)\phi_s(r\mid m)$",
+        )
+        figure.suptitle(
+            f"ETAS dispersion for parent magnitude m={parent_magnitude:.3g}"
+        )
+        figure.tight_layout()
+        if show:
+            plt.show()
+
+        result = {
+            "figure": figure,
+            "axes": axes,
+            "time_lags": time_lags,
+            "distances": distances,
+            "parent_magnitude": parent_magnitude,
+            "phi_t": phi_t,
+            "phi_s": phi_s,
+            "phi_spatiotemporal": phi_st,
+        }
+        if reference is not None:
+            result.update(
+                {
+                    "reference_phi_t": reference[0],
+                    "reference_phi_s": reference[1],
+                    "reference_phi_spatiotemporal": reference[2],
+                }
+            )
+        return result
 
     def declustering(self, background_threshold: float = 0.5) -> dict:
         """Return a two-stage declustering decision from q(Z)."""
