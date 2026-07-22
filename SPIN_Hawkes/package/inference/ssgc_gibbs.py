@@ -3,7 +3,6 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
-import openturns as otexp
 from polyagamma import random_polyagamma
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
@@ -957,7 +956,7 @@ class SSGC_GibbsSampler:
         covariance_model = ot.SquaredExponential(
             [1.0] * dimension, [1.0]
         )
-        fitter = otexp.GaussianProcessFitter(
+        fitter = ot.GaussianProcessFitter(
             sample_ot,
             ot.Sample(target.reshape(-1, 1).tolist()),
             covariance_model,
