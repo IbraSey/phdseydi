@@ -3,6 +3,7 @@
 # ================= IMPORTS =================
 # ===========================================
 from pathlib import Path
+import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -10,6 +11,11 @@ import pyproj
 import seaborn as sns
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
+
+# Add path to SPIN_Hawkes folder
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Add path to SPIN_Hawkes folder
 from package import EventCatalog, GPParameters, GibbsConfig, SSGCModel, SparseGP
 import openturns as ot
 
