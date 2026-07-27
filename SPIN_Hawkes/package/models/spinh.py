@@ -1,6 +1,6 @@
 """SPIN-H model: SSGC background plus marked ETAS triggering."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -16,32 +16,11 @@ class SPINHModel(SSGCModel):
 
     etas_parameters: ETASParameters = field(default_factory=ETASParameters)
     etas_kernel: ETASKernel = field(default_factory=ETASKernel)
-    magnitude_min: float = 0.0
-    magnitude_max: float | None = None
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.magnitude_min = float(self.magnitude_min)
-        if not np.isfinite(self.magnitude_min):
-            raise ValueError("magnitude_min must be finite.")
-        if self.magnitude_max is not None:
-            self.magnitude_max = float(self.magnitude_max)
-            if not np.isfinite(self.magnitude_max):
-                raise ValueError("magnitude_max must be finite.")
-            if self.magnitude_max < self.magnitude_min:
-                raise ValueError("magnitude_max must be >= magnitude_min.")
 
     def validate_catalog(self, catalog: EventCatalog) -> np.ndarray:
         indices = super().validate_catalog(catalog)
         if self.etas_parameters.marked and catalog.magnitudes is None:
             raise ValueError("The marked ETAS model requires event magnitudes.")
-        if catalog.magnitudes is not None:
-            if np.any(catalog.magnitudes < self.magnitude_min):
-                raise ValueError("Catalog magnitudes must be >= magnitude_min.")
-            if self.magnitude_max is not None and np.any(
-                catalog.magnitudes > self.magnitude_max
-            ):
-                raise ValueError("Catalog magnitudes exceed magnitude_max.")
         return indices
 
     def gibbs(
@@ -104,7 +83,15 @@ class SPINHModel(SSGCModel):
             config = SPINHVIConfig(random_seed=rng_seed)
         elif not isinstance(config, SPINHVIConfig):
             raise TypeError("config must be a SPINHVIConfig instance.")
-        engine = SPINHVI(self, catalog, config=config)
+        inference_model = self
+        if config.use_calibration:
+            calibrated_prior = self.calibrate_gp_prior(
+                catalog,
+                rng_seed=config.random_seed,
+                verbose=config.verbose,
+            )
+            inference_model = replace(self, gp_prior=calibrated_prior)
+        engine = SPINHVI(inference_model, catalog, config=config)
         return engine.fit()
 
     def triggering_intensity(

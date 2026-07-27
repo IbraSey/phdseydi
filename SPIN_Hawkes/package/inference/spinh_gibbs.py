@@ -56,7 +56,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         "d":     (np.log(1e-8),  np.log(50.0)),
         "q_m1":  (np.log(1e-4),  np.log(20.0)),
         "gamma": (np.log(1e-4),  np.log(20.0)),
-        "beta":  (np.log(0.1),   np.log(30.0)),
     }
 
     # ─────────────────────────────────────────────────────────
@@ -76,27 +75,20 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         """Initialize the SPIN-Hawkes sampler; see the class docstring for parameters."""
         if not isinstance(model, SPINHModel):
             raise TypeError("model must be a SPINHModel instance.")
-        super().__init__(model=model, rng_seed=rng_seed)
+        super().__init__(
+            model=model,
+            m=m,
+            beta_init=beta_init,
+            beta_priors=beta_priors,
+            sigma_MH_beta=sigma_MH_beta,
+            t0_beta=t0_etas,
+            eps_mh_beta=eps_mh_etas,
+            rng_seed=rng_seed,
+        )
         self.use_etas = True
         self.t0_etas = t0_etas
         self.eps_mh_etas = eps_mh_etas
         self.sigma_MH_etas = sigma_MH_etas
-        self.sigma_MH_beta = sigma_MH_beta
-
-        self.m_c = model.magnitude_min
-        if m is not None:
-            self.m = np.asarray(m)
-            self.use_magnitudes = True
-            self.m_max = (
-                model.magnitude_max
-                if model.magnitude_max is not None
-                else float(np.max(self.m)) + 1.0
-            )
-            self.beta = float(beta_init)
-            self.beta_priors = {"a_beta": 2.0, "b_beta": 1.0, **(beta_priors or {})}
-        else:
-            self.m, self.use_magnitudes = None, False
-            self.m_max, self.beta, self.beta_priors = None, None, None
 
         self.theta_phi = model.etas_parameters.as_dict()
         self.fixed_etas = {}
@@ -707,77 +699,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             return True
         return False
 
-    # ─────────────────────────────────────────────────────────
-    #  Block β  (d = 1)
-    #
-    #  log p(β|·) ∝  (a_β−1+N) log β − N log(1−e^{−β Δm})
-    #              − β Σ(m_i−m_c) − b_β β
-    # ─────────────────────────────────────────────────────────
-
-    def _log_posterior_beta(self, beta):
-        """Evaluate the truncated Gutenberg-Richter log-posterior.
-        
-        Parameters
-        ----------
-        beta : float
-            Candidate positive rate on ``[m_c, m_max]``.
-        
-        Returns
-        -------
-        float
-            Unnormalized log-posterior, or ``-inf`` outside the support."""
-        if beta <= 0:
-            return -np.inf
-        N = len(self.m)
-        bm = beta * (self.m_max - self.m_c)
-        log_trunc = np.log(-np.expm1(-bm))  # = log(1 − e^{−bm}), stable
-        if not np.isfinite(log_trunc):
-            return -np.inf
-        bp = self.beta_priors
-        return ((bp["a_beta"] - 1 + N) * np.log(beta)
-                - N * log_trunc
-                - beta * np.sum(self.m - self.m_c)
-                - bp["b_beta"] * beta)
-
-    def update_beta(self, history, it):
-        """Update the Gutenberg-Richter rate with adaptive Metropolis.
-        
-        Parameters
-        ----------
-        history : list
-            Previous ``log(beta)`` states; appended in place.
-        it : int
-            Current Gibbs iteration.
-        
-        Returns
-        -------
-        accepted : bool
-            Whether the log-scale proposal was accepted."""
-        sd = 2.38 ** 2
-        B = self._LOG_BOUNDS
-        log_cur = np.log(self.beta)
-        history.append(log_cur)
-
-        if it > self.t0_etas and len(history) > self.t0_etas:
-            std = np.sqrt(sd * np.var(history, ddof=1) + self.eps_mh_etas)
-        else:
-            std = self.sigma_MH_beta
-
-        log_star = log_cur + std * float(ot.Normal().getRealization()[0])
-        if not (B["beta"][0] <= log_star <= B["beta"][1]):
-            return False
-        beta_s = np.exp(log_star)
-
-        lp_cur = self._log_posterior_beta(self.beta)
-        lp_star = self._log_posterior_beta(beta_s)
-        if not np.isfinite(lp_star):
-            return False
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + (log_star - log_cur)):
-            self.beta = beta_s
-            return True
-        return False
-
-    # ─────────────────────────────────────────────────────────
     #  run
     # ─────────────────────────────────────────────────────────
 
