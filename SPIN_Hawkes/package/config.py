@@ -76,38 +76,48 @@ class GibbsConfig:
     emu_every: int = 10
     grid_nx: int = 30
     grid_ny: int = 30
+    beta_init: float = 2.3
+    fixed_beta: float | None = None
+    beta_prior: dict[str, float] = field(
+        default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
+    )
+    sigma_mh_beta: float = 0.1
+    adaptation_start: int = 50
+    proposal_jitter: float = 1e-6
 
     def __post_init__(self):
         if self.n_iter <= 0 or self.thin <= 0:
             raise ValueError("n_iter and thin must be positive.")
         if self.mala_step <= 0 or self.verbose_every <= 0:
             raise ValueError("mala_step and verbose_every must be positive.")
+        if self.beta_init <= 0:
+            raise ValueError("beta_init must be positive.")
+        if self.fixed_beta is not None and self.fixed_beta <= 0:
+            raise ValueError("fixed_beta must be positive.")
+        if self.sigma_mh_beta <= 0:
+            raise ValueError("sigma_mh_beta must be positive.")
+        if self.adaptation_start < 0:
+            raise ValueError("adaptation_start must be non-negative.")
+        if self.proposal_jitter <= 0:
+            raise ValueError("proposal_jitter must be positive.")
+        for name in ("a_beta", "b_beta"):
+            value = self.beta_prior.get(name)
+            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
+                raise ValueError(f"beta_prior['{name}'] must be positive and finite.")
 
 
 @dataclass(frozen=True)
 class SPINHGibbsConfig(GibbsConfig):
     """Configuration of a SPIN-H Gibbs run, including ETAS updates."""
 
-    beta_init: float = 2.3
-    fixed_beta: float | None = None
-    beta_prior: dict[str, float] = field(
-        default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
-    )
     theta_priors: dict[str, float] = field(default_factory=dict)
     fixed_etas: dict[str, float] = field(default_factory=dict)
     sample_z: bool = True
     known_z: object = None
     sigma_mh_etas: float = 0.1
-    sigma_mh_beta: float = 0.1
-    adaptation_start: int = 50
-    proposal_jitter: float = 1e-6
 
     def __post_init__(self):
         super().__post_init__()
-        if self.beta_init <= 0:
-            raise ValueError("beta_init must be positive.")
-        if self.fixed_beta is not None and self.fixed_beta <= 0:
-            raise ValueError("fixed_beta must be positive.")
         unknown_fixed = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
         if unknown_fixed:
             raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown_fixed)}")
@@ -116,12 +126,8 @@ class SPINHGibbsConfig(GibbsConfig):
                 raise ValueError("fixed_etas values must be numeric.")
         if not isinstance(self.sample_z, bool):
             raise ValueError("sample_z must be a boolean.")
-        if self.sigma_mh_etas <= 0 or self.sigma_mh_beta <= 0:
-            raise ValueError("Metropolis proposal scales must be positive.")
-        if self.adaptation_start < 0:
-            raise ValueError("adaptation_start must be non-negative.")
-        if self.proposal_jitter <= 0:
-            raise ValueError("proposal_jitter must be positive.")
+        if self.sigma_mh_etas <= 0:
+            raise ValueError("sigma_mh_etas must be positive.")
 
 
 @dataclass(frozen=True)
@@ -160,6 +166,7 @@ class SPINHVIConfig:
     max_optimizer_iter: int = 20
     etas_quadrature_nodes: int = 8
     gp_backend: str = "exact"
+    use_calibration: bool = False
     sparse_gp: object | None = None
     spatial_compensator_grid: int = 0
     jitter: float = 1e-6
@@ -167,7 +174,7 @@ class SPINHVIConfig:
     def __post_init__(self):
         if self.n_iter <= 0:
             raise ValueError("n_iter must be positive.")
-        if self.tolerance <= 0:
+        if not isfinite(self.tolerance) or self.tolerance <= 0:
             raise ValueError("tolerance must be positive.")
         if self.verbose_every <= 0:
             raise ValueError("verbose_every must be positive.")
@@ -189,18 +196,50 @@ class SPINHVIConfig:
             raise ValueError("gp_backend must be 'exact' or 'sparse'.")
         if self.sparse_gp is not None and str(self.gp_backend).lower() != "sparse":
             raise ValueError("sparse_gp requires gp_backend='sparse'.")
+        if self.use_calibration and self.sparse_gp is not None:
+            raise ValueError(
+                "use_calibration=True cannot be combined with an injected sparse_gp."
+            )
         if self.spatial_compensator_grid < 0:
             raise ValueError("spatial_compensator_grid must be non-negative.")
-        if self.jitter <= 0:
+        if not isfinite(self.jitter) or self.jitter <= 0:
             raise ValueError("jitter must be positive.")
-        if self.fixed_beta is not None and self.fixed_beta <= 0:
-            raise ValueError("fixed_beta must be positive.")
+        if self.fixed_beta is not None and (
+            not isinstance(self.fixed_beta, Real)
+            or not isfinite(self.fixed_beta)
+            or self.fixed_beta <= 0
+        ):
+            raise ValueError("fixed_beta must be positive and finite.")
         unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
         if unknown:
             raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown)}")
         for name, value in self.fixed_etas.items():
-            if not isinstance(value, (int, float)):
-                raise ValueError(f"fixed_etas[{name!r}] must be numeric.")
+            if not isinstance(value, Real) or not isfinite(value):
+                raise ValueError(f"fixed_etas[{name!r}] must be finite.")
+        beta_prior_names = {"a_beta", "b_beta"}
+        unknown_beta_priors = set(self.beta_prior).difference(beta_prior_names)
+        if unknown_beta_priors:
+            raise ValueError(
+                f"Unknown beta prior parameters: {sorted(unknown_beta_priors)}"
+            )
+        for name, value in self.beta_prior.items():
+            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
+                raise ValueError(f"beta_prior[{name!r}] must be positive and finite.")
+        theta_prior_names = {
+            f"{prefix}_{name}"
+            for name in ETAS_PARAMETER_NAMES
+            for prefix in ("a", "b")
+        }
+        unknown_theta_priors = set(self.theta_priors).difference(theta_prior_names)
+        if unknown_theta_priors:
+            raise ValueError(
+                f"Unknown ETAS prior parameters: {sorted(unknown_theta_priors)}"
+            )
+        for name, value in self.theta_priors.items():
+            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
+                raise ValueError(
+                    f"theta_priors[{name!r}] must be positive and finite."
+                )
         unknown_initial = set(self.initial_gamma_factors).difference(
             VI_GAMMA_FACTOR_NAMES
         )

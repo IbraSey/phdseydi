@@ -44,9 +44,17 @@ class SSGC_GibbsSampler:
         Jitter-regularized OpenTURNS representation of ``Sigma_eps`` used by the
         linear solvers."""
 
+    _BETA_LOG_BOUNDS = (np.log(0.1), np.log(30.0))
+
     def __init__(
         self,
         model,
+        m=None,
+        beta_init=2.3,
+        beta_priors=None,
+        sigma_MH_beta=0.1,
+        t0_beta=50,
+        eps_mh_beta=1e-6,
         rng_seed=None,
     ):
         """Initialize the SSGC sampler; see the class docstring for parameters."""
@@ -62,6 +70,30 @@ class SSGC_GibbsSampler:
         self.delta = ot.Point([model.eps_prior_variance, model.eps_prior_length_scale])
         self.jitter = float(model.jitter)
         self.domain_partition = model.domains
+        self.m_c = float(model.magnitude_min)
+        if m is None:
+            self.m = None
+            self.m_max = None
+            self.beta = None
+            self.beta_priors = None
+            self.use_magnitudes = False
+        else:
+            self.m = np.asarray(m, dtype=float).reshape(-1)
+            self.m_max = (
+                float(model.magnitude_max)
+                if model.magnitude_max is not None
+                else float(np.max(self.m)) + 1.0
+            )
+            self.beta = float(beta_init)
+            self.beta_priors = {
+                "a_beta": 2.0,
+                "b_beta": 1.0,
+                **(beta_priors or {}),
+            }
+            self.use_magnitudes = True
+        self.sigma_MH_beta = float(sigma_MH_beta)
+        self.t0_beta = int(t0_beta)
+        self.eps_mh_beta = float(eps_mh_beta)
 
         self.domains = list(self.domain_partition.polygons)
         self.prepared_domains = list(self.domain_partition.prepared_domains)
@@ -83,6 +115,56 @@ class SSGC_GibbsSampler:
             (self.Sigma_eps + self.jitter * np.eye(self.J)).tolist()
         )
         self.Sigma_eps_cov = Sigma_eps_reg
+
+    def _log_posterior_beta(self, beta):
+        """Evaluate the truncated Gutenberg--Richter log-posterior."""
+        if not self.use_magnitudes or beta <= 0.0:
+            return -np.inf
+        n_events = self.m.size
+        scaled_width = beta * (self.m_max - self.m_c)
+        log_normalizer = np.log(-np.expm1(-scaled_width))
+        if not np.isfinite(log_normalizer):
+            return -np.inf
+        prior = self.beta_priors
+        return (
+            (prior["a_beta"] - 1.0 + n_events) * np.log(beta)
+            - n_events * log_normalizer
+            - beta * np.sum(self.m - self.m_c)
+            - prior["b_beta"] * beta
+        )
+
+    def update_beta(self, history, iteration):
+        """Update the Gutenberg--Richter rate by adaptive MH on log(beta)."""
+        log_current = np.log(self.beta)
+        history.append(log_current)
+        if iteration > self.t0_beta and len(history) > self.t0_beta:
+            proposal_sd = np.sqrt(
+                2.38**2 * np.var(history, ddof=1) + self.eps_mh_beta
+            )
+        else:
+            proposal_sd = self.sigma_MH_beta
+
+        log_proposed = (
+            log_current
+            + proposal_sd * float(ot.Normal().getRealization()[0])
+        )
+        lower, upper = self._BETA_LOG_BOUNDS
+        if not lower <= log_proposed <= upper:
+            return False
+
+        proposed = np.exp(log_proposed)
+        log_ratio = (
+            self._log_posterior_beta(proposed)
+            - self._log_posterior_beta(self.beta)
+            + log_proposed
+            - log_current
+        )
+        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(
+            0.0, log_ratio
+        ):
+            self.beta = proposed
+            return True
+        return False
 
     def compute_Sigma_eps(self):
         """Build the structured Gaussian prior covariance Σ_ε for the zonal log-intensities.
@@ -979,7 +1061,8 @@ class SSGC_GibbsSampler:
     # ----------------------------------------- Run du Gibbs ------------------------------------------
     # =================================================================================================
 
-    def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False, t0_nu=50,
+    def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False,
+        fixed_beta=None, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
         compute_emu=True, emu_every=10,
@@ -1000,6 +1083,9 @@ class SSGC_GibbsSampler:
             Number of Gibbs iterations.
         learn_nu : bool, optional
             Update GP hyperparameters with adaptive Metropolis.
+        fixed_beta : float or None, optional
+            Fixed Gutenberg--Richter rate. When ``None`` and magnitudes were
+            supplied to the sampler, beta is sampled from its posterior.
         t0_nu : int, optional
             Warm-up length for GP-hyperparameter adaptation.
         step_nu_init : float, optional
@@ -1035,11 +1121,19 @@ class SSGC_GibbsSampler:
         Returns
         -------
         results : dict
-            Stored chains ``eps``, ``nPi``, ``f_data`` and ``nu``; the full-length
+            Stored chains ``eps``, ``nPi``, ``f_data``, ``nu`` and optional
+            ``beta``; the full-length
             ``E_mu`` diagnostic (NaN where not evaluated); acceptance rates; final
             state; covariance metadata; and storage settings."""
 
         N = len(t)
+        if fixed_beta is not None:
+            fixed_beta = float(fixed_beta)
+            if fixed_beta <= 0.0:
+                raise ValueError("fixed_beta must be positive.")
+            if self.use_magnitudes:
+                self.beta = fixed_beta
+        sample_beta = bool(self.use_magnitudes and fixed_beta is None)
         Z = ot.Point([0.0] * N)
         N_j, _ = self._count_events_per_zone(x, y, Z, ot.Sample(0, 3))
 
@@ -1117,11 +1211,14 @@ class SSGC_GibbsSampler:
         gp_coeffs_chain = (
             np.zeros((n_store, int(sparse_gp.m))) if gp_backend == "sparse" else None
         )
+        beta_chain = np.zeros(n_store) if self.use_magnitudes else None
         E_mu_chain = np.full(n_iter, np.nan)      # Je garde toutes les it pour E_mu
         store_idx = 0       # compteur de stockage
         acc_eps = 0
         acc_nu = 0
+        acc_beta = 0
         history_log_nu = []         # used only when learn_nu=True
+        history_log_beta = []
 
         if verbose:
             print("\n" + "=" * 100)
@@ -1168,6 +1265,9 @@ class SSGC_GibbsSampler:
                     )
                     acc_nu += int(accepted_nu)
 
+                if sample_beta:
+                    acc_beta += int(self.update_beta(history_log_beta, it))
+
                 
                 # ---------- Affichage ----------
                 if verbose and (it % verbose_every == 0 or it == n_iter - 1):
@@ -1181,6 +1281,14 @@ class SSGC_GibbsSampler:
                         acc_rate_nu = acc_nu / (it + 1) * 100
                         msg += (f" | nu = {np.round(np.array(self.nu), 4)}"
                                 f" | acc_nu = {np.round(acc_rate_nu, 1)}%")
+                    if self.use_magnitudes:
+                        if sample_beta:
+                            msg += (
+                                f" | beta = {self.beta:.3f}"
+                                f" | acc_beta = {acc_beta / (it + 1) * 100:.1f}%"
+                            )
+                        else:
+                            msg += f" | beta = {self.beta:.3f} fixed"
                     print(msg)
 
                 # ---------- Calcul de Eps_mu^(t) ----------
@@ -1221,6 +1329,8 @@ class SSGC_GibbsSampler:
                     nu_chain[store_idx, :] = np.array(self.nu)
                     if gp_coeffs_chain is not None:
                         gp_coeffs_chain[store_idx, :] = np.asarray(gp_coeffs, dtype=float)
+                    if beta_chain is not None:
+                        beta_chain[store_idx] = self.beta
                     store_idx += 1
 
             except Exception as e:
@@ -1236,6 +1346,11 @@ class SSGC_GibbsSampler:
             if learn_nu:
                 print(f"nu acceptance rate : {np.round(acc_nu  / n_iter * 100, 1)}%"
                       f" (target ~23% -> {'increase' if acc_nu/n_iter > 0.23 else 'decrease'} step_nu_init)")
+            if sample_beta:
+                print(
+                    "beta acceptance rate : "
+                    f"{np.round(acc_beta / n_iter * 100, 1)}%"
+                )
 
         return {
             "eps"            : eps_chain[:store_idx],
@@ -1245,7 +1360,14 @@ class SSGC_GibbsSampler:
             "E_mu"           : E_mu_chain,
             "acceptance_eps" : acc_eps / n_iter,
             "acceptance_nu"  : acc_nu / n_iter if learn_nu else None,
-            "last_state"     : {"eps": eps_arr, "nu": list(self.nu), "delta": list(self.delta)},
+            "beta"           : beta_chain[:store_idx] if beta_chain is not None else None,
+            "acceptance_beta": acc_beta / n_iter if sample_beta else None,
+            "last_state"     : {
+                "eps": eps_arr,
+                "nu": list(self.nu),
+                "delta": list(self.delta),
+                "beta": self.beta,
+            },
             "Sigma_eps"      : self.Sigma_eps,
             "centroids"      : self.centroids_xy,
             "thin"           : thin,
@@ -1253,5 +1375,13 @@ class SSGC_GibbsSampler:
             "gp_backend"     : gp_backend,
             "gp_coeffs"      : gp_coeffs_chain[:store_idx] if gp_coeffs_chain is not None else None,
             "sparse_gp"      : sparse_gp if gp_backend == "sparse" else None,
+            "use_etas"       : False,
+            "use_magnitudes" : self.use_magnitudes,
+            "sample_beta"    : sample_beta,
+            "fixed_beta"     : fixed_beta if self.use_magnitudes else None,
+            "am_history"     : {
+                "beta": np.asarray(history_log_beta) if history_log_beta else None,
+                "nu": np.asarray(history_log_nu) if history_log_nu else None,
+            },
         }
     

@@ -49,7 +49,7 @@ class BranchingFactor:
 
     @classmethod
     def background_initialization(cls, n_events: int):
-        probabilities = np.zeros((n_events, n_events + 1), dtype=float)
+        probabilities = np.zeros((n_events, n_events), dtype=float)
         probabilities[:, 0] = 1.0
         return cls(probabilities)
 
@@ -75,7 +75,7 @@ class LatentPoissonFactor:
     grid_xy: np.ndarray
     grid_domain_index: np.ndarray
     grid_intensity: np.ndarray
-    cell_area: float
+    quadrature_weights: np.ndarray
     expected_counts_by_domain: np.ndarray
 
     @property
@@ -275,7 +275,7 @@ class SPINHVI:
         ) / np.sqrt(self.sparse_gp.L2)
         return phi_x * phi_y * self.sparse_gp.sqrt_Delta[None, :]
 
-    def _make_quadrature_grid(self) -> tuple[np.ndarray, np.ndarray, float]:
+    def _make_quadrature_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         nx = self.config.quadrature_nx
         ny = self.config.quadrature_ny
         x_edges = np.linspace(self.model.x_bounds[0], self.model.x_bounds[1], nx + 1)
@@ -286,8 +286,23 @@ class SPINHVI:
         grid_xy = np.column_stack([X.ravel(), Y.ravel()])
         domain_index = self.model.domains.locate(grid_xy[:, 0], grid_xy[:, 1])
         inside = domain_index >= 0
-        cell_area = float((x_edges[1] - x_edges[0]) * (y_edges[1] - y_edges[0]))
-        return grid_xy[inside], domain_index[inside], cell_area
+        grid_xy = grid_xy[inside]
+        domain_index = domain_index[inside]
+        points_per_domain = np.bincount(
+            domain_index,
+            minlength=self.model.n_domains,
+        )
+        missing_domains = np.flatnonzero(points_per_domain == 0)
+        if missing_domains.size:
+            raise ValueError(
+                "The VI quadrature grid has no point in domain(s) "
+                f"{missing_domains.tolist()}; increase quadrature_nx/quadrature_ny."
+            )
+        domain_areas = np.asarray(self.model.domains.areas, dtype=float)
+        quadrature_weights = (
+            domain_areas[domain_index] / points_per_domain[domain_index]
+        )
+        return grid_xy, domain_index, quadrature_weights
 
     def _magnitudes(self) -> np.ndarray:
         if self.catalog.magnitudes is None:
@@ -380,7 +395,7 @@ class SPINHVI:
         if parameter_name in self.config.fixed_etas:
             value = float(self.config.fixed_etas[parameter_name])
             if moment == "log":
-                return np.log(max(value, self.config.jitter))
+                return -np.inf if value == 0.0 else np.log(value)
             if name in {"p_minus_1", "q_minus_1"}:
                 shifted = max(value - 1.0, self.config.jitter)
                 return np.log(shifted) if moment == "log_shifted" else shifted
@@ -521,7 +536,7 @@ class SPINHVI:
         )
         return np.exp(log_values)
 
-    def _expected_log_spatial_tail(
+    def _expected_log_spatial_scale_plus_distance(
         self,
         r2: np.ndarray,
         dm: np.ndarray,
@@ -532,10 +547,27 @@ class SPINHVI:
         if self.model.etas_parameters.marked:
             gamma_nodes, gamma_weights = self._gamma_quadrature("gamma")
         values = np.zeros_like(r2, dtype=float)
+        log_r2 = np.full_like(r2, -np.inf, dtype=float)
+        positive_distance = r2 > 0.0
+        log_r2[positive_distance] = np.log(r2[positive_distance])
         for d_value, d_weight in zip(d_nodes, d_weights):
             for gamma_value, gamma_weight in zip(gamma_nodes, gamma_weights):
-                scale = d_value * np.exp(gamma_value * dm)
-                values += d_weight * gamma_weight * np.log1p(r2 / np.maximum(scale, self.config.jitter))
+                log_scale = np.log(d_value) + gamma_value * dm
+                values += (
+                    d_weight
+                    * gamma_weight
+                    * np.logaddexp(log_scale, log_r2)
+                )
+        if np.any(~positive_distance):
+            gamma_mean = (
+                0.0
+                if not self.model.etas_parameters.marked
+                else self._fixed_or_factor_value("gamma")
+            )
+            values[~positive_distance] = (
+                self._fixed_or_factor_value("d", "log")
+                + gamma_mean * dm[~positive_distance]
+            )
         return values
 
     def _pair_expected_log_etas(self, child_idx, parent_idx) -> np.ndarray:
@@ -570,6 +602,13 @@ class SPINHVI:
         )
         p_minus_1_mean = self._fixed_or_factor_value("p_minus_1")
         q_minus_1_mean = self._fixed_or_factor_value("q_minus_1")
+        expected_log_scale = (
+            self._fixed_or_factor_value("d", "log")
+            + gamma_mean * dm
+        )
+        expected_log_scale_plus_r2 = (
+            self._expected_log_spatial_scale_plus_distance(r2, dm)
+        )
         temporal = (
             self._fixed_or_factor_value("p_minus_1", "log_shifted")
             + p_minus_1_mean * self._fixed_or_factor_value("c", "log")
@@ -578,9 +617,8 @@ class SPINHVI:
         spatial = (
             self._fixed_or_factor_value("q_minus_1", "log_shifted")
             - np.log(np.pi)
-            - self._fixed_or_factor_value("d", "log")
-            - gamma_mean * dm
-            - (1.0 + q_minus_1_mean) * self._expected_log_spatial_tail(r2, dm)
+            + q_minus_1_mean * expected_log_scale
+            - (1.0 + q_minus_1_mean) * expected_log_scale_plus_r2
         )
         out[valid] = (
             self._fixed_or_factor_value("A", "log")
@@ -691,14 +729,16 @@ class SPINHVI:
             shifted = value - 1.0 if name in {"p", "q"} else value
             a = self.priors.get(f"a_{name}", 1.0)
             b = self.priors.get(f"b_{name}", 1.0)
-            if name in self.config.fixed_etas or factor_name not in self.state.etas.gamma_factors:
+            if name in self.config.fixed_etas:
+                continue
+            if factor_name not in self.state.etas.gamma_factors:
                 total += self._gamma_prior_log_density(shifted, a, b)
-            else:
-                total += self._gamma_prior_entropy_term(
-                    self.state.etas.gamma_factors[factor_name],
-                    a,
-                    b,
-                )
+                continue
+            total += self._gamma_prior_entropy_term(
+                self.state.etas.gamma_factors[factor_name],
+                a,
+                b,
+            )
         return float(total)
 
     def _etas_elbo(self) -> float:
@@ -750,7 +790,7 @@ class SPINHVI:
 
     def _update_branching(self):
         n_events = len(self.catalog)
-        probabilities = np.zeros((n_events, n_events + 1), dtype=float)
+        probabilities = np.zeros((n_events, n_events), dtype=float)
         eps = self.state.eps.mean
         bg_log = eps[self.domain_index] + self._observed_log_sigmoid_expectation(
             self.state.gp.f_data_mean,
@@ -766,18 +806,13 @@ class SPINHVI:
 
     def _update_polya_gamma(self):
         second_moment = self.state.gp.f_data_mean**2 + self.state.gp.f_data_var
-        c = np.sqrt(
-            np.maximum(
-                self.state.branching.p_background * second_moment,
-                0.0,
-            )
-        )
+        c = np.sqrt(self.state.branching.p_background * second_moment)
         self.state.polya_gamma.observed_tilt = c
         self.state.polya_gamma.observed_mean = self._pg_mean(c)
         if self.state.latent_poisson.grid_xy.size:
             m_grid = self.state.gp.f_grid_mean
             v_grid = self.state.gp.f_grid_var
-            c_grid = np.sqrt(np.maximum(m_grid**2 + v_grid, 0.0))
+            c_grid = np.sqrt(m_grid**2 + v_grid)
             self.state.polya_gamma.grid_tilt = c_grid
             self.state.polya_gamma.grid_mean = self._pg_mean(c_grid)
 
@@ -805,7 +840,7 @@ class SPINHVI:
         intensity = np.exp(log_intensity)
         counts = np.bincount(
             self.state.latent_poisson.grid_domain_index,
-            weights=intensity * self.state.latent_poisson.cell_area,
+            weights=intensity * self.state.latent_poisson.quadrature_weights,
             minlength=self.model.n_domains,
         )
         self.state.latent_poisson.grid_intensity = intensity
@@ -849,7 +884,10 @@ class SPINHVI:
             self.state.polya_gamma.observed_mean * p_bg,
             self.config.jitter,
         )
-        grid_counts = self.state.latent_poisson.grid_intensity * self.state.latent_poisson.cell_area
+        grid_counts = (
+            self.state.latent_poisson.grid_intensity
+            * self.state.latent_poisson.quadrature_weights
+        )
         if self.state.polya_gamma.grid_mean is None:
             omega_grid = np.full(n_grid, 0.25, dtype=float)
         else:
@@ -1026,179 +1064,6 @@ class SPINHVI:
 
 
     # ===================================================================================================
-    # ----------------------------------------------- FIT -----------------------------------------------
-    # ===================================================================================================
-
-    def _initial_gamma_factor(
-        self,
-        factor_name: str,
-    ) -> GammaFactor:
-        configured = self.config.initial_gamma_factors.get(factor_name)
-        if configured is not None:
-            shape, rate = configured
-            return GammaFactor(shape=shape, rate=rate)
-        if factor_name == "beta":
-            return GammaFactor(
-                shape=self.beta_prior["a_beta"],
-                rate=self.beta_prior["b_beta"],
-            )
-        parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
-        return GammaFactor(
-            shape=self.priors[f"a_{parameter_name}"],
-            rate=self.priors[f"b_{parameter_name}"],
-        )
-
-    def initialize_state(self) -> SPINHVIState:
-        n_events = len(self.catalog)
-        n_domains = self.model.n_domains
-        counts = np.bincount(self.domain_index, minlength=n_domains).astype(float)
-        exposure = self.model.duration * np.asarray(self.model.domains.areas, dtype=float)
-        eps_mean = np.log(2.0 * (counts + 0.5) / np.maximum(exposure, self.config.jitter))
-        eps_cov = self.model.epsilon_prior_covariance()
-        f_mean = np.zeros(n_events, dtype=float)
-        f_var = np.full(n_events, self.model.gp_prior.variance, dtype=float)
-        grid_xy, grid_domains, cell_area = self._make_quadrature_grid()
-        latent = LatentPoissonFactor(
-            grid_xy=grid_xy,
-            grid_domain_index=grid_domains,
-            grid_intensity=np.zeros(grid_xy.shape[0], dtype=float),
-            cell_area=cell_area,
-            expected_counts_by_domain=np.zeros(n_domains, dtype=float),
-        )
-        f_grid_mean = np.zeros(grid_xy.shape[0], dtype=float)
-        f_grid_var = np.full(grid_xy.shape[0], self.model.gp_prior.variance, dtype=float)
-        sparse_dimension = None
-        if self.sparse_gp is not None:
-            probe_xy = grid_xy[:1] if grid_xy.size else self.catalog.xy[:1]
-            sparse_dimension = self._sparse_design(probe_xy).shape[1]
-        params = self._parameters_with_fixed(self.model.etas_parameters)
-        gamma_factors: dict[str, GammaFactor] = {}
-        for factor_name in self._free_etas_factor_names():
-            gamma_factors[factor_name] = self._initial_gamma_factor(factor_name)
-        initial_values = params.as_dict()
-        for factor_name, factor in gamma_factors.items():
-            parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
-            initial_values[parameter_name] = factor.mean + (
-                1.0 if parameter_name in {"p", "q"} else 0.0
-            )
-        params = self._parameters_with_fixed(ETASParameters(**initial_values))
-        beta_gamma = None
-        if self.config.fixed_beta is None:
-            beta_gamma = self._initial_gamma_factor("beta")
-            beta = beta_gamma.mean
-        else:
-            beta = float(self.config.fixed_beta)
-        return SPINHVIState(
-            branching=BranchingFactor.background_initialization(n_events),
-            polya_gamma=PolyaGammaFactor(
-                observed_mean=np.full(n_events, 0.25, dtype=float),
-                observed_tilt=np.zeros(n_events, dtype=float),
-                grid_mean=np.full(grid_xy.shape[0], 0.25, dtype=float),
-                grid_tilt=np.zeros(grid_xy.shape[0], dtype=float),
-            ),
-            latent_poisson=latent,
-            gp=GPFactor(
-                f_data_mean=f_mean,
-                f_data_var=f_var,
-                f_grid_mean=f_grid_mean,
-                f_grid_var=f_grid_var,
-                covariance=None,
-                coefficients_mean=(
-                    np.zeros(sparse_dimension, dtype=float)
-                    if sparse_dimension is not None else None
-                ),
-                coefficients_covariance=(
-                    np.eye(sparse_dimension, dtype=float)
-                    if sparse_dimension is not None else None
-                ),
-            ),
-            eps=EpsilonFactor(mean=eps_mean, covariance=eps_cov),
-            etas=ETASFactor(
-                parameters_mean=params,
-                beta_mean=beta,
-                gamma_factors=gamma_factors,
-                beta_gamma=beta_gamma,
-                fixed_etas=dict(self.config.fixed_etas),
-            ),
-        )
-
-    def _print_progress(self, iteration: int, elbo: float):
-        params = self.state.etas.parameters_mean
-        print(
-            f"[VI {iteration:04d}] elbo={elbo:.3f} "
-            f"p_bg={self.state.branching.p_background.mean():.3f} "
-            f"E[pi_S]={self.state.latent_poisson.expected_count:.2f} "
-            f"A={params.A:.3f} alpha={params.alpha:.3f} c={params.c:.4f} p={params.p:.3f} "
-            f"d={params.d:.4f} q={params.q:.3f} gamma={params.gamma:.3f} beta={self.state.etas.beta_mean:.3f}"
-        )
-    
-    def fit(self) -> SPINHVIResults:
-        elbo_trace: list[float] = []
-        elbo_iterations: list[int] = []
-        previous = -np.inf
-        converged = False
-        iteration = -1
-        for iteration in range(self.config.n_iter):
-            if self.config.update_polya_gamma:
-                self._update_polya_gamma()
-            if self.config.update_z:
-                self._update_branching()
-            if self.config.update_latent_poisson:
-                self._update_latent_poisson()
-            if self.config.update_eps:
-                self._update_eps()
-            if self.config.update_gp:
-                self._update_gp()
-            if self.config.update_etas and iteration >= self.config.etas_update_start:
-                optimize_nonconjugate = (
-                    (iteration - self.config.etas_update_start)
-                    % self.config.etas_update_every
-                    == 0
-                )
-                self._update_etas(optimize_nonconjugate=optimize_nonconjugate)
-            # The magnitude likelihood is independent of all other VI blocks.
-            if (
-                iteration == 0
-                and self.config.fixed_beta is None
-            ):
-                self._update_beta()
-
-            evaluate_elbo = (
-                iteration % self.config.elbo_every == 0
-                or iteration == self.config.n_iter - 1
-            )
-            if not evaluate_elbo:
-                continue
-            elbo, _ = self._elbo()
-            elbo_trace.append(elbo)
-            elbo_iterations.append(iteration)
-            if self.config.verbose and iteration % self.config.verbose_every == 0:
-                self._print_progress(iteration, elbo)
-            if np.isfinite(previous) and np.isfinite(elbo):
-                scale = max(1.0, abs(previous))
-                if abs(elbo - previous) / scale < self.config.tolerance:
-                    converged = True
-                    break
-            previous = elbo
-        diagnostics = {
-            "converged": converged,
-            "n_iter_run": iteration + 1,
-            "n_elbo_evaluations": len(elbo_trace),
-            "elbo_iterations": np.asarray(elbo_iterations, dtype=int),
-            "expected_latent_poisson_count": self.state.latent_poisson.expected_count,
-        }
-        return SPINHVIResults(
-            self.state,
-            self.model,
-            self.catalog,
-            self.config,
-            elbo_trace,
-            diagnostics,
-        )
-
-
-
-    # ===================================================================================================
     # ----------------------------------------------- ELBO -----------------------------------------------
     # ===================================================================================================
     
@@ -1229,7 +1094,7 @@ class SPINHVI:
         if latent.grid_xy.size == 0:
             return 0.0
         intensity = np.maximum(latent.grid_intensity, self.config.jitter)
-        cell_area = latent.cell_area
+        quadrature_weights = latent.quadrature_weights
         domain_index = latent.grid_domain_index
         eps_mean = self.state.eps.mean[domain_index]
         if self.state.polya_gamma.grid_mean is None:
@@ -1252,7 +1117,11 @@ class SPINHVI:
         )
         log_model_intensity = np.log(self.model.duration) + eps_mean + log_sigmoid_rejected
         return float(
-            np.sum(intensity * cell_area * (log_model_intensity - np.log(intensity) + 1.0))
+            np.sum(
+                intensity
+                * quadrature_weights
+                * (log_model_intensity - np.log(intensity) + 1.0)
+            )
         )
     
     def _poisson_envelope_compensator_elbo(self):
@@ -1378,3 +1247,202 @@ class SPINHVI:
             + terms["etas_prior_entropy"]
         )
         return total, terms
+
+
+
+    # ===================================================================================================
+    # ----------------------------------------------- FIT -----------------------------------------------
+    # ===================================================================================================
+
+    def _initial_gamma_factor(
+        self,
+        factor_name: str,
+    ) -> GammaFactor:
+        configured = self.config.initial_gamma_factors.get(factor_name)
+        if configured is not None:
+            shape, rate = configured
+            return GammaFactor(shape=shape, rate=rate)
+        if factor_name == "beta":
+            return GammaFactor(
+                shape=self.beta_prior["a_beta"],
+                rate=self.beta_prior["b_beta"],
+            )
+        parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
+        return GammaFactor(
+            shape=self.priors[f"a_{parameter_name}"],
+            rate=self.priors[f"b_{parameter_name}"],
+        )
+
+    def initialize_state(self) -> SPINHVIState:
+        n_events = len(self.catalog)
+        n_domains = self.model.n_domains
+        counts = np.bincount(self.domain_index, minlength=n_domains).astype(float)
+        exposure = self.model.duration * np.asarray(self.model.domains.areas, dtype=float)
+        eps_mean = np.log(2.0 * (counts + 0.5) / np.maximum(exposure, self.config.jitter))
+        eps_cov = self.model.epsilon_prior_covariance()
+        f_mean = np.zeros(n_events, dtype=float)
+        f_var = np.full(n_events, self.model.gp_prior.variance, dtype=float)
+        grid_xy, grid_domains, quadrature_weights = self._make_quadrature_grid()
+        latent = LatentPoissonFactor(
+            grid_xy=grid_xy,
+            grid_domain_index=grid_domains,
+            grid_intensity=np.zeros(grid_xy.shape[0], dtype=float),
+            quadrature_weights=quadrature_weights,
+            expected_counts_by_domain=np.zeros(n_domains, dtype=float),
+        )
+        f_grid_mean = np.zeros(grid_xy.shape[0], dtype=float)
+        f_grid_var = np.full(grid_xy.shape[0], self.model.gp_prior.variance, dtype=float)
+        sparse_dimension = None
+        if self.sparse_gp is not None:
+            probe_xy = grid_xy[:1] if grid_xy.size else self.catalog.xy[:1]
+            sparse_dimension = self._sparse_design(probe_xy).shape[1]
+        params = self._parameters_with_fixed(self.model.etas_parameters)
+        gamma_factors: dict[str, GammaFactor] = {}
+        for factor_name in self._free_etas_factor_names():
+            gamma_factors[factor_name] = self._initial_gamma_factor(factor_name)
+        initial_values = params.as_dict()
+        for factor_name, factor in gamma_factors.items():
+            parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
+            initial_values[parameter_name] = factor.mean + (
+                1.0 if parameter_name in {"p", "q"} else 0.0
+            )
+        params = self._parameters_with_fixed(ETASParameters(**initial_values))
+        beta_gamma = None
+        if self.config.fixed_beta is None:
+            beta_gamma = self._initial_gamma_factor("beta")
+            beta = beta_gamma.mean
+        else:
+            beta = float(self.config.fixed_beta)
+        return SPINHVIState(
+            branching=BranchingFactor.background_initialization(n_events),
+            polya_gamma=PolyaGammaFactor(
+                observed_mean=np.full(n_events, 0.25, dtype=float),
+                observed_tilt=np.zeros(n_events, dtype=float),
+                grid_mean=np.full(grid_xy.shape[0], 0.25, dtype=float),
+                grid_tilt=np.zeros(grid_xy.shape[0], dtype=float),
+            ),
+            latent_poisson=latent,
+            gp=GPFactor(
+                f_data_mean=f_mean,
+                f_data_var=f_var,
+                f_grid_mean=f_grid_mean,
+                f_grid_var=f_grid_var,
+                covariance=None,
+                coefficients_mean=(
+                    np.zeros(sparse_dimension, dtype=float)
+                    if sparse_dimension is not None else None
+                ),
+                coefficients_covariance=(
+                    np.eye(sparse_dimension, dtype=float)
+                    if sparse_dimension is not None else None
+                ),
+            ),
+            eps=EpsilonFactor(mean=eps_mean, covariance=eps_cov),
+            etas=ETASFactor(
+                parameters_mean=params,
+                beta_mean=beta,
+                gamma_factors=gamma_factors,
+                beta_gamma=beta_gamma,
+                fixed_etas=dict(self.config.fixed_etas),
+            ),
+        )
+
+    def _print_progress(self, iteration: int, elbo: float):
+        params = self.state.etas.parameters_mean
+        print(
+            f"[VI {iteration:04d}] elbo={elbo:.3f} "
+            f"p_bg={self.state.branching.p_background.mean():.3f} "
+            f"E[pi_S]={self.state.latent_poisson.expected_count:.2f} "
+            f"A={params.A:.3f} alpha={params.alpha:.3f} c={params.c:.4f} p={params.p:.3f} "
+            f"d={params.d:.4f} q={params.q:.3f} gamma={params.gamma:.3f} beta={self.state.etas.beta_mean:.3f}"
+        )
+
+    def fit(self) -> SPINHVIResults:
+        elbo_trace: list[float] = []
+        elbo_iterations: list[int] = []
+        convergence_iterations: list[int] = []
+        previous_checkpoint = -np.inf
+        converged = False
+        iteration = -1
+        has_nonconjugate_etas = bool(
+            self._free_etas_factor_names(include_A=False)
+        )
+        for iteration in range(self.config.n_iter):
+            optimized_nonconjugate_etas = False
+            if self.config.update_polya_gamma:
+                self._update_polya_gamma()
+            if self.config.update_z:
+                self._update_branching()
+            if self.config.update_latent_poisson:
+                self._update_latent_poisson()
+            if self.config.update_eps:
+                self._update_eps()
+            if self.config.update_gp:
+                self._update_gp()
+            if self.config.update_etas and iteration >= self.config.etas_update_start:
+                optimized_nonconjugate_etas = (
+                    (iteration - self.config.etas_update_start)
+                    % self.config.etas_update_every
+                    == 0
+                )
+                self._update_etas(
+                    optimize_nonconjugate=optimized_nonconjugate_etas
+                )
+            # The magnitude likelihood is independent of all other VI blocks.
+            if (
+                iteration == 0
+                and self.config.fixed_beta is None
+            ):
+                self._update_beta()
+
+            evaluate_elbo = (
+                iteration % self.config.elbo_every == 0
+                or optimized_nonconjugate_etas
+                or iteration == self.config.n_iter - 1
+            )
+            if not evaluate_elbo:
+                continue
+            elbo, _ = self._elbo()
+            elbo_trace.append(elbo)
+            elbo_iterations.append(iteration)
+            if self.config.verbose and iteration % self.config.verbose_every == 0:
+                self._print_progress(iteration, elbo)
+            convergence_checkpoint = (
+                not self.config.update_etas
+                or not has_nonconjugate_etas
+                or optimized_nonconjugate_etas
+            )
+            if not convergence_checkpoint:
+                continue
+            convergence_iterations.append(iteration)
+            if np.isfinite(previous_checkpoint) and np.isfinite(elbo):
+                scale = max(1.0, abs(previous_checkpoint))
+                if (
+                    abs(elbo - previous_checkpoint) / scale
+                    < self.config.tolerance
+                ):
+                    converged = True
+                    break
+            previous_checkpoint = elbo
+        diagnostics = {
+            "converged": converged,
+            "n_iter_run": iteration + 1,
+            "n_elbo_evaluations": len(elbo_trace),
+            "elbo_iterations": np.asarray(elbo_iterations, dtype=int),
+            "convergence_iterations": np.asarray(
+                convergence_iterations,
+                dtype=int,
+            ),
+            "expected_latent_poisson_count": self.state.latent_poisson.expected_count,
+            "use_calibration": self.config.use_calibration,
+            "gp_prior_variance": self.model.gp_prior.variance,
+            "gp_prior_length_scale": self.model.gp_prior.length_scale,
+        }
+        return SPINHVIResults(
+            self.state,
+            self.model,
+            self.catalog,
+            self.config,
+            elbo_trace,
+            diagnostics,
+        )

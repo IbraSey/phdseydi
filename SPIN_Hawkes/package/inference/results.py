@@ -313,6 +313,11 @@ class GibbsResults(Mapping):
         return None if values is None else np.asarray(values)
 
     @property
+    def beta_chain(self) -> np.ndarray | None:
+        values = self.raw.get("beta")
+        return None if values is None else np.asarray(values)
+
+    @property
     def acceptance_rates(self) -> dict:
         rates = {"eps": self.raw.get("acceptance_eps")}
         if self.raw.get("acceptance_nu") is not None:
@@ -1164,7 +1169,14 @@ class GibbsResults(Mapping):
         else:
             eps_chain = self.eps_chain
             chains = [(rf"$\epsilon_{j}$", eps_chain[:, j]) for j in range(eps_chain.shape[1])]
-            tex = {}
+            if (
+                self.beta_chain is not None
+                and self.raw.get(
+                    "sample_beta", self.raw.get("acceptance_beta") is not None
+                )
+            ):
+                chains.append(("beta", self.beta_chain))
+            tex = {"beta": r"$\beta$"}
             title_savefig = title_savefig or "traces_eps"
 
         thin = self.raw.get("thin", 1)
@@ -1254,13 +1266,13 @@ class GibbsResults(Mapping):
             names = self.raw.get("theta_phi_names", [])
             for index, name in enumerate(names):
                 plots.append((name, self.etas_chain[burn:, index]))
-            if (
-                self.raw.get("beta") is not None
-                and self.raw.get(
-                    "sample_beta", self.raw.get("acceptance_beta") is not None
-                )
-            ):
-                plots.append((r"$\beta$", np.asarray(self.raw["beta"])[burn:]))
+        if (
+            self.beta_chain is not None
+            and self.raw.get(
+                "sample_beta", self.raw.get("acceptance_beta") is not None
+            )
+        ):
+            plots.append((r"$\beta$", self.beta_chain[burn:]))
 
         fig, axes = plt.subplots(len(plots), 1, figsize=(figsize[0], 3.0 * len(plots)), squeeze=False)
         lags = np.arange(max_lag + 1)

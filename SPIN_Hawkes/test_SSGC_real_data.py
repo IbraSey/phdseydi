@@ -260,6 +260,8 @@ if MAKE_PLOTS:
     )
     for line in coastlines:
         plt.plot(line[0], line[1], "w", linewidth=1.0)
+    plt.xlim(X_BOUNDS)
+    plt.ylim(Y_BOUNDS)
     plt.title("Seismic intensity - posterior mean", fontsize=20)
     plt.tight_layout()
     plt.savefig("intensity_post_mean.png", dpi=150)
@@ -278,6 +280,8 @@ if MAKE_PLOTS:
     )
     for line in coastlines:
         plt.plot(line[0], line[1], "w", linewidth=1.0)
+    plt.xlim(X_BOUNDS)
+    plt.ylim(Y_BOUNDS)
     plt.title("Seismic intensity - posterior standard deviation", fontsize=20)
     plt.tight_layout()
     plt.savefig("intensity_post_mean_std.png", dpi=150)
