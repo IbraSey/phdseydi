@@ -19,7 +19,12 @@ class SparseGP:
     """
 
     def __init__(self, hypers):
-        ell_x, ell_y, center_x, center_y, radius_x, radius_y, variance = map(float, hypers)
+        values = np.asarray(hypers, dtype=float).reshape(-1)
+        if values.size != 7:
+            raise ValueError("hypers must contain exactly seven values.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Sparse-GP hyperparameters must be finite.")
+        ell_x, ell_y, center_x, center_y, radius_x, radius_y, variance = values
         if ell_x <= 0 or ell_y <= 0 or radius_x <= 0 or radius_y <= 0 or variance <= 0:
             raise ValueError("Length scales, radii, and variance must be strictly positive.")
 
@@ -54,6 +59,12 @@ class SparseGP:
     @classmethod
     def from_bounds(cls, x_bounds, y_bounds, variance, length_scale):
         """Construct the basis from rectangular observation bounds."""
+        x_bounds = np.asarray(x_bounds, dtype=float).reshape(-1)
+        y_bounds = np.asarray(y_bounds, dtype=float).reshape(-1)
+        if x_bounds.size != 2 or y_bounds.size != 2:
+            raise ValueError("x_bounds and y_bounds must each contain two values.")
+        if not np.all(np.isfinite(np.r_[x_bounds, y_bounds])):
+            raise ValueError("Sparse-GP bounds must be finite.")
         center_x = 0.5 * (x_bounds[0] + x_bounds[1])
         center_y = 0.5 * (y_bounds[0] + y_bounds[1])
         radius_x = 0.5 * (x_bounds[1] - x_bounds[0])

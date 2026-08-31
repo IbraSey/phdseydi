@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from math import isfinite
-from numbers import Real
+from numbers import Integral, Real
 
 
 ETAS_PARAMETER_NAMES = ("A", "alpha", "c", "p", "d", "q", "gamma")
@@ -18,14 +18,64 @@ VI_GAMMA_FACTOR_NAMES = (
 )
 
 
+def _require_real(name, value, *, minimum=None, strict=False) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value):
+        raise ValueError(f"{name} must be a finite real number.")
+    value = float(value)
+    if minimum is not None:
+        valid = value > minimum if strict else value >= minimum
+        if not valid:
+            relation = ">" if strict else ">="
+            raise ValueError(f"{name} must be {relation} {minimum}.")
+    return value
+
+
+def _require_integer(name, value, *, minimum=None) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer.")
+    value = int(value)
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
+    return value
+
+
+def _require_boolean(name, value) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean.")
+
+
+def _validate_etas_value(name: str, value) -> float:
+    value = _require_real(f"ETAS parameter {name!r}", value)
+    if name in {"A", "alpha", "gamma"} and value < 0.0:
+        raise ValueError(f"ETAS parameter {name!r} must be non-negative.")
+    if name in {"c", "d"} and value <= 0.0:
+        raise ValueError(f"ETAS parameter {name!r} must be positive.")
+    if name in {"p", "q"} and value <= 1.0:
+        raise ValueError(f"ETAS parameter {name!r} must be greater than one.")
+    return value
+
+
 @dataclass(frozen=True)
 class GPParameters:
     variance: float = 1.0
     length_scale: float = 0.5
 
     def __post_init__(self):
-        if self.variance <= 0 or self.length_scale <= 0:
-            raise ValueError("GP variance and length scale must be positive.")
+        object.__setattr__(
+            self,
+            "variance",
+            _require_real("GP variance", self.variance, minimum=0.0, strict=True),
+        )
+        object.__setattr__(
+            self,
+            "length_scale",
+            _require_real(
+                "GP length_scale",
+                self.length_scale,
+                minimum=0.0,
+                strict=True,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -39,12 +89,21 @@ class ETASParameters:
     gamma: float | None = None
 
     def __post_init__(self):
-        if self.A < 0 or self.c <= 0 or self.p <= 1 or self.d <= 0 or self.q <= 1:
-            raise ValueError("ETAS requires A>=0, c>0, p>1, d>0, and q>1.")
-        if self.alpha is not None and self.alpha < 0:
-            raise ValueError("alpha must be non-negative.")
-        if self.gamma is not None and self.gamma < 0:
-            raise ValueError("gamma must be non-negative.")
+        for name in ("A", "c", "p", "d", "q"):
+            object.__setattr__(
+                self,
+                name,
+                _validate_etas_value(name, getattr(self, name)),
+            )
+        if (self.alpha is None) != (self.gamma is None):
+            raise ValueError(
+                "alpha and gamma must either both be provided or both be None. "
+                "Use zero to disable one magnitude effect in a marked model."
+            )
+        for name in ("alpha", "gamma"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _validate_etas_value(name, value))
 
     @property
     def marked(self) -> bool:
@@ -86,24 +145,42 @@ class GibbsConfig:
     proposal_jitter: float = 1e-6
 
     def __post_init__(self):
-        if self.n_iter <= 0 or self.thin <= 0:
-            raise ValueError("n_iter and thin must be positive.")
-        if self.mala_step <= 0 or self.verbose_every <= 0:
-            raise ValueError("mala_step and verbose_every must be positive.")
-        if self.beta_init <= 0:
-            raise ValueError("beta_init must be positive.")
-        if self.fixed_beta is not None and self.fixed_beta <= 0:
-            raise ValueError("fixed_beta must be positive.")
-        if self.sigma_mh_beta <= 0:
-            raise ValueError("sigma_mh_beta must be positive.")
-        if self.adaptation_start < 0:
-            raise ValueError("adaptation_start must be non-negative.")
-        if self.proposal_jitter <= 0:
-            raise ValueError("proposal_jitter must be positive.")
-        for name in ("a_beta", "b_beta"):
-            value = self.beta_prior.get(name)
-            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
-                raise ValueError(f"beta_prior['{name}'] must be positive and finite.")
+        for name in (
+            "n_iter",
+            "thin",
+            "verbose_every",
+            "emu_every",
+            "grid_nx",
+            "grid_ny",
+        ):
+            _require_integer(name, getattr(self, name), minimum=1)
+        for name in ("t0_nu", "adaptation_start"):
+            _require_integer(name, getattr(self, name), minimum=0)
+        for name in ("learn_nu", "use_calibration", "verbose", "compute_emu"):
+            _require_boolean(name, getattr(self, name))
+        for name in (
+            "mala_step",
+            "step_nu_init",
+            "beta_init",
+            "sigma_mh_beta",
+            "proposal_jitter",
+        ):
+            _require_real(name, getattr(self, name), minimum=0.0, strict=True)
+        if self.fixed_beta is not None:
+            _require_real("fixed_beta", self.fixed_beta, minimum=0.0, strict=True)
+        if not isinstance(self.beta_prior, dict):
+            raise TypeError("beta_prior must be a dictionary.")
+        allowed_beta_priors = {"a_beta", "b_beta"}
+        unknown = set(self.beta_prior).difference(allowed_beta_priors)
+        if unknown:
+            raise ValueError(f"Unknown beta prior parameters: {sorted(unknown)}")
+        for name, value in self.beta_prior.items():
+            _require_real(
+                f"beta_prior[{name!r}]",
+                value,
+                minimum=0.0,
+                strict=True,
+            )
 
 
 @dataclass(frozen=True)
@@ -115,24 +192,53 @@ class SPINHGibbsConfig(GibbsConfig):
     sample_z: bool = True
     known_z: object = None
     sigma_mh_etas: float = 0.1
+    parent_time_window: float | None = None
 
     def __post_init__(self):
         super().__post_init__()
+        if not isinstance(self.fixed_etas, dict):
+            raise TypeError("fixed_etas must be a dictionary.")
         unknown_fixed = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
         if unknown_fixed:
             raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown_fixed)}")
         for name, value in self.fixed_etas.items():
-            if not isinstance(value, (int, float)):
-                raise ValueError("fixed_etas values must be numeric.")
-        if not isinstance(self.sample_z, bool):
-            raise ValueError("sample_z must be a boolean.")
-        if self.sigma_mh_etas <= 0:
-            raise ValueError("sigma_mh_etas must be positive.")
+            _validate_etas_value(name, value)
+        _require_boolean("sample_z", self.sample_z)
+        _require_real(
+            "sigma_mh_etas",
+            self.sigma_mh_etas,
+            minimum=0.0,
+            strict=True,
+        )
+        if self.parent_time_window is not None:
+            _require_real(
+                "parent_time_window",
+                self.parent_time_window,
+                minimum=0.0,
+                strict=True,
+            )
+        if not isinstance(self.theta_priors, dict):
+            raise TypeError("theta_priors must be a dictionary.")
+        theta_prior_names = {
+            f"{prefix}_{name}"
+            for name in ETAS_PARAMETER_NAMES
+            for prefix in ("a", "b")
+        }
+        unknown_priors = set(self.theta_priors).difference(theta_prior_names)
+        if unknown_priors:
+            raise ValueError(f"Unknown ETAS prior parameters: {sorted(unknown_priors)}")
+        for name, value in self.theta_priors.items():
+            _require_real(
+                f"theta_priors[{name!r}]",
+                value,
+                minimum=0.0,
+                strict=True,
+            )
 
 
 @dataclass(frozen=True)
-class SPINHVIConfig:
-    """Configuration for the SPIN-H variational inference routine."""
+class SSGCVIConfig:
+    """Configuration shared by SSGC variational inference runs."""
 
     n_iter: int = 200
     tolerance: float = 1e-4
@@ -141,19 +247,15 @@ class SPINHVIConfig:
     elbo_every: int = 1
     random_seed: int | None = None
 
-    update_z: bool = True
     update_polya_gamma: bool = True
     update_latent_poisson: bool = True
     update_gp: bool = True
     update_eps: bool = True
-    update_etas: bool = True
 
-    fixed_etas: dict[str, float] = field(default_factory=dict)
     fixed_beta: float | None = None
     beta_prior: dict[str, float] = field(
         default_factory=lambda: {"a_beta": 2.0, "b_beta": 1.0}
     )
-    theta_priors: dict[str, float] = field(default_factory=dict)
     initial_gamma_factors: dict[str, tuple[float, float]] = field(
         default_factory=dict
     )
@@ -161,61 +263,55 @@ class SPINHVIConfig:
     quadrature_nx: int = 30
     quadrature_ny: int = 30
     eps_newton_steps: int = 8
-    etas_update_start: int = 10
-    etas_update_every: int = 20
     max_optimizer_iter: int = 20
-    etas_quadrature_nodes: int = 8
+    gamma_quadrature_nodes: int = 8
     gp_backend: str = "exact"
     use_calibration: bool = False
     sparse_gp: object | None = None
-    spatial_compensator_grid: int = 0
     jitter: float = 1e-6
 
+    def _allowed_initial_gamma_factors(self) -> set[str]:
+        return {"beta"}
+
     def __post_init__(self):
-        if self.n_iter <= 0:
-            raise ValueError("n_iter must be positive.")
-        if not isfinite(self.tolerance) or self.tolerance <= 0:
-            raise ValueError("tolerance must be positive.")
-        if self.verbose_every <= 0:
-            raise ValueError("verbose_every must be positive.")
-        if self.elbo_every <= 0:
-            raise ValueError("elbo_every must be positive.")
-        if self.quadrature_nx <= 1 or self.quadrature_ny <= 1:
-            raise ValueError("quadrature grid sizes must be greater than one.")
-        if self.eps_newton_steps <= 0:
-            raise ValueError("eps_newton_steps must be positive.")
-        if self.etas_update_start < 0:
-            raise ValueError("etas_update_start must be non-negative.")
-        if self.etas_update_every <= 0:
-            raise ValueError("etas_update_every must be positive.")
-        if self.max_optimizer_iter <= 0:
-            raise ValueError("max_optimizer_iter must be positive.")
-        if self.etas_quadrature_nodes <= 1:
-            raise ValueError("etas_quadrature_nodes must be greater than one.")
-        if str(self.gp_backend).lower() not in {"exact", "sparse"}:
+        for name in (
+            "n_iter",
+            "verbose_every",
+            "elbo_every",
+            "eps_newton_steps",
+            "max_optimizer_iter",
+        ):
+            _require_integer(name, getattr(self, name), minimum=1)
+        for name in ("quadrature_nx", "quadrature_ny", "gamma_quadrature_nodes"):
+            _require_integer(name, getattr(self, name), minimum=2)
+        for name in (
+            "verbose",
+            "update_polya_gamma",
+            "update_latent_poisson",
+            "update_gp",
+            "update_eps",
+            "use_calibration",
+        ):
+            _require_boolean(name, getattr(self, name))
+        if self.random_seed is not None:
+            _require_integer("random_seed", self.random_seed, minimum=0)
+        _require_real("tolerance", self.tolerance, minimum=0.0, strict=True)
+        if not isinstance(self.gp_backend, str) or self.gp_backend.lower() not in {
+            "exact",
+            "sparse",
+        }:
             raise ValueError("gp_backend must be 'exact' or 'sparse'.")
-        if self.sparse_gp is not None and str(self.gp_backend).lower() != "sparse":
+        if self.sparse_gp is not None and self.gp_backend.lower() != "sparse":
             raise ValueError("sparse_gp requires gp_backend='sparse'.")
         if self.use_calibration and self.sparse_gp is not None:
             raise ValueError(
                 "use_calibration=True cannot be combined with an injected sparse_gp."
             )
-        if self.spatial_compensator_grid < 0:
-            raise ValueError("spatial_compensator_grid must be non-negative.")
-        if not isfinite(self.jitter) or self.jitter <= 0:
-            raise ValueError("jitter must be positive.")
-        if self.fixed_beta is not None and (
-            not isinstance(self.fixed_beta, Real)
-            or not isfinite(self.fixed_beta)
-            or self.fixed_beta <= 0
-        ):
-            raise ValueError("fixed_beta must be positive and finite.")
-        unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
-        if unknown:
-            raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown)}")
-        for name, value in self.fixed_etas.items():
-            if not isinstance(value, Real) or not isfinite(value):
-                raise ValueError(f"fixed_etas[{name!r}] must be finite.")
+        _require_real("jitter", self.jitter, minimum=0.0, strict=True)
+        if self.fixed_beta is not None:
+            _require_real("fixed_beta", self.fixed_beta, minimum=0.0, strict=True)
+        if not isinstance(self.beta_prior, dict):
+            raise TypeError("beta_prior must be a dictionary.")
         beta_prior_names = {"a_beta", "b_beta"}
         unknown_beta_priors = set(self.beta_prior).difference(beta_prior_names)
         if unknown_beta_priors:
@@ -223,25 +319,16 @@ class SPINHVIConfig:
                 f"Unknown beta prior parameters: {sorted(unknown_beta_priors)}"
             )
         for name, value in self.beta_prior.items():
-            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
-                raise ValueError(f"beta_prior[{name!r}] must be positive and finite.")
-        theta_prior_names = {
-            f"{prefix}_{name}"
-            for name in ETAS_PARAMETER_NAMES
-            for prefix in ("a", "b")
-        }
-        unknown_theta_priors = set(self.theta_priors).difference(theta_prior_names)
-        if unknown_theta_priors:
-            raise ValueError(
-                f"Unknown ETAS prior parameters: {sorted(unknown_theta_priors)}"
+            _require_real(
+                f"beta_prior[{name!r}]",
+                value,
+                minimum=0.0,
+                strict=True,
             )
-        for name, value in self.theta_priors.items():
-            if not isinstance(value, Real) or not isfinite(value) or value <= 0:
-                raise ValueError(
-                    f"theta_priors[{name!r}] must be positive and finite."
-                )
+        if not isinstance(self.initial_gamma_factors, dict):
+            raise TypeError("initial_gamma_factors must be a dictionary.")
         unknown_initial = set(self.initial_gamma_factors).difference(
-            VI_GAMMA_FACTOR_NAMES
+            self._allowed_initial_gamma_factors()
         )
         if unknown_initial:
             raise ValueError(
@@ -254,20 +341,99 @@ class SPINHVIConfig:
                     f"initial_gamma_factors[{name!r}] must be a (shape, rate) pair."
                 )
             shape, rate = parameters
-            if not all(
-                isinstance(value, Real) and isfinite(value) and value > 0
-                for value in (shape, rate)
-            ):
+            try:
+                _require_real("shape", shape, minimum=0.0, strict=True)
+                _require_real("rate", rate, minimum=0.0, strict=True)
+            except ValueError as error:
                 raise ValueError(
                     f"initial_gamma_factors[{name!r}] must contain positive finite values."
-                )
+                ) from error
+        conflicting = set()
+        if self.fixed_beta is not None and "beta" in self.initial_gamma_factors:
+            conflicting.add("beta")
+        if conflicting:
+            raise ValueError(
+                "Initial Gamma factors cannot be provided for fixed parameters: "
+                f"{sorted(conflicting)}"
+            )
+
+
+@dataclass(frozen=True)
+class SPINHVIConfig(SSGCVIConfig):
+    """Configuration for SPIN-H variational inference, including ETAS."""
+
+    update_z: bool = True
+    update_etas: bool = True
+    fixed_etas: dict[str, float] = field(default_factory=dict)
+    theta_priors: dict[str, float] = field(default_factory=dict)
+    etas_update_start: int = 10
+    etas_update_every: int = 20
+    # Kept for backward compatibility; None uses gamma_quadrature_nodes.
+    etas_quadrature_nodes: int | None = None
+    spatial_compensator_grid: int = 0
+    parent_time_window: float | None = None
+
+    def _allowed_initial_gamma_factors(self) -> set[str]:
+        return set(VI_GAMMA_FACTOR_NAMES)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _require_boolean("update_z", self.update_z)
+        _require_boolean("update_etas", self.update_etas)
+        _require_integer("etas_update_start", self.etas_update_start, minimum=0)
+        _require_integer("etas_update_every", self.etas_update_every, minimum=1)
+        if self.etas_quadrature_nodes is not None:
+            _require_integer(
+                "etas_quadrature_nodes",
+                self.etas_quadrature_nodes,
+                minimum=2,
+            )
+        _require_integer(
+            "spatial_compensator_grid",
+            self.spatial_compensator_grid,
+            minimum=0,
+        )
+        if self.parent_time_window is not None:
+            _require_real(
+                "parent_time_window",
+                self.parent_time_window,
+                minimum=0.0,
+                strict=True,
+            )
+
+        if not isinstance(self.fixed_etas, dict):
+            raise TypeError("fixed_etas must be a dictionary.")
+        unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
+        if unknown:
+            raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown)}")
+        for name, value in self.fixed_etas.items():
+            _validate_etas_value(name, value)
+
+        if not isinstance(self.theta_priors, dict):
+            raise TypeError("theta_priors must be a dictionary.")
+        theta_prior_names = {
+            f"{prefix}_{name}"
+            for name in ETAS_PARAMETER_NAMES
+            for prefix in ("a", "b")
+        }
+        unknown_theta_priors = set(self.theta_priors).difference(theta_prior_names)
+        if unknown_theta_priors:
+            raise ValueError(
+                f"Unknown ETAS prior parameters: {sorted(unknown_theta_priors)}"
+            )
+        for name, value in self.theta_priors.items():
+            _require_real(
+                f"theta_priors[{name!r}]",
+                value,
+                minimum=0.0,
+                strict=True,
+            )
+
         shifted_factor_names = {"p": "p_minus_1", "q": "q_minus_1"}
         fixed_factor_names = {
             shifted_factor_names.get(name, name) for name in self.fixed_etas
         }
         conflicting = fixed_factor_names.intersection(self.initial_gamma_factors)
-        if self.fixed_beta is not None and "beta" in self.initial_gamma_factors:
-            conflicting.add("beta")
         if conflicting:
             raise ValueError(
                 "Initial Gamma factors cannot be provided for fixed parameters: "

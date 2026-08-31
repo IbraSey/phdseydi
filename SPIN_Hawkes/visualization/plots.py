@@ -41,7 +41,12 @@ def save_figure(
     directory = DEFAULT_FIGURES_DIR if output_dir is None else Path(output_dir)
     destination = directory / path
     destination.parent.mkdir(parents=True, exist_ok=True)
-    save_kwargs = {"bbox_inches": "tight"}
+    save_kwargs = {
+        "bbox_inches": "tight",
+        "pad_inches": 0.08,
+        "facecolor": fig.get_facecolor(),
+        "transparent": False,
+    }
     if figure_type == "raster":
         save_kwargs["dpi"] = RASTER_FIGURE_DPI if dpi is None else int(dpi)
     fig.savefig(destination, **save_kwargs)
@@ -77,7 +82,7 @@ def plot_field(
     value_grid = values.reshape(y_unique.size, x_unique.size)
 
     if mode == "plot":
-        fig, local_ax = plt.subplots(figsize=(6, 4))
+        fig, local_ax = plt.subplots(figsize=(6, 4), layout="constrained")
     elif mode == "subplot":
         if ax is None:
             raise ValueError("ax is required when mode='subplot'.")
@@ -85,8 +90,15 @@ def plot_field(
     else:
         raise ValueError("mode must be either 'plot' or 'subplot'.")
 
-    contour = local_ax.contourf(
-        x_grid, y_grid, value_grid, levels=15, vmin=vmin, vmax=vmax, cmap=cmap
+    contour = local_ax.pcolormesh(
+        x_grid,
+        y_grid,
+        value_grid,
+        shading="auto",
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+        rasterized=True,
     )
     if add_colorbar:
         fig.colorbar(contour, ax=local_ax)
@@ -123,12 +135,17 @@ def plot_process_dashboard(
     grid_x, grid_y = grid.x, grid.y
     color_map = plt.get_cmap(cmap) if isinstance(cmap, str) else cmap
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), layout="constrained")
     fig.suptitle(title)
 
     latent_ax = axes[0, 0]
-    latent_image = latent_ax.contourf(
-        grid_x, grid_y, grid.latent, levels=50, cmap=latent_cmap
+    latent_image = latent_ax.pcolormesh(
+        grid_x,
+        grid_y,
+        grid.latent,
+        shading="auto",
+        cmap=latent_cmap,
+        rasterized=True,
     )
     latent_divider = make_axes_locatable(latent_ax)
     fig.colorbar(
@@ -139,8 +156,13 @@ def plot_process_dashboard(
     latent_ax.set_title(r"Latent field $f^\star$")
 
     intensity_ax = axes[0, 1]
-    intensity_image = intensity_ax.contourf(
-        grid_x, grid_y, grid.intensity, levels=50, cmap=cmap
+    intensity_image = intensity_ax.pcolormesh(
+        grid_x,
+        grid_y,
+        grid.intensity,
+        shading="auto",
+        cmap=cmap,
+        rasterized=True,
     )
     intensity_divider = make_axes_locatable(intensity_ax)
     fig.colorbar(
@@ -183,7 +205,6 @@ def plot_process_dashboard(
         axis.set_ylim(y_bounds)
         axis.set_aspect("equal", adjustable="box")
         axis.grid(alpha=0.3)
-    fig.tight_layout()
     if savefigure:
         save_figure(fig, title_savefig, output_dir, figure_type="raster")
     if show:
@@ -210,7 +231,7 @@ def plot_voronoi_cells(
     if germs.ndim != 2 or germs.shape[1] != 2 or len(cells) != len(germs):
         raise ValueError("cells and germs must describe the same 2D tessellation.")
     color_map = plt.get_cmap(cmap_name, len(germs))
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained")
     for index, cell in enumerate(cells):
         if cell is None or cell.is_empty:
             continue
@@ -234,7 +255,6 @@ def plot_voronoi_cells(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.grid(alpha=0.3)
-    fig.tight_layout()
     if savefigure:
         save_figure(fig, title_savefig, output_dir)
     if show:

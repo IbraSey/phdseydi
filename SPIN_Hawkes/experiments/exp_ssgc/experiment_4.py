@@ -12,51 +12,31 @@ Figures : heatmaps, profils marginaux, traces sélectionnées.
 # =============================================================================
 # Imports
 # =============================================================================
-import warnings
 import sys
+import warnings
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import openturns as ot
 import matplotlib.pyplot as plt
-from functools import partial
 from pathlib import Path
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 from shapely.prepared import prep
-from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-try:
-    from package import (
-        EventCatalog,
-        GPParameters,
-        GibbsConfig,
-        SSGCModel,
-        generate_voronoi_cells,
-        simulate_spatial_process,
-    )
-    from visualization import (
-        plot_process_dashboard,
-        plot_voronoi_cells,
-        save_figure,
-    )
-except ImportError:
-    from package import (
-        EventCatalog,
-        GPParameters,
-        GibbsConfig,
-        SSGCModel,
-        generate_voronoi_cells,
-        simulate_spatial_process,
-    )
-    from visualization import (
-        plot_process_dashboard,
-        plot_voronoi_cells,
-        save_figure,
-    )
+from package import (
+    GPParameters,
+    GibbsConfig,
+    SSGCModel,
+    generate_voronoi_cells,
+    simulate_spatial_process,
+)
+from visualization import plot_process_dashboard, plot_voronoi_cells, save_figure
 
 
 # =============================================================================
@@ -76,13 +56,12 @@ STEP_NU_INIT  = 0.0009
 VERBOSE       = True
 VERBOSE_EVERY = 50
 SEED          = 42
-NX, NY        = 30, 30
 NX_POST, NY_POST = 60, 60
 N_CHAINS      = 2
 XB, YB        = (0.0, 2.0), (0.0, 2.0)
-N_JOBS       = 1
 GP_BACKEND   = "sparse"
 COMPUTE_EMU  = False
+POSTERIOR_N_MC = 500
 
 # Données fixes : Profile 1, Setting A
 N_GERMS  = 6
@@ -108,7 +87,7 @@ REPRESENTATIVE_CONFIGS = {
 # MALA step par (delta0, delta1)
 #
 # Les valeurs ci-dessous ont été recalibrées avec le backend sparse GP, environ
-# 1000 événements simulés (T=110), et des runs courts de 100--200 itérations.
+# 1000 événements simulés et des runs courts de 100--200 itérations.
 # La table reste explicite pour pouvoir ajuster un couple (delta0, delta1) sans
 # modifier une règle cachée.
 # =============================================================================
@@ -203,78 +182,122 @@ def f_star_A(x, y):
 
 
 # =============================================================================
-# Helpers picklables
+# Construction des modèles et chaînes
 # =============================================================================
-def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
-    from scipy.special import expit
-    from shapely.prepared import prep
-    from shapely.geometry import Point as ShapelyPoint
-    import numpy as np
-    x_flat     = np.atleast_1d(x).flatten()
-    y_flat     = np.atleast_1d(y).flatten()
-    mu_tilde   = np.zeros(len(x_flat))
-    unassigned = np.ones(len(x_flat), dtype=bool)
-    for j, pz in enumerate([prep(z) for z in zones_raw]):
-        idx = np.where(unassigned)[0]
-        if len(idx) == 0:
-            break
-        inside = idx[[pz.covers(ShapelyPoint(x_flat[i], y_flat[i])) for i in idx]]
-        if len(inside) > 0:
-            mu_tilde[inside]   = mus_vec[j]
-            unassigned[inside] = False
-    return (mu_tilde * expit(f_func(x_flat, y_flat))).reshape(np.shape(x))
+def make_reference_intensity(zones, mus, latent_field):
+    prepared_zones = [prep(zone) for zone in zones]
+
+    def reference_intensity(x, y):
+        x_values, y_values = np.broadcast_arrays(
+            np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        )
+        flat_x = x_values.reshape(-1)
+        flat_y = y_values.reshape(-1)
+        baseline = np.zeros(flat_x.size, dtype=float)
+        unassigned = np.ones(flat_x.size, dtype=bool)
+
+        for intensity, zone in zip(mus, prepared_zones):
+            indices = np.flatnonzero(unassigned)
+            if indices.size == 0:
+                break
+            inside = np.fromiter(
+                (
+                    zone.covers(ShapelyPoint(flat_x[i], flat_y[i]))
+                    for i in indices
+                ),
+                dtype=bool,
+                count=indices.size,
+            )
+            selected = indices[inside]
+            baseline[selected] = intensity
+            unassigned[selected] = False
+
+        values = baseline * expit(latent_field(flat_x, flat_y))
+        return values.reshape(x_values.shape)
+
+    return reference_intensity
 
 
-def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T_val,
-              Xb, Yb, nu_init, lambda_nu, delta, jitter,
-              mala_step, t0_nu, step_nu_init,
-              n_iter, thin, verbose, verbose_every,
-              mu_star_func, nx, ny):
-    chain_seed       = seed + k
-    model = SSGCModel.from_polygons(
-        polygons=zones_raw,
-        duration=T_val,
-        x_bounds=Xb,
-        y_bounds=Yb,
+def make_model(zones, duration, delta):
+    return SSGCModel.from_polygons(
+        polygons=zones,
+        duration=duration,
+        x_bounds=XB,
+        y_bounds=YB,
         initial_log_intensities=0.0,
-        gp_prior=GPParameters(*nu_init),
+        gp_prior=GPParameters(
+            variance=NU_INIT[0], length_scale=NU_INIT[1]
+        ),
         eps_prior_variance=delta[0],
         eps_prior_length_scale=delta[1],
-        nu_prior_rate=lambda_nu,
-        jitter=jitter,
+        nu_prior_rate=LAMBDA_NU,
+        jitter=JITTER,
     )
-    config = GibbsConfig(
-        mala_step=mala_step, learn_nu=LEARN_NU,
-        t0_nu=t0_nu, step_nu_init=step_nu_init,
-        n_iter=n_iter, thin=thin,
-        verbose=verbose, verbose_every=verbose_every,
+
+
+def make_gibbs_config(mala_step):
+    return GibbsConfig(
+        n_iter=N_ITER,
+        thin=THIN,
+        mala_step=mala_step,
+        learn_nu=LEARN_NU,
         use_calibration=USE_CALIB,
-        grid_nx=nx, grid_ny=ny,
+        verbose=VERBOSE,
+        verbose_every=VERBOSE_EVERY,
+        t0_nu=T0_NU,
+        step_nu_init=STEP_NU_INIT,
         compute_emu=COMPUTE_EMU,
     )
-    return model.gibbs(
-        EventCatalog(t=t_arr, x=x_arr, y=y_arr),
-        config=config,
+
+
+def run_chain(
+    chain_index,
+    zones,
+    catalog,
+    duration,
+    delta,
+    mala_step,
+    reference_intensity,
+):
+    chain_seed = SEED + chain_index
+    model = make_model(zones, duration, delta)
+    result = model.gibbs(
+        catalog,
+        config=make_gibbs_config(mala_step),
         rng_seed=chain_seed,
-        reference_intensity=mu_star_func,
+        reference_intensity=reference_intensity,
         gp_backend=GP_BACKEND,
     )
+    print(f"  [Chain {chain_index + 1}] done (seed={chain_seed})")
+    return result
 
 
-def launch_chains(zones_raw_list, x_arr, y_arr, t_arr, T_val,
-                  mala_step, mu_star_func, delta):
-    chain_outputs = Parallel(n_jobs=N_JOBS, prefer="processes")(
-        delayed(run_chain)(
-            k, SEED, zones_raw_list,
-            x_arr, y_arr, t_arr, T_val,
-            XB, YB, NU_INIT, LAMBDA_NU, delta, JITTER,
-            mala_step, T0_NU, STEP_NU_INIT,
-            N_ITER, THIN, VERBOSE, VERBOSE_EVERY,
-            mu_star_func, NX, NY,
+def launch_chains(
+    zones, catalog, duration, delta, mala_step, reference_intensity
+):
+    """Run independent chains sequentially; Gibbs results contain OT objects."""
+    return [
+        run_chain(
+            chain_index,
+            zones,
+            catalog,
+            duration,
+            delta,
+            mala_step,
+            reference_intensity,
         )
-        for k in range(N_CHAINS)
-    )
-    return list(chain_outputs)
+        for chain_index in tqdm(
+            range(N_CHAINS),
+            desc="Gibbs chains",
+            unit="chain",
+            leave=False,
+            dynamic_ncols=True,
+        )
+    ]
+
+
+def reference_chain(results):
+    return results[len(results) // 2]
 
 
 # =============================================================================
@@ -288,8 +311,8 @@ def _save(fig, name):
 # =============================================================================
 # Fit + eval pour un (delta0, delta1) donné
 # =============================================================================
-def fit_single_config(d0, d1, zones_raw_list, x_arr, y_arr, t_arr,
-                      mu_star_func, cmap_intensities="inferno",
+def fit_single_config(d0, d1, zones, catalog, reference_intensity,
+                      cmap_intensities="inferno",
                       savefigure=False, save_traces=False):
     """Lance l'inférence pour un couple (delta0, delta1).
 
@@ -306,23 +329,22 @@ def fit_single_config(d0, d1, zones_raw_list, x_arr, y_arr, t_arr,
     delta     = [d0, d1]
     mala_step = get_mala_step(d0, d1)
     tag       = f"d0={d0}_d1={d1}"
-    print(f"    ({d0}, {d1})  step={mala_step}", end=" ", flush=True)
+    tqdm.write(f"    ({d0}, {d1})  step={mala_step}")
 
     all_results = launch_chains(
-        zones_raw_list, x_arr, y_arr, t_arr, T,
-        mala_step, mu_star_func, delta,
+        zones, catalog, T, delta, mala_step, reference_intensity,
     )
-    k_ref = N_CHAINS // 2
-    out = all_results[k_ref].posterior_intensity(
+    out = reference_chain(all_results).posterior_intensity(
         nx=NX_POST, ny=NY_POST, burn_in=BURN_IN,
         cmap=cmap_intensities,
-        mu_star_func=mu_star_func,
+        mu_star_func=reference_intensity,
         savefigure=savefigure, savefigure_Emu=savefigure and COMPUTE_EMU,
         title_savefig=f"ssgc/experiment_4/exp4_intensity_{tag}",
         title_savefig_Emu=f"ssgc/experiment_4/exp4_Emu_{tag}",
+        n_mc=POSTERIOR_N_MC,
     )
 
-    print(f"→ RMSE={out['rmse']:.4f}  MAE={out['mae']:.4f}")
+    tqdm.write(f"    RMSE={out['rmse']:.4f}  MAE={out['mae']:.4f}")
 
     entry = {
         "d0": d0, "d1": d1,
@@ -378,20 +400,23 @@ def plot_heatmaps(grid_results, savefigure=False):
                             fontsize=7, color="black")
 
     # Panel 1 : métriques
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(14, 6),
+        layout="constrained",
+    )
     _panel(axes[0], rmse_mat, r"$\mathrm{RMSE}_\mu$",      "YlOrRd")
     _panel(axes[1], mae_mat,  r"$\mathrm{MAE}_\mu$",       "YlOrRd")
     plt.suptitle(r"Experiment 4 — Heatmaps $($\delta_0, \delta_1)$", fontsize=13)
-    plt.tight_layout()
     if savefigure:
         save_figure(fig, "ssgc/experiment_4/exp4_heatmaps", figure_type="raster")
     plt.show()
 
     # Panel 2 : MALA step utilisé (diagnostic)
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
     _panel(ax, step_mat, "MALA step par config", "Blues", annotate=True)
     plt.suptitle(r"Experiment 4 — MALA step $($\delta_0, \delta_1)$", fontsize=13)
-    plt.tight_layout()
     if savefigure:
         save_figure(fig, "ssgc/experiment_4/exp4_heatmap_mala_step", figure_type="raster")
     plt.show()
@@ -430,7 +455,12 @@ def plot_marginal_profiles(grid_results, savefigure=False,
     q25_d1  = np.quantile(delta_rmse_mat, 0.25, axis=1)
     q75_d1  = np.quantile(delta_rmse_mat, 0.75, axis=1)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(14, 5),
+        layout="constrained",
+    )
 
     ax = axes[0]
     x_pos = np.arange(n0)
@@ -458,7 +488,6 @@ def plot_marginal_profiles(grid_results, savefigure=False,
 
     plt.suptitle(r"Experiment 4 — Profils marginaux $\Delta_{\mathrm{RMSE}}$",
                  fontsize=13)
-    plt.tight_layout()
     if savefigure:
         _save(fig, "exp4_marginal_profiles")
     plt.show()
@@ -481,36 +510,55 @@ def plot_representative_traces(grid_results, savefigure=False, emu_color="steelb
     n_repr = len(configs)
 
     # Traces eps
-    fig, axes = plt.subplots(n_repr, 1, figsize=(12, 3.5 * n_repr))
+    fig, axes = plt.subplots(
+        n_repr,
+        1,
+        figsize=(12, 3.5 * n_repr),
+        layout="constrained",
+    )
     if n_repr == 1:
         axes = [axes]
     for ax, (name, r) in zip(axes, configs.items()):
-        rk        = r["all_results"][N_CHAINS // 2]
-        eps_chain = np.asarray(rk["eps"])
-        thin      = rk.get("thin", 1)
+        result = reference_chain(r["all_results"])
+        eps_chain = result.eps_chain
+        thin = result.raw.get("thin", 1)
         iters     = np.arange(eps_chain.shape[0]) * thin
         for j in range(eps_chain.shape[1]):
-            ax.plot(iters, eps_chain[:, j], lw=0.8, label=rf"$\varepsilon_{j}$")
+            ax.plot(
+                iters,
+                eps_chain[:, j],
+                lw=0.8,
+                label=rf"$\varepsilon_{{{j}}}$",
+            )
         ax.set_title(
             f"{name} — $($\\delta_0, \\delta_1) = ({r['d0']}, {r['d1']})$"
             f"  [step={r['mala_step']}]"
         )
         ax.set_xlabel("Iteration")
         ax.set_ylabel(r"$\varepsilon_j$")
-        ax.legend(ncol=eps_chain.shape[1], fontsize=7, loc="upper right")
+        ax.legend(
+            ncol=min(3, eps_chain.shape[1]),
+            fontsize=7,
+            loc="upper right",
+        )
         ax.grid(alpha=0.3)
     plt.suptitle(r"Experiment 4 — Traces $\varepsilon_j$", fontsize=13)
-    plt.tight_layout()
     if savefigure:
         _save(fig, "exp4_traces_eps")
     plt.show()
 
     # Traces E_mu
-    fig, axes = plt.subplots(n_repr, 1, figsize=(12, 3 * n_repr))
+    fig, axes = plt.subplots(
+        n_repr,
+        1,
+        figsize=(12, 3 * n_repr),
+        layout="constrained",
+    )
     if n_repr == 1:
         axes = [axes]
     for ax, (name, r) in zip(axes, configs.items()):
-        E_mu = r["all_results"][N_CHAINS // 2]["E_mu"]
+        result = reference_chain(r["all_results"])
+        E_mu = np.asarray(result.raw.get("E_mu", []), dtype=float)
         mask = ~np.isnan(E_mu)
         if mask.any():
             ax.plot(np.where(mask)[0], E_mu[mask], lw=0.8, color=emu_color)
@@ -522,7 +570,6 @@ def plot_representative_traces(grid_results, savefigure=False, emu_color="steelb
         ax.set_ylabel(r"$\mathcal{E}_\mu^{(t)}$")
         ax.grid(alpha=0.3)
     plt.suptitle(r"Experiment 4 — Traces $\mathcal{E}_\mu^{(t)}$", fontsize=13)
-    plt.tight_layout()
     if savefigure:
         _save(fig, "exp4_traces_Emu")
     plt.show()
@@ -588,34 +635,34 @@ if __name__ == "__main__":
         title="Exp4 — Données (Profile 1, Setting A)",
         savefigure=SAVEFIGURE, title_savefig="ssgc/experiment_4/exp4_dashboard")
 
-    X_data         = simulation.sample; N = X_data.getSize()
-    x_arr          = np.array([float(X_data[i, 0]) for i in range(N)])
-    y_arr          = np.array([float(X_data[i, 1]) for i in range(N)])
-    t_arr          = np.array([float(X_data[i, 2]) for i in range(N)])
-    zones_raw_list = list(simulation.domains.polygons)
-    mus_vec_list   = list(simulation.baseline_intensities)
-
-    mu_star_func = partial(mu_star_func_picklable,
-                           zones_raw=zones_raw_list, mus_vec=mus_vec_list,
-                           f_func=f_star_A)
+    catalog = simulation.catalog
+    zones = list(simulation.domains.polygons)
+    reference_intensity = make_reference_intensity(
+        zones, simulation.baseline_intensities, f_star_A
+    )
 
     # Boucle sur la grille (delta0, delta1)
-    n_total      = len(DELTA0_GRID) * len(DELTA1_GRID)
+    parameter_grid = [
+        (d0, d1)
+        for d0 in DELTA0_GRID
+        for d1 in DELTA1_GRID
+    ]
+    n_total      = len(parameter_grid)
     grid_results = []
-    count        = 0
 
-    for d0 in DELTA0_GRID:
-        for d1 in DELTA1_GRID:
-            count += 1
-            print(f"\n  [{count}/{n_total}]", end=" ")
-            save_traces = (d0, d1) in REPRESENTATIVE_CONFIGS.values()
-            entry = fit_single_config(
-                d0, d1, zones_raw_list, x_arr, y_arr, t_arr,
-                mu_star_func,
-                savefigure=False,
-                save_traces=save_traces,
-            )
-            grid_results.append(entry)
+    for d0, d1 in tqdm(
+        parameter_grid,
+        desc="Experiment 4 hyperparameter grid",
+        unit="config",
+        dynamic_ncols=True,
+    ):
+        save_traces = (d0, d1) in REPRESENTATIVE_CONFIGS.values()
+        entry = fit_single_config(
+            d0, d1, zones, catalog, reference_intensity,
+            savefigure=False,
+            save_traces=save_traces,
+        )
+        grid_results.append(entry)
 
     print(f"\n{'='*70}")
     print(f"  Grille terminée — {n_total} configurations")
@@ -631,13 +678,13 @@ if __name__ == "__main__":
     for name, (d0, d1) in REPRESENTATIVE_CONFIGS.items():
         for r in grid_results:
             if r["d0"] == d0 and r["d1"] == d1 and "all_results" in r:
-                k_ref = N_CHAINS // 2
-                r["all_results"][k_ref].posterior_intensity(
+                reference_chain(r["all_results"]).posterior_intensity(
                     nx=NX_POST, ny=NY_POST, burn_in=BURN_IN, cmap="inferno",
-                    mu_star_func=mu_star_func,
+                    mu_star_func=reference_intensity,
                     savefigure=SAVEFIGURE, savefigure_Emu=SAVEFIGURE and COMPUTE_EMU,
                     title_savefig=f"ssgc/experiment_4/exp4_intensity_{name.replace(' ', '_')}",
                     title_savefig_Emu=f"ssgc/experiment_4/exp4_Emu_{name.replace(' ', '_')}",
+                    n_mc=POSTERIOR_N_MC,
                 )
                 break
 

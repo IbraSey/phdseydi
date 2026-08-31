@@ -1,24 +1,35 @@
-"""User-facing Gibbs posterior result object."""
+"""User-facing variational and Gibbs inference result objects."""
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
 from matplotlib.colors import LogNorm
-from scipy.special import expit
+from scipy.special import expit, log_expit
 
 from package.config import ETASParameters
 from data.catalog import EventCatalog
+from .backends import SparseGP
 from ..models.ssgc import SSGCModel
 from visualization import plot_field, save_figure
 
 
+def _positive_integer(name, value, *, minimum=1) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer.")
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+    return value
+
+
 @dataclass
-class SPINHVIResults:
-    """User-facing result object returned by SPINHVI.fit()."""
+class VIResults:
+    """User-facing result object returned by SSGC or SPIN-H VI."""
 
     state: Any
     model: Any
@@ -27,14 +38,33 @@ class SPINHVIResults:
     elbo_trace: list[float]
     diagnostics: dict = field(default_factory=dict)
 
-    def beta_mean(self) -> float:
-        return float(self.state.etas.beta_mean)
+    @property
+    def use_etas(self) -> bool:
+        """Whether this fit includes branching and ETAS components."""
+        return bool(
+            self.diagnostics.get(
+                "use_etas",
+                getattr(self.model, "etas_kernel", None) is not None,
+            )
+        )
+
+    def _require_etas(self, operation: str) -> None:
+        if not self.use_etas:
+            raise TypeError(
+                f"{operation} is unavailable for an SSGC-only VI fit."
+            )
+
+    def beta_mean(self) -> float | None:
+        value = self.state.etas.beta_mean
+        return None if value is None else float(value)
 
     def etas_mean(self) -> ETASParameters:
+        self._require_etas("ETAS posterior summaries")
         return self.state.etas.parameters_mean
 
     def etas_gamma_parameters(self) -> dict:
         """Return shape/rate summaries for learned ETAS Gamma factors."""
+        self._require_etas("ETAS posterior summaries")
         return {
             name: factor.as_dict()
             for name, factor in self.state.etas.gamma_factors.items()
@@ -47,7 +77,7 @@ class SPINHVIResults:
 
     def summary(self) -> dict:
         """Return posterior means and diagnostics in a compact dictionary."""
-        return {
+        summary = {
             "eps_mean": self.state.eps.mean.copy(),
             "eps_covariance": self.state.eps.covariance.copy(),
             "f_data_mean": self.state.gp.f_data_mean.copy(),
@@ -64,19 +94,201 @@ class SPINHVIResults:
                 None if self.state.gp.coefficients_covariance is None
                 else self.state.gp.coefficients_covariance.copy()
             ),
-            "p_background": self.state.branching.p_background.copy(),
-            "parent_probabilities": self.state.branching.probabilities.copy(),
-            "theta_phi_hat": self.state.etas.parameters_mean.as_dict(),
-            "beta_hat": self.beta_mean(),
-            "theta_phi_gamma": self.etas_gamma_parameters(),
-            "beta_gamma": self.beta_gamma_parameters(),
-            "fixed_etas": dict(self.state.etas.fixed_etas),
             "latent_poisson_expected_counts": (
                 self.state.latent_poisson.expected_counts_by_domain.copy()
             ),
             "elbo_trace": np.asarray(self.elbo_trace, dtype=float),
             "diagnostics": dict(self.diagnostics),
         }
+        if self.catalog.magnitudes is not None:
+            summary.update(
+                {
+                    "beta_hat": self.beta_mean(),
+                    "beta_gamma": self.beta_gamma_parameters(),
+                }
+            )
+        if self.use_etas:
+            summary.update(
+                {
+                    "p_background": self.state.branching.p_background.copy(),
+                    "parent_probabilities": self.state.branching.probabilities.copy(),
+                    "theta_phi_hat": self.state.etas.parameters_mean.as_dict(),
+                    "theta_phi_gamma": self.etas_gamma_parameters(),
+                    "fixed_etas": dict(self.state.etas.fixed_etas),
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _gaussian_draws(mean, covariance, n_samples, rng):
+        """Draw from a Gaussian after removing negligible negative eigenvalues."""
+        mean = np.asarray(mean, dtype=float).reshape(-1)
+        covariance = np.asarray(covariance, dtype=float)
+        covariance = 0.5 * (covariance + covariance.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+        if float(np.min(eigenvalues)) < -1e-8 * scale:
+            raise ValueError("The variational covariance is not positive semidefinite.")
+        square_root = eigenvectors * np.sqrt(np.maximum(eigenvalues, 0.0))
+        standard = rng.standard_normal((mean.size, n_samples))
+        return mean[:, None] + square_root @ standard
+
+    def _latent_gp_samples(self, x_flat, y_flat, n_samples, rng):
+        evaluation_xy = np.column_stack([x_flat, y_flat])
+        backend = str(getattr(self.config, "gp_backend", "exact")).lower()
+        if backend == "sparse":
+            sparse_gp = getattr(self.config, "sparse_gp", None)
+            if sparse_gp is None:
+                sparse_gp = SparseGP.from_bounds(
+                    self.model.x_bounds,
+                    self.model.y_bounds,
+                    self.model.gp_prior.variance,
+                    self.model.gp_prior.length_scale,
+                )
+            coefficients_mean = self.state.gp.coefficients_mean
+            coefficients_covariance = self.state.gp.coefficients_covariance
+            if coefficients_mean is None or coefficients_covariance is None:
+                raise RuntimeError("The sparse variational GP factor is unavailable.")
+            points = ot.Sample(evaluation_xy.tolist())
+            design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
+            coefficient_draws = self._gaussian_draws(
+                coefficients_mean,
+                coefficients_covariance,
+                n_samples,
+                rng,
+            )
+            return design @ coefficient_draws
+
+        support_xy = np.vstack(
+            [self.catalog.xy, self.state.latent_poisson.grid_xy]
+        )
+        support_mean = np.concatenate(
+            [self.state.gp.f_data_mean, self.state.gp.f_grid_mean]
+        )
+        support_covariance = self.state.gp.covariance
+        if support_covariance is None:
+            raise RuntimeError("The exact variational GP factor is unavailable.")
+
+        variance = float(self.model.gp_prior.variance)
+        length_scale = float(self.model.gp_prior.length_scale)
+
+        def kernel(left, right):
+            differences = left[:, None, :] - right[None, :, :]
+            squared_distance = np.sum(differences**2, axis=2)
+            return variance * np.exp(
+                -squared_distance / (2.0 * length_scale**2)
+            )
+
+        K_support = kernel(support_xy, support_xy)
+        K_support.flat[:: K_support.shape[0] + 1] += self.config.jitter
+        K_eval_support = kernel(evaluation_xy, support_xy)
+        projection = np.linalg.solve(K_support, K_eval_support.T).T
+        predictive_mean = projection @ support_mean
+        predictive_covariance = (
+            kernel(evaluation_xy, evaluation_xy)
+            - projection @ K_eval_support.T
+            + projection @ support_covariance @ projection.T
+        )
+        return self._gaussian_draws(
+            predictive_mean,
+            predictive_covariance,
+            n_samples,
+            rng,
+        )
+
+    def background_log_intensity_samples(
+        self,
+        x,
+        y,
+        n_samples: int = 500,
+        rng_seed: int | None = None,
+        domain_index=None,
+    ) -> np.ndarray:
+        """Draw log background-intensity fields without exponential underflow.
+
+        ``domain_index`` is normally inferred from the fitted partition. It can
+        be supplied explicitly for spatial block cross-validation, where the
+        training exposure excludes a held-out block but predictions still use
+        the original domain labels.
+        """
+        n_samples = _positive_integer("n_samples", n_samples)
+        if rng_seed is not None:
+            rng_seed = _positive_integer("rng_seed", rng_seed, minimum=0)
+        rng = np.random.default_rng(rng_seed)
+        x_values, y_values = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+        x_flat = x_values.reshape(-1)
+        y_flat = y_values.reshape(-1)
+        if domain_index is None:
+            domain_index = self.model.domains.locate(x_flat, y_flat)
+        else:
+            domain_index = np.asarray(domain_index, dtype=int).reshape(-1)
+            if domain_index.size != x_flat.size:
+                raise ValueError("domain_index must contain one label per point.")
+        if np.any((domain_index < 0) | (domain_index >= self.model.n_domains)):
+            raise ValueError("Every prediction point must have a valid domain label.")
+
+        eps_draws = self._gaussian_draws(
+            self.state.eps.mean,
+            self.state.eps.covariance,
+            n_samples,
+            rng,
+        )
+        latent_draws = self._latent_gp_samples(
+            x_flat,
+            y_flat,
+            n_samples,
+            rng,
+        )
+        log_intensity_draws = eps_draws[domain_index] + log_expit(latent_draws)
+        if not np.all(np.isfinite(log_intensity_draws)):
+            raise FloatingPointError(
+                "Variational log background-intensity draws are not finite."
+            )
+        return log_intensity_draws
+
+    def background_intensity_samples(
+        self,
+        x,
+        y,
+        n_samples: int = 500,
+        rng_seed: int | None = None,
+        domain_index=None,
+    ) -> np.ndarray:
+        """Draw background-intensity fields from the variational posterior."""
+        return np.exp(
+            self.background_log_intensity_samples(
+                x,
+                y,
+                n_samples=n_samples,
+                rng_seed=rng_seed,
+                domain_index=domain_index,
+            )
+        )
+
+    def background_intensity(
+        self,
+        x,
+        y,
+        n_samples: int = 500,
+        rng_seed: int | None = 0,
+        domain_index=None,
+    ) -> np.ndarray:
+        """Estimate the variational posterior mean background intensity."""
+        x_values, y_values = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+        samples = self.background_intensity_samples(
+            x_values,
+            y_values,
+            n_samples=n_samples,
+            rng_seed=rng_seed,
+            domain_index=domain_index,
+        )
+        return samples.mean(axis=1).reshape(x_values.shape)
 
     def plot_etas_kernel_dispersion(
         self,
@@ -84,6 +296,7 @@ class SPINHVIResults:
         distances=None,
         parent_magnitude: float | None = None,
         reference_parameters: ETASParameters | None = None,
+        parent_time_window: float | None = None,
         n_time: int = 200,
         show: bool = True,
     ) -> dict:
@@ -92,31 +305,54 @@ class SPINHVIResults:
         The displayed kernel is evaluated at the variational posterior means.
         The spatial factor depends on the selected parent magnitude.
         """
+        self._require_etas("ETAS kernel diagnostics")
         kernel = getattr(self.model, "etas_kernel", None)
         if kernel is None:
             raise TypeError("The fitted model does not define an ETAS kernel.")
 
         parameters = self.etas_mean()
         if parent_magnitude is None:
-            magnitudes = np.asarray(self.catalog.magnitudes, dtype=float)
-            parent_magnitude = (
-                float(np.median(magnitudes))
-                if magnitudes.size
-                else float(self.model.magnitude_min)
-            )
+            if self.catalog.magnitudes is None:
+                parent_magnitude = float(self.model.magnitude_min)
+            else:
+                magnitudes = np.asarray(self.catalog.magnitudes, dtype=float)
+                parent_magnitude = (
+                    float(np.median(magnitudes))
+                    if magnitudes.size
+                    else float(self.model.magnitude_min)
+                )
         parent_magnitude = float(parent_magnitude)
         if not np.isfinite(parent_magnitude):
             raise ValueError("parent_magnitude must be finite.")
+        truncation = None
+        if parent_time_window is not None:
+            parent_time_window = float(parent_time_window)
+            if not np.isfinite(parent_time_window) or parent_time_window <= 0.0:
+                raise ValueError("parent_time_window must be finite and positive.")
+            truncation = {
+                "parent_time_window": parent_time_window,
+                "relative_temporal_density": float(
+                    kernel.temporal.relative_density(
+                        parent_time_window,
+                        parameters,
+                    )
+                ),
+                "omitted_temporal_mass": float(
+                    kernel.temporal.tail_mass(
+                        parent_time_window,
+                        parameters,
+                    )
+                ),
+            }
 
         if time_lags is None:
-            if n_time < 2:
-                raise ValueError("n_time must be at least 2.")
+            n_time = _positive_integer("n_time", n_time, minimum=2)
             c_values = [parameters.c]
             if reference_parameters is not None:
                 c_values.append(reference_parameters.c)
             lower = max(min(c_values) * 1e-2, self.model.duration * 1e-6, 1e-8)
             upper = max(float(self.model.duration), 10.0 * lower)
-            time_lags = np.geomspace(lower, upper, int(n_time))
+            time_lags = np.geomspace(lower, upper, n_time)
         else:
             time_lags = np.sort(np.asarray(time_lags, dtype=float).reshape(-1))
             if time_lags.size == 0 or np.any(~np.isfinite(time_lags)):
@@ -171,7 +407,12 @@ class SPINHVIResults:
             None if reference_parameters is None else evaluate(reference_parameters)
         )
 
-        figure, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+        figure, axes = plt.subplots(
+            1,
+            3,
+            figsize=(16, 4.8),
+            layout="constrained",
+        )
         axes[0].plot(time_lags, phi_t, label="VI plug-in estimate")
         if reference is not None:
             axes[0].plot(time_lags, reference[0], "--", label="Reference")
@@ -182,6 +423,13 @@ class SPINHVIResults:
             ylabel=r"$\phi_t(\tau)$",
         )
         axes[0].set_title("Temporal dispersion")
+        if truncation is not None:
+            axes[0].axvline(
+                parent_time_window,
+                color="black",
+                linestyle=":",
+                label="Parent cutoff",
+            )
         axes[0].legend()
 
         colors = plt.cm.viridis(np.linspace(0.05, 0.9, distances.size))
@@ -203,6 +451,13 @@ class SPINHVIResults:
             ylabel=r"$\phi_t(\tau)\phi_s(r\mid m)$",
         )
         axes[1].set_title("Spatio-temporal dispersion")
+        if truncation is not None:
+            axes[1].axvline(
+                parent_time_window,
+                color="black",
+                linestyle=":",
+                label="Parent cutoff",
+            )
         axes[1].legend(fontsize="small")
 
         positive_values = phi_st[phi_st > 0.0]
@@ -222,6 +477,12 @@ class SPINHVIResults:
         )
         axes[2].set(xscale="log", xlabel="Time lag", ylabel="Distance")
         axes[2].set_title("Kernel at VI parameter means")
+        if truncation is not None:
+            axes[2].axvline(
+                parent_time_window,
+                color="white",
+                linestyle=":",
+            )
         figure.colorbar(
             image,
             ax=axes[2],
@@ -230,7 +491,6 @@ class SPINHVIResults:
         figure.suptitle(
             f"ETAS dispersion for parent magnitude m={parent_magnitude:.3g}"
         )
-        figure.tight_layout()
         if show:
             plt.show()
 
@@ -244,6 +504,8 @@ class SPINHVIResults:
             "phi_s": phi_s,
             "phi_spatiotemporal": phi_st,
         }
+        if truncation is not None:
+            result["truncation"] = truncation
         if reference is not None:
             result.update(
                 {
@@ -256,24 +518,35 @@ class SPINHVIResults:
 
     def declustering(self, background_threshold: float = 0.5) -> dict:
         """Return a two-stage declustering decision from q(Z)."""
-        probabilities = self.state.branching.probabilities
-        p_background = probabilities[:, 0]
-        labels = np.zeros(probabilities.shape[0], dtype=int)
-        parent = np.full(probabilities.shape[0], -1, dtype=int)
+        self._require_etas("Declustering")
+        if (
+            not np.isfinite(background_threshold)
+            or not 0.0 <= background_threshold <= 1.0
+        ):
+            raise ValueError("background_threshold must be in [0, 1].")
+        branching = self.state.branching
+        p_background = branching.p_background
+        labels = np.zeros(p_background.size, dtype=int)
+        parent = np.full(p_background.size, -1, dtype=int)
         triggered = p_background < background_threshold
         for i in np.where(triggered)[0]:
             if i == 0:
                 labels[i] = 0
                 continue
-            j = int(np.argmax(probabilities[i, 1 : i + 1]))
-            labels[i] = 1
-            parent[i] = j
+            j = branching.most_likely_parent(i)
+            if j >= 0:
+                labels[i] = 1
+                parent[i] = j
         return {
             "p_background": p_background.copy(),
             "is_background": ~triggered,
             "parent": parent,
             "labels": labels,
         }
+
+
+# Historical public name retained for backward compatibility.
+SPINHVIResults = VIResults
 
 
 @dataclass
@@ -434,10 +707,14 @@ class GibbsResults(Mapping):
         y,
         burn_in: float | None = None,
         n_samples: int = 500,
+        domain_index=None,
     ) -> np.ndarray:
-        """Draw background-intensity fields at arbitrary spatial coordinates."""
-        if n_samples <= 0:
-            raise ValueError("n_samples must be positive.")
+        """Draw background-intensity fields at arbitrary spatial coordinates.
+
+        Explicit ``domain_index`` labels support predictions in held-out spatial
+        blocks that were removed from the training exposure.
+        """
+        n_samples = _positive_integer("n_samples", n_samples)
 
         summary = self.summary(burn_in)
         x_eval, y_eval = np.broadcast_arrays(
@@ -446,6 +723,12 @@ class GibbsResults(Mapping):
         )
         x_flat = x_eval.reshape(-1)
         y_flat = y_eval.reshape(-1)
+        if domain_index is not None:
+            domain_index = np.asarray(domain_index, dtype=int).reshape(-1)
+            if domain_index.size != x_flat.size:
+                raise ValueError("domain_index must contain one label per point.")
+            if np.any((domain_index < 0) | (domain_index >= self.model.n_domains)):
+                raise ValueError("Every prediction point must have a valid domain label.")
 
         eps_chain = np.asarray(self.raw.get("eps", []), dtype=float)
         sparse_gp = self.raw.get("sparse_gp")
@@ -464,9 +747,14 @@ class GibbsResults(Mapping):
                 samples = np.empty((x_flat.size, draw_indices.size), dtype=float)
                 for column, index in enumerate(draw_indices):
                     latent_gp = design @ gp_coeffs[index]
-                    samples[:, column] = self.model.background_intensity(
-                        x_flat, y_flat, eps_chain[index], latent_gp
-                    ).reshape(-1)
+                    if domain_index is None:
+                        samples[:, column] = self.model.background_intensity(
+                            x_flat, y_flat, eps_chain[index], latent_gp
+                        ).reshape(-1)
+                    else:
+                        samples[:, column] = (
+                            np.exp(eps_chain[index, domain_index]) * expit(latent_gp)
+                        )
                 return samples
 
         evaluation_xy = np.column_stack([x_flat, y_flat])
@@ -519,17 +807,43 @@ class GibbsResults(Mapping):
                 "OpenTURNS could not sample the posterior GP."
             ) from last_error
 
-        baseline = self.model.baseline_intensity(
-            x_flat, y_flat, summary["eps_hat"]
-        )
-        return baseline[:, None] * expit(latent_samples)
+        if eps_chain.ndim == 2 and eps_chain.shape[0]:
+            burn = self._burn_index(eps_chain.shape[0], burn_in)
+            available_indices = np.arange(burn, eps_chain.shape[0])
+            positions = np.linspace(
+                0, available_indices.size - 1, n_samples
+            ).round().astype(int)
+            eps_indices = available_indices[positions]
+            if domain_index is None:
+                baseline_samples = np.column_stack(
+                    [
+                        self.model.baseline_intensity(
+                            x_flat,
+                            y_flat,
+                            eps_chain[index],
+                        ).reshape(-1)
+                        for index in eps_indices
+                    ]
+                )
+            else:
+                baseline_samples = np.exp(eps_chain[eps_indices][:, domain_index]).T
+        else:
+            if domain_index is None:
+                baseline = self.model.baseline_intensity(
+                    x_flat, y_flat, summary["eps_hat"]
+                )
+            else:
+                baseline = np.exp(summary["eps_hat"][domain_index])
+            baseline_samples = baseline[:, None]
+        return baseline_samples * expit(latent_samples)
 
     @staticmethod
     def _thin_indices(indices, max_draws=200):
+        max_draws = _positive_integer("max_draws", max_draws)
         indices = np.asarray(indices, dtype=int).reshape(-1)
         if indices.size <= max_draws:
             return indices
-        selected = np.linspace(0, indices.size - 1, int(max_draws)).round().astype(int)
+        selected = np.linspace(0, indices.size - 1, max_draws).round().astype(int)
         return np.unique(indices[selected])
 
     def _posterior_background_flat(
@@ -640,11 +954,11 @@ class GibbsResults(Mapping):
             raise ValueError("times must contain at least one value.")
         if not np.all(np.isfinite(times)):
             raise ValueError("times must contain only finite values.")
-        if int(nx) < 2 or int(ny) < 2:
-            raise ValueError("nx and ny must be at least 2.")
+        nx = _positive_integer("nx", nx, minimum=2)
+        ny = _positive_integer("ny", ny, minimum=2)
 
-        x_grid = np.linspace(self.model.x_bounds[0], self.model.x_bounds[1], int(nx))
-        y_grid = np.linspace(self.model.y_bounds[0], self.model.y_bounds[1], int(ny))
+        x_grid = np.linspace(self.model.x_bounds[0], self.model.x_bounds[1], nx)
+        y_grid = np.linspace(self.model.y_bounds[0], self.model.y_bounds[1], ny)
         X, Y = np.meshgrid(x_grid, y_grid)
         x_flat = X.reshape(-1)
         y_flat = Y.reshape(-1)
@@ -971,6 +1285,8 @@ class GibbsResults(Mapping):
         return output
 
     def _make_mesh(self, nx, ny):
+        nx = _positive_integer("nx", nx, minimum=2)
+        ny = _positive_integer("ny", ny, minimum=2)
         xmin, xmax = self.model.x_bounds
         ymin, ymax = self.model.y_bounds
         interval = ot.Interval([xmin, ymin], [xmax, ymax])
@@ -981,8 +1297,8 @@ class GibbsResults(Mapping):
     def posterior_intensity(
         self,
         burn_in: float | None = None,
-        nx=100,
-        ny=100,
+        nx=70,
+        ny=70,
         cmap="viridis",
         event_cmap="plasma",
         savefigure=False,
@@ -996,7 +1312,7 @@ class GibbsResults(Mapping):
         """Plot and summarize the posterior SSGC background intensity."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         mesh, vertices = self._make_mesh(nx, ny)
-        if vertices.shape[0] > 50000:
+        if vertices.shape[0] > 10000:
             raise ValueError(f"Mesh too large: {vertices.shape[0]} points")
 
         x_grid = vertices[:, 0]
@@ -1028,13 +1344,15 @@ class GibbsResults(Mapping):
             iters_post = np.where(mask)[0]
             if E_mu_post.size:
                 E_mu_bar = float(E_mu_post.mean())
-                fig_err, ax_err = plt.subplots(figsize=(9, 3))
+                fig_err, ax_err = plt.subplots(
+                    figsize=(9, 3),
+                    layout="constrained",
+                )
                 ax_err.plot(iters_post, E_mu_post, linewidth=0.8, color=color_Emu)
                 ax_err.set_xlabel("Iteration")
                 ax_err.set_ylabel(r"$\mathcal{E}_\mu^{(t)}$")
                 ax_err.set_title(r"$L^2$ reconstruction error $\mathcal{E}_\mu^{(t)}$")
                 ax_err.grid(alpha=0.3)
-                plt.tight_layout()
                 if savefigure_Emu:
                     save_figure(fig_err, title_savefig_Emu)
                 plt.show()
@@ -1055,7 +1373,7 @@ class GibbsResults(Mapping):
                 import properscoring as ps
 
                 crps_bar = float(ps.crps_ensemble(mu_star_grid, mu_hat_sims).mean())
-            except Exception:
+            except ImportError:
                 crps_bar = None
             print(f"\n{'='*45}")
             print(f"  Metrics (grid {nx}x{ny}, n_mc={n_mc})")
@@ -1066,7 +1384,12 @@ class GibbsResults(Mapping):
                 print(f"  CRPS          : {crps_bar:.4f}")
             print(f"{'='*45}\n")
 
-            fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+            fig, axes = plt.subplots(
+                1,
+                3,
+                figsize=(17, 5.4),
+                layout="constrained",
+            )
             plot_specs = [
                 (mu_star_field, r"True intensity $\mu^\star(s)$"),
                 (mu_hat_field, r"Estimated intensity $\hat{\mu}(s)$"),
@@ -1079,7 +1402,12 @@ class GibbsResults(Mapping):
                 ax.set_ylim(self.model.y_bounds)
                 ax.grid(alpha=0.3, color="white", linewidth=0.5)
         else:
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+            fig, axes = plt.subplots(
+                1,
+                2,
+                figsize=(12, 5.5),
+                layout="constrained",
+            )
             ax = axes[0]
             ax.scatter(
                 self.catalog.x,
@@ -1103,7 +1431,6 @@ class GibbsResults(Mapping):
             ax.set_ylim(self.model.y_bounds)
             ax.grid(alpha=0.3, color="white", linewidth=0.5)
 
-        plt.tight_layout()
         if savefigure:
             save_figure(fig, title_savefig, figure_type="raster")
         plt.show()
@@ -1168,7 +1495,10 @@ class GibbsResults(Mapping):
             title_savefig = title_savefig or "traces_etas"
         else:
             eps_chain = self.eps_chain
-            chains = [(rf"$\epsilon_{j}$", eps_chain[:, j]) for j in range(eps_chain.shape[1])]
+            chains = [
+                (rf"$\varepsilon_{{{j}}}$", eps_chain[:, j])
+                for j in range(eps_chain.shape[1])
+            ]
             if (
                 self.beta_chain is not None
                 and self.raw.get(
@@ -1185,7 +1515,13 @@ class GibbsResults(Mapping):
         iters = np.arange(n_store) * thin
         if figsize is None:
             figsize = (10, max(2.0, 1.8 * len(chains)))
-        fig, axes = plt.subplots(len(chains), 2, figsize=figsize, squeeze=False)
+        fig, axes = plt.subplots(
+            len(chains),
+            2,
+            figsize=figsize,
+            squeeze=False,
+            layout="constrained",
+        )
         for index, (name, values) in enumerate(chains):
             label = tex.get(name, name)
             axes[index, 0].plot(iters, values, lw=0.8, alpha=0.85, color=trace_color)
@@ -1198,7 +1534,6 @@ class GibbsResults(Mapping):
             )
             axes[index, 1].set_title(f"Posterior {label}")
             axes[index, 1].grid(alpha=0.3)
-        plt.tight_layout()
         if savefigure:
             save_figure(fig, title_savefig)
         plt.show()
@@ -1207,7 +1542,13 @@ class GibbsResults(Mapping):
         if self.etas_chain is None and self.raw.get("acceptance_nu") is not None:
             nu_chain = np.asarray(self.raw["nu"])
             labels = [r"$v^2$", r"$\ell$"]
-            nu_fig, nu_axes = plt.subplots(2, 2, figsize=(figsize[0], 6), squeeze=False)
+            nu_fig, nu_axes = plt.subplots(
+                2,
+                2,
+                figsize=(figsize[0], 6),
+                squeeze=False,
+                layout="constrained",
+            )
             for index, label in enumerate(labels):
                 values = nu_chain[:, index]
                 nu_axes[index, 0].plot(iters, values, linewidth=1, color=trace_color)
@@ -1220,7 +1561,6 @@ class GibbsResults(Mapping):
                 )
                 nu_axes[index, 1].set_title(f"Posterior {label}")
                 nu_axes[index, 1].grid(alpha=0.3)
-            plt.tight_layout()
             if savefigure:
                 save_figure(nu_fig, "traces_nu")
             plt.show()
@@ -1258,7 +1598,10 @@ class GibbsResults(Mapping):
             print(f"[plot_acf] Not enough post-burn-in draws ({n_post}).")
             return None
 
-        plots = [(rf"$\epsilon_{j}$", eps_chain[burn:, j]) for j in range(eps_chain.shape[1])]
+        plots = [
+            (rf"$\varepsilon_{{{j}}}$", eps_chain[burn:, j])
+            for j in range(eps_chain.shape[1])
+        ]
         if self.raw.get("acceptance_nu") is not None:
             nu_chain = np.asarray(self.raw["nu"])
             plots.extend([(r"$v^2$", nu_chain[burn:, 0]), (r"$\ell$", nu_chain[burn:, 1])])
@@ -1274,7 +1617,13 @@ class GibbsResults(Mapping):
         ):
             plots.append((r"$\beta$", self.beta_chain[burn:]))
 
-        fig, axes = plt.subplots(len(plots), 1, figsize=(figsize[0], 3.0 * len(plots)), squeeze=False)
+        fig, axes = plt.subplots(
+            len(plots),
+            1,
+            figsize=(figsize[0], 3.0 * len(plots)),
+            squeeze=False,
+            layout="constrained",
+        )
         lags = np.arange(max_lag + 1)
         thin = self.raw.get("thin", 1)
         for ax, (label, chain) in zip(axes[:, 0], plots):
@@ -1284,7 +1633,6 @@ class GibbsResults(Mapping):
             ax.set(xlim=(0, max_lag), ylim=(-1.0, 1.0), xlabel="Lag")
             ax.set_title(f"ACF - {label} (thin={thin})")
             ax.grid(alpha=0.3)
-        plt.tight_layout()
         if savefigure:
             save_figure(fig, title_savefig)
         plt.show()
@@ -1408,7 +1756,12 @@ class GibbsResults(Mapping):
                 zero_division=0,
             )
 
-        fig, axes = plt.subplots(1, 2, figsize=(14.5, 5.5))
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=(14.5, 5.5),
+            layout="constrained",
+        )
         ax = axes[0]
         sc = ax.scatter(
             xa, ya, c=p_bg, cmap=probability_cmap, s=20,
@@ -1459,7 +1812,6 @@ class GibbsResults(Mapping):
         ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label=branching_color_label)
 
-        plt.tight_layout()
         if savefigure:
             save_figure(fig, title_savefig)
         plt.show()

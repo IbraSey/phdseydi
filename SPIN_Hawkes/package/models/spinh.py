@@ -17,6 +17,13 @@ class SPINHModel(SSGCModel):
     etas_parameters: ETASParameters = field(default_factory=ETASParameters)
     etas_kernel: ETASKernel = field(default_factory=ETASKernel)
 
+    def __post_init__(self):
+        super().__post_init__()
+        if not isinstance(self.etas_parameters, ETASParameters):
+            raise TypeError("etas_parameters must be an ETASParameters instance.")
+        if not isinstance(self.etas_kernel, ETASKernel):
+            raise TypeError("etas_kernel must be an ETASKernel instance.")
+
     def validate_catalog(self, catalog: EventCatalog) -> np.ndarray:
         indices = super().validate_catalog(catalog)
         if self.etas_parameters.marked and catalog.magnitudes is None:
@@ -69,12 +76,13 @@ class SPINHModel(SSGCModel):
             sample_z=config.sample_z,
             known_z=config.known_z,
             fixed_etas=config.fixed_etas,
+            parent_time_window=config.parent_time_window,
         )
 
     def vi(self, catalog, config=None, rng_seed=None):
         """Estimate this SPIN-H model with simple hybrid CAVI/VI.
 
-        The model remains unchanged. The returned SPINHVIResults object contains
+        The model remains unchanged. The returned VIResults object contains
         variational posterior summaries for Z, epsilon, the GP and ETAS blocks.
         """
         from ..inference.VI import SPINHVI
@@ -83,6 +91,12 @@ class SPINHModel(SSGCModel):
             config = SPINHVIConfig(random_seed=rng_seed)
         elif not isinstance(config, SPINHVIConfig):
             raise TypeError("config must be a SPINHVIConfig instance.")
+        elif rng_seed is not None:
+            if config.random_seed is not None and config.random_seed != rng_seed:
+                raise ValueError(
+                    "rng_seed conflicts with config.random_seed; provide only one seed."
+                )
+            config = replace(config, random_seed=rng_seed)
         inference_model = self
         if config.use_calibration:
             calibrated_prior = self.calibrate_gp_prior(
@@ -94,6 +108,24 @@ class SPINHModel(SSGCModel):
         engine = SPINHVI(inference_model, catalog, config=config)
         return engine.fit()
 
+    def parent_time_window_from_kernel(
+        self,
+        relative_density: float,
+        parameters: ETASParameters | None = None,
+    ) -> float:
+        """Map a relative spatio-temporal kernel height to a parent time window.
+
+        For fixed parent magnitude and distance, the relative decay of the full
+        ETAS kernel is the relative decay of its temporal Omori component.
+        """
+        parameters = self.etas_parameters if parameters is None else parameters
+        if not isinstance(parameters, ETASParameters):
+            raise TypeError("parameters must be an ETASParameters instance.")
+        return self.etas_kernel.temporal.lag_at_relative_density(
+            relative_density,
+            parameters,
+        )
+
     def triggering_intensity(
         self,
         t_eval,
@@ -102,18 +134,26 @@ class SPINHModel(SSGCModel):
         history: EventCatalog,
         parameters: ETASParameters | None = None,
     ) -> np.ndarray:
-        parameters = parameters or self.etas_parameters
+        parameters = self.etas_parameters if parameters is None else parameters
+        if not isinstance(parameters, ETASParameters):
+            raise TypeError("parameters must be an ETASParameters instance.")
+        if not isinstance(history, EventCatalog):
+            raise TypeError("history must be an EventCatalog instance.")
         t_eval, x_eval, y_eval = np.broadcast_arrays(
             np.asarray(t_eval, dtype=float),
             np.asarray(x_eval, dtype=float),
             np.asarray(y_eval, dtype=float),
         )
         shape = t_eval.shape
+        if not np.all(np.isfinite([t_eval, x_eval, y_eval])):
+            raise ValueError("Evaluation times and coordinates must be finite.")
         t_eval = t_eval.reshape(-1)
         x_eval = x_eval.reshape(-1)
         y_eval = y_eval.reshape(-1)
         if len(history) == 0:
             return np.zeros(shape, dtype=float)
+        if parameters.marked and history.magnitudes is None:
+            raise ValueError("Marked triggering intensity requires history magnitudes.")
         magnitudes = (
             history.magnitudes
             if history.magnitudes is not None
@@ -146,7 +186,7 @@ class SPINHModel(SSGCModel):
         background = self.background_intensity(x_eval, y_eval, eps, latent_gp)
         triggering = self.triggering_intensity(
             t_eval, x_eval, y_eval, history, parameters
-        ).reshape(-1)
+        )
         return background, triggering, background + triggering
 
     def temporal_compensator(
@@ -154,8 +194,14 @@ class SPINHModel(SSGCModel):
         parent_times,
         parameters: ETASParameters | None = None,
     ) -> np.ndarray:
+        parameters = self.etas_parameters if parameters is None else parameters
+        if not isinstance(parameters, ETASParameters):
+            raise TypeError("parameters must be an ETASParameters instance.")
+        parent_times = np.asarray(parent_times, dtype=float)
+        if not np.all(np.isfinite(parent_times)):
+            raise ValueError("parent_times must contain only finite values.")
         return self.etas_kernel.temporal.integral_until(
-            parent_times, self.duration, parameters or self.etas_parameters
+            parent_times, self.duration, parameters
         )
 
     def spatial_compensator(
@@ -167,11 +213,27 @@ class SPINHModel(SSGCModel):
         n_grid: int = 40,
         observation_domain=None,
     ) -> np.ndarray:
-        parameters = parameters or self.etas_parameters
-        parent_x = np.asarray(parent_x, dtype=float)
+        parameters = self.etas_parameters if parameters is None else parameters
+        if not isinstance(parameters, ETASParameters):
+            raise TypeError("parameters must be an ETASParameters instance.")
+        parent_x = np.asarray(parent_x, dtype=float).reshape(-1)
+        parent_y = np.asarray(parent_y, dtype=float).reshape(-1)
         if parent_magnitudes is None:
             parent_magnitudes = np.full(
                 parent_x.size, self.magnitude_min
+            )
+        parent_magnitudes = np.asarray(parent_magnitudes, dtype=float).reshape(-1)
+        if not (
+            parent_x.size == parent_y.size == parent_magnitudes.size
+        ):
+            raise ValueError(
+                "Parent coordinates and magnitudes must have matching lengths."
+            )
+        if not np.all(
+            np.isfinite(np.r_[parent_x, parent_y, parent_magnitudes])
+        ):
+            raise ValueError(
+                "Parent coordinates and magnitudes must contain only finite values."
             )
         return self.etas_kernel.spatial.retained_mass(
             parent_x,
@@ -195,7 +257,10 @@ class SPINHModel(SSGCModel):
         parameters: ETASParameters | None = None,
         n_grid: int = 40,
     ) -> float:
-        parameters = parameters or self.etas_parameters
+        parameters = self.etas_parameters if parameters is None else parameters
+        if not isinstance(parameters, ETASParameters):
+            raise TypeError("parameters must be an ETASParameters instance.")
+        self.validate_catalog(catalog)
         magnitudes = (
             catalog.magnitudes
             if catalog.magnitudes is not None

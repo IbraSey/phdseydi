@@ -1,6 +1,7 @@
 """Deterministic ETAS kernel components."""
 
 from dataclasses import dataclass
+from numbers import Integral
 
 import numpy as np
 from shapely import contains_xy
@@ -56,6 +57,42 @@ class OmoriKernel:
             parameters.c / (remaining + parameters.c)
         ) ** (parameters.p - 1.0)
 
+    def relative_density(self, delta_t, parameters: ETASParameters) -> np.ndarray:
+        """Return ``phi_t(delta_t) / phi_t(0+)`` for non-negative lags."""
+        delta_t = np.asarray(delta_t, dtype=float)
+        if np.any(~np.isfinite(delta_t)) or np.any(delta_t < 0.0):
+            raise ValueError("delta_t must contain finite non-negative values.")
+        return (parameters.c / (delta_t + parameters.c)) ** parameters.p
+
+    def tail_mass(self, delta_t, parameters: ETASParameters) -> np.ndarray:
+        """Return the normalized temporal mass after each non-negative lag."""
+        delta_t = np.asarray(delta_t, dtype=float)
+        if np.any(~np.isfinite(delta_t)) or np.any(delta_t < 0.0):
+            raise ValueError("delta_t must contain finite non-negative values.")
+        return (
+            parameters.c / (delta_t + parameters.c)
+        ) ** (parameters.p - 1.0)
+
+    def lag_at_relative_density(
+        self,
+        relative_density: float,
+        parameters: ETASParameters,
+    ) -> float:
+        """Convert a relative kernel-height threshold into a time window."""
+        try:
+            relative_density = float(relative_density)
+        except (TypeError, ValueError) as error:
+            raise ValueError("relative_density must lie strictly between 0 and 1.") from error
+        if (
+            not np.isfinite(relative_density)
+            or not 0.0 < relative_density < 1.0
+        ):
+            raise ValueError("relative_density must lie strictly between 0 and 1.")
+        return float(
+            parameters.c
+            * (relative_density ** (-1.0 / parameters.p) - 1.0)
+        )
+
 
 @dataclass(frozen=True)
 class SpatialPowerLawKernel:
@@ -109,6 +146,8 @@ class SpatialPowerLawKernel:
         Polygon, non-convex Polygon, Polygon with holes, or MultiPolygon.  The
         rectangular window is used only when no geometry is supplied.
         """
+        if isinstance(n_grid, bool) or not isinstance(n_grid, Integral):
+            raise ValueError("n_grid must be an integer.")
         n_grid = int(n_grid)
         if n_grid < 1:
             raise ValueError("n_grid must be positive.")

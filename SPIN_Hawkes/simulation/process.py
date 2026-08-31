@@ -1,11 +1,13 @@
 """Simulation of spatial sigmoidal Cox and marked Hawkes processes."""
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Callable, Sequence
 
 import numpy as np
 import openturns as ot
 from scipy.special import expit
+from tqdm.auto import tqdm
 from shapely.geometry import box
 
 from package.config import ETASParameters
@@ -14,6 +16,26 @@ from package.models.kernels import ETASKernel
 from spatial.domain import DomainPartition
 
 LatentField = Callable[..., np.ndarray | float]
+
+
+def _positive_integer(name, value, *, minimum=1) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer.")
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}.")
+    return value
+
+
+def _validate_rng_seed(rng_seed):
+    if rng_seed is None:
+        return None
+    if isinstance(rng_seed, bool) or not isinstance(rng_seed, Integral):
+        raise ValueError("rng_seed must be a non-negative integer or None.")
+    rng_seed = int(rng_seed)
+    if rng_seed < 0:
+        raise ValueError("rng_seed must be a non-negative integer or None.")
+    return rng_seed
 
 
 @dataclass(frozen=True)
@@ -27,6 +49,26 @@ class SimulationGrid:
     sigmoid: np.ndarray
     intensity: np.ndarray
 
+    def __post_init__(self):
+        arrays = {}
+        shape = None
+        for name in ("x", "y", "baseline", "latent", "sigmoid", "intensity"):
+            values = np.array(getattr(self, name), dtype=float, copy=True)
+            if shape is None:
+                shape = values.shape
+            elif values.shape != shape:
+                raise ValueError("Every SimulationGrid array must have the same shape.")
+            if not np.all(np.isfinite(values)):
+                raise ValueError("SimulationGrid arrays must contain only finite values.")
+            values.setflags(write=False)
+            arrays[name] = values
+        if np.any(arrays["baseline"] < 0.0) or np.any(arrays["intensity"] < 0.0):
+            raise ValueError("SimulationGrid intensities must be non-negative.")
+        if np.any((arrays["sigmoid"] < 0.0) | (arrays["sigmoid"] > 1.0)):
+            raise ValueError("SimulationGrid sigmoid values must lie in [0, 1].")
+        for name, values in arrays.items():
+            object.__setattr__(self, name, values)
+
 @dataclass(frozen=True)
 class SpatialProcessSimulation:
     """A simulated catalog together with its generating spatial intensity."""
@@ -39,6 +81,43 @@ class SpatialProcessSimulation:
     duration: float
     grid: SimulationGrid
     _component_evaluator: Callable = field(repr=False, compare=False)
+
+    def __post_init__(self):
+        if not isinstance(self.catalog, EventCatalog):
+            raise TypeError("catalog must be an EventCatalog instance.")
+        if not isinstance(self.domains, DomainPartition):
+            raise TypeError("domains must be a DomainPartition instance.")
+        if not isinstance(self.grid, SimulationGrid):
+            raise TypeError("grid must be a SimulationGrid instance.")
+        if not callable(self._component_evaluator):
+            raise TypeError("_component_evaluator must be callable.")
+        baseline = np.array(
+            self.baseline_intensities,
+            dtype=float,
+            copy=True,
+        ).reshape(-1)
+        if baseline.size != len(self.domains):
+            raise ValueError("One baseline intensity is required per spatial domain.")
+        if np.any(~np.isfinite(baseline)) or np.any(baseline <= 0.0):
+            raise ValueError("Baseline intensities must be finite and positive.")
+        baseline.setflags(write=False)
+        object.__setattr__(self, "baseline_intensities", baseline)
+
+        bounds = []
+        for name, values in (("x_bounds", self.x_bounds), ("y_bounds", self.y_bounds)):
+            try:
+                lower, upper = map(float, values)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} must contain two finite bounds.") from error
+            if not np.all(np.isfinite([lower, upper])) or lower >= upper:
+                raise ValueError(f"{name} must contain two finite increasing bounds.")
+            bounds.append((lower, upper))
+        object.__setattr__(self, "x_bounds", bounds[0])
+        object.__setattr__(self, "y_bounds", bounds[1])
+        duration = float(self.duration)
+        if not np.isfinite(duration) or duration <= 0.0:
+            raise ValueError("duration must be finite and positive.")
+        object.__setattr__(self, "duration", duration)
 
     @property
     def sample(self) -> ot.Sample:
@@ -62,11 +141,32 @@ class HawkesProcessSimulation:
     catalog: EventCatalog
     parent_indices: np.ndarray
     generations: np.ndarray
-    background_simulation: SpatialProcessSimulation
+    background_simulation: SpatialProcessSimulation | None
 
     def __post_init__(self):
-        parent_indices = np.asarray(self.parent_indices, dtype=int).reshape(-1)
-        generations = np.asarray(self.generations, dtype=int).reshape(-1)
+        if not isinstance(self.catalog, EventCatalog):
+            raise TypeError("catalog must be an EventCatalog instance.")
+        if self.background_simulation is not None and not isinstance(
+            self.background_simulation,
+            SpatialProcessSimulation,
+        ):
+            raise TypeError(
+                "background_simulation must be a SpatialProcessSimulation or None."
+            )
+
+        def integer_vector(name, values):
+            try:
+                numeric = np.asarray(values, dtype=float).reshape(-1)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} must contain integer labels.") from error
+            if np.any(~np.isfinite(numeric)) or np.any(numeric != np.rint(numeric)):
+                raise ValueError(f"{name} must contain integer labels.")
+            result = np.array(numeric, dtype=int, copy=True)
+            result.setflags(write=False)
+            return result
+
+        parent_indices = integer_vector("parent_indices", self.parent_indices)
+        generations = integer_vector("generations", self.generations)
         n_events = len(self.catalog)
         if parent_indices.size != n_events or generations.size != n_events:
             raise ValueError("One parent index and generation are required per event.")
@@ -77,6 +177,16 @@ class HawkesProcessSimulation:
             raise ValueError("Parent indices must be -1 or valid event indices.")
         if np.any(generations < 0):
             raise ValueError("Generations must be non-negative.")
+        background = parent_indices < 0
+        if np.any(generations[background] != 0):
+            raise ValueError("Every background event must have generation zero.")
+        triggered = np.flatnonzero(~background)
+        if triggered.size and np.any(
+            generations[triggered] != generations[parent_indices[triggered]] + 1
+        ):
+            raise ValueError(
+                "Each triggered event generation must be one greater than its parent's."
+            )
         object.__setattr__(self, "parent_indices", parent_indices)
         object.__setattr__(self, "generations", generations)
 
@@ -146,12 +256,15 @@ def simulate_hawkes_process(
     beta = float(beta)
     magnitude_min = float(magnitude_min)
     magnitude_max = float(magnitude_max)
-    if beta <= 0:
-        raise ValueError("beta must be positive.")
+    if not np.isfinite(beta) or beta <= 0:
+        raise ValueError("beta must be finite and positive.")
+    if not np.isfinite(magnitude_min) or not np.isfinite(magnitude_max):
+        raise ValueError("Magnitude bounds must be finite.")
     if not magnitude_min < magnitude_max:
         raise ValueError("magnitude_min must be smaller than magnitude_max.")
-    if max_events <= 0:
-        raise ValueError("max_events must be positive.")
+    max_events = _positive_integer("max_events", max_events)
+    grid_res = _positive_integer("grid_res", grid_res, minimum=2)
+    rng_seed = _validate_rng_seed(rng_seed)
 
     background = simulate_spatial_process(
         X_bounds=X_bounds,
@@ -190,6 +303,13 @@ def simulate_hawkes_process(
     duration = float(T)
     parent_index = 0
 
+    progress = tqdm(
+        total=len(events),
+        desc="Hawkes branching simulation",
+        unit="parent",
+        disable=not verbose,
+        dynamic_ncols=True,
+    )
     while parent_index < len(events):
         parent_time, parent_x, parent_y, parent_magnitude, _, parent_generation = (
             events[parent_index]
@@ -244,6 +364,9 @@ def simulate_hawkes_process(
                 ]
             )
         parent_index += 1
+        progress.total = len(events)
+        progress.update()
+    progress.close()
 
     if events:
         values = np.asarray(events, dtype=float)
@@ -271,7 +394,7 @@ def simulate_hawkes_process(
         background_simulation=background,
     )
     if verbose:
-        print(
+        tqdm.write(
             f"Simulated {len(catalog)} Hawkes events "
             f"({simulation.n_background} background, {simulation.n_triggered} triggered)."
         )
@@ -279,8 +402,8 @@ def simulate_hawkes_process(
 
 
 def _rectangular_domains(x_bounds, y_bounds, n_cols: int, n_rows: int):
-    if n_cols <= 0 or n_rows <= 0:
-        raise ValueError("n_cols and n_rows must be positive.")
+    n_cols = _positive_integer("n_cols", n_cols)
+    n_rows = _positive_integer("n_rows", n_rows)
     xmin, xmax = x_bounds
     ymin, ymax = y_bounds
     dx = (xmax - xmin) / n_cols
@@ -316,10 +439,15 @@ def simulate_spatial_process(
     xmin, xmax = map(float, X_bounds)
     ymin, ymax = map(float, Y_bounds)
     duration = float(T)
-    if not xmin < xmax or not ymin < ymax or duration <= 0:
-        raise ValueError("Bounds must increase and T must be positive.")
-    if grid_res < 2:
-        raise ValueError("grid_res must be at least 2.")
+    if (
+        not np.all(np.isfinite([xmin, xmax, ymin, ymax, duration]))
+        or not xmin < xmax
+        or not ymin < ymax
+        or duration <= 0
+    ):
+        raise ValueError("Bounds must be finite and increasing, and T must be positive.")
+    grid_res = _positive_integer("grid_res", grid_res, minimum=2)
+    rng_seed = _validate_rng_seed(rng_seed)
     if rng_seed is not None:
         ot.RandomGenerator.SetSeed(int(rng_seed))
 
@@ -376,6 +504,9 @@ def simulate_spatial_process(
                     )
                     latent[mask] = np.broadcast_to(values, (mask.sum(),))
 
+        if not np.all(np.isfinite(latent)):
+            raise ValueError("The latent field must return only finite values.")
+
         sigmoid = expit(latent)
         intensity = mu_tilde * sigmoid
         return tuple(
@@ -417,7 +548,7 @@ def simulate_spatial_process(
         _component_evaluator=evaluate_components,
     )
     if verbose:
-        print(
+        tqdm.write(
             f"Simulated {len(catalog)} events in {n_domains} domains "
             f"over T={duration:g}."
         )

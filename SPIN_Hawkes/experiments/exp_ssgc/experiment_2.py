@@ -24,6 +24,7 @@ from pathlib import Path
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
 from shapely.prepared import prep
+from tqdm.auto import tqdm
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE_ROOT))
@@ -307,7 +308,13 @@ def launch_chains(
             seed_offset=seed_offset,
             use_calibration=use_calibration,
         )
-        for chain_index in range(N_CHAINS)
+        for chain_index in tqdm(
+            range(N_CHAINS),
+            desc="Gibbs chains",
+            unit="chain",
+            leave=False,
+            dynamic_ncols=True,
+        )
     ]
 
 
@@ -397,7 +404,13 @@ def fit_and_eval_zonewise(
     mu_hat_sims_zw = np.zeros((M, n_mc))
     per_zone_metrics = []
 
-    for j in range(J):
+    for j in tqdm(
+        range(J),
+        desc="Independent spatial zones",
+        unit="zone",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         idx_j = points_per_zone[j]
         N_j   = len(idx_j)
         print(f"     Zone {j+1}/{J} (N_j={N_j})")
@@ -562,24 +575,29 @@ def _plot_fields(grid_xy, fields, titles, cmap, colorbar_label):
     if vmax <= vmin:
         vmax = vmin + 1.0
 
-    fig, axes = plt.subplots(1, len(fields), figsize=(6 * len(fields), 5))
+    fig, axes = plt.subplots(
+        1,
+        len(fields),
+        figsize=(5.4 * len(fields), 5.2),
+        layout="constrained",
+    )
     axes = np.atleast_1d(axes)
     for ax, field, title in zip(axes, fields, titles):
-        image = ax.tricontourf(
+        image = ax.tripcolor(
             grid_xy[:, 0],
             grid_xy[:, 1],
             np.asarray(field, dtype=float),
-            levels=30,
+            shading="gouraud",
             cmap=cmap,
             vmin=vmin,
             vmax=vmax,
+            rasterized=True,
         )
         fig.colorbar(image, ax=ax, label=colorbar_label)
         ax.set_title(title)
         ax.set_xlim(X_BOUNDS)
         ax.set_ylim(Y_BOUNDS)
         ax.set_aspect("equal", adjustable="box")
-    fig.tight_layout()
     return fig
 
 
@@ -651,7 +669,7 @@ def plot_calibration_curves(
     zonewise_x, zonewise_y = _calibration_curve(truth, zonewise["mu_hat"])
     upper = float(max(np.max(truth), np.max(joint_y), np.max(zonewise_y)))
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(6, 5), layout="constrained")
     ax.plot([0.0, upper], [0.0, upper], "k--", label="Ideal")
     ax.plot(joint_x, joint_y, "o-", label="Joint SSGC")
     ax.plot(zonewise_x, zonewise_y, "s-", label="Zone-wise SGCP")
@@ -660,7 +678,6 @@ def plot_calibration_curves(
     ax.set_title(f"Profile {profile_name}, Setting {setting_name} — calibration")
     ax.grid(alpha=0.3)
     ax.legend()
-    fig.tight_layout()
     if savefigure:
         _save(fig, f"exp2_calibration_P{profile_name}_{setting_name}")
     plt.show()
@@ -764,7 +781,12 @@ if __name__ == "__main__":
         (PROFILE_2, "B"),
     ]
 
-    for profile, setting in configs:
+    for profile, setting in tqdm(
+        configs,
+        desc="Experiment 2 configurations",
+        unit="config",
+        dynamic_ncols=True,
+    ):
         out = run_exp2_config(profile, setting, savefigure=SAVEFIGURE)
         all_outputs.append(out)
 

@@ -61,7 +61,7 @@ MODEL_JITTER = 1e-5
 
 # Variational inference
 N_ITER = 500
-TOLERANCE = 1e-6
+TOLERANCE = 1e-8
 VERBOSE = True
 VERBOSE_EVERY = max(1, N_ITER // 10)
 ELBO_EVERY = 5
@@ -79,7 +79,7 @@ QUADRATURE_NX, QUADRATURE_NY = 20, 20
 EPS_NEWTON_STEPS = 8
 SPATIAL_COMPENSATOR_GRID = 10
 ETAS_UPDATE_START = 5
-ETAS_UPDATE_EVERY = 5
+ETAS_UPDATE_EVERY = 10
 MAX_OPTIMIZER_ITER = 10
 ETAS_QUADRATURE_NODES = 4
 VI_JITTER = 1e-6
@@ -295,7 +295,12 @@ def main():
     print_intensity_metrics("Total conditional intensity at events", lambda_est, lambda_true)
 
     if MAKE_PLOTS:
-        fig, axes = plt.subplots(1, 2, figsize=PLOT_FIGSIZE)
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=PLOT_FIGSIZE,
+            layout="constrained",
+        )
         axes[0].plot(
             fit.diagnostics["elbo_iterations"],
             summary["elbo_trace"],
@@ -330,7 +335,6 @@ def main():
         axes[1].set_ylim(Y_BOUNDS)
         axes[1].grid(alpha=PLOT_SPATIAL_GRID_ALPHA)
         fig.colorbar(scatter, ax=axes[1], label="q(Z=background)")
-        fig.tight_layout()
         plt.show()
 
         parent_magnitude = (
