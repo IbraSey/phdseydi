@@ -1,5 +1,7 @@
 """Spatial tessellation helpers used by simulations and examples."""
 
+from numbers import Integral
+
 import numpy as np
 from scipy.spatial import Voronoi
 from shapely.geometry import Polygon, box
@@ -61,8 +63,11 @@ def generate_voronoi_cells(
 
     Returns one cell per germ, in the same order as the returned germ array.
     """
-    if n_germs < 2:
-        raise ValueError("n_germs must be at least 2.")
+    if isinstance(n_germs, bool) or not isinstance(n_germs, Integral):
+        raise ValueError("n_germs must be an integer.")
+    n_germs = int(n_germs)
+    if n_germs < 3:
+        raise ValueError("n_germs must be at least 3 for a 2D Voronoi diagram.")
     xmin, xmax = map(float, X_bounds)
     ymin, ymax = map(float, Y_bounds)
     if not xmin < xmax or not ymin < ymax:

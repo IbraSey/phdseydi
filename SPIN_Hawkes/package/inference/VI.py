@@ -1,4 +1,4 @@
-"""Simple mean-field CAVI inference for the SPIN-H model.
+"""Mean-field CAVI inference for SSGC and SPIN-H models.
 
 The implementation follows the Polya-Gamma augmented updates used by SPIN-H,
 but keeps the first usable version intentionally modest:
@@ -17,18 +17,23 @@ corresponding parameter is learned. Parameters can still be fixed with
 ``fixed_etas`` and ``fixed_beta`` in the same spirit as the Gibbs sampler.
 """
 
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.sparse import csr_matrix, issparse
 from scipy.special import digamma, gammaln, logsumexp, roots_genlaguerre
 from scipy.stats import gamma as gamma_distribution
+from tqdm.auto import tqdm
 
-from package.config import ETASParameters, SPINHVIConfig
+from package.config import ETASParameters, SPINHVIConfig, SSGCVIConfig
 from data.catalog import EventCatalog
+from ..models.ssgc import SSGCModel
 from ..models.spinh import SPINHModel
 from .backends import SparseGP
-from .results import SPINHVIResults
+from .branching import TemporalCandidateGraph
+from .results import VIResults
 
 
 _ETAS_PARAMETER_TO_FACTOR = {
@@ -48,14 +53,94 @@ class BranchingFactor:
     probabilities: np.ndarray
 
     @classmethod
-    def background_initialization(cls, n_events: int):
-        probabilities = np.zeros((n_events, n_events), dtype=float)
+    def background_initialization(
+        cls,
+        n_events: int,
+        include_parents: bool = True,
+        sparse: bool = False,
+    ):
+        n_columns = max(1, n_events) if include_parents else 1
+        if sparse:
+            rows = np.arange(n_events, dtype=int)
+            columns = np.zeros(n_events, dtype=int)
+            data = np.ones(n_events, dtype=float)
+            return cls(
+                csr_matrix(
+                    (data, (rows, columns)),
+                    shape=(n_events, n_columns),
+                )
+            )
+        probabilities = np.zeros((n_events, n_columns), dtype=float)
         probabilities[:, 0] = 1.0
         return cls(probabilities)
 
     @property
     def p_background(self) -> np.ndarray:
+        if issparse(self.probabilities):
+            return self.probabilities.getcol(0).toarray().reshape(-1)
         return self.probabilities[:, 0]
+
+    @property
+    def is_sparse(self) -> bool:
+        return bool(issparse(self.probabilities))
+
+    @property
+    def expected_offspring(self) -> float:
+        if self.probabilities.shape[1] <= 1:
+            return 0.0
+        return float(self.probabilities[:, 1:].sum())
+
+    @property
+    def memory_bytes(self) -> int:
+        if self.is_sparse:
+            matrix = self.probabilities
+            return int(matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes)
+        return int(self.probabilities.nbytes)
+
+    def parent_entries(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return child indices, parent indices and non-zero parent weights."""
+        if self.is_sparse:
+            entries = self.probabilities.tocoo(copy=False)
+            keep = entries.col > 0
+            return (
+                entries.row[keep].astype(int, copy=False),
+                (entries.col[keep] - 1).astype(int, copy=False),
+                entries.data[keep],
+            )
+        child, parent = np.nonzero(self.probabilities[:, 1:] > 0.0)
+        valid = parent < child
+        child = child[valid]
+        parent = parent[valid]
+        return child, parent, self.probabilities[child, parent + 1]
+
+    def entropy(self) -> float:
+        values = (
+            self.probabilities.data
+            if self.is_sparse
+            else self.probabilities[self.probabilities > 0.0]
+        )
+        positive = values > 0.0
+        return -float(np.sum(values[positive] * np.log(values[positive])))
+
+    def most_likely_parent(self, child_index: int) -> int:
+        child_index = int(child_index)
+        if self.is_sparse:
+            row = self.probabilities.getrow(child_index)
+            parent_entries = row.indices > 0
+            if not np.any(parent_entries):
+                return -1
+            columns = row.indices[parent_entries]
+            values = row.data[parent_entries]
+            return int(columns[np.argmax(values)] - 1)
+        if child_index <= 0:
+            return -1
+        values = self.probabilities[child_index, 1 : child_index + 1]
+        return -1 if values.size == 0 else int(np.argmax(values))
+
+    def to_dense(self) -> np.ndarray:
+        if self.is_sparse:
+            return self.probabilities.toarray()
+        return np.asarray(self.probabilities)
 
 
 @dataclass
@@ -114,8 +199,13 @@ class GammaFactor:
     def __post_init__(self):
         self.shape = float(self.shape)
         self.rate = float(self.rate)
-        if self.shape <= 0 or self.rate <= 0:
-            raise ValueError("GammaFactor shape and rate must be positive.")
+        if (
+            not np.isfinite(self.shape)
+            or not np.isfinite(self.rate)
+            or self.shape <= 0
+            or self.rate <= 0
+        ):
+            raise ValueError("GammaFactor shape and rate must be finite and positive.")
 
     @property
     def mean(self) -> float:
@@ -147,8 +237,8 @@ class GammaFactor:
 class ETASFactor:
     """Gamma variational block for ETAS and magnitude parameters."""
 
-    parameters_mean: ETASParameters
-    beta_mean: float
+    parameters_mean: ETASParameters | None
+    beta_mean: float | None
     gamma_factors: dict[str, GammaFactor] = field(default_factory=dict)
     beta_gamma: GammaFactor | None = None
     fixed_etas: dict[str, float] = field(default_factory=dict)
@@ -167,28 +257,47 @@ class SPINHVIState:
 
 
 class SPINHVI:
-    """Generalized coordinate-ascent variational inference for SPIN-H."""
+    """Shared generalized CAVI engine for SSGC and SPIN-H."""
 
     def __init__(self, model, catalog, config=None):
-        if not isinstance(model, SPINHModel):
-            raise TypeError("model must be a SPINHModel instance.")
+        if not isinstance(model, SSGCModel):
+            raise TypeError("model must be an SSGCModel or SPINHModel instance.")
         if not isinstance(catalog, EventCatalog):
             raise TypeError("catalog must be an EventCatalog instance.")
         self.model = model
         self.catalog = catalog
-        self.config = SPINHVIConfig() if config is None else config
-        if not isinstance(self.config, SPINHVIConfig):
-            raise TypeError("config must be a SPINHVIConfig instance.")
+        self.use_etas = isinstance(model, SPINHModel)
+        config_type = SPINHVIConfig if self.use_etas else SSGCVIConfig
+        self.config = config_type() if config is None else config
+        config_is_valid = isinstance(self.config, config_type)
+        if not self.use_etas and isinstance(self.config, SPINHVIConfig):
+            config_is_valid = False
+        if not config_is_valid:
+            raise TypeError(f"config must be a {config_type.__name__} instance.")
         self.domain_index = model.validate_catalog(catalog)
         self.gp_backend = str(self.config.gp_backend).lower()
         self.sparse_gp = self._make_sparse_gp() if self.gp_backend == "sparse" else None
         self._spatial_compensator_geometry = None
-        self.rng = np.random.default_rng(self.config.random_seed)
-        self.priors = self._default_theta_priors() | dict(self.config.theta_priors)
+        self.priors = (
+            self._default_theta_priors() | dict(self.config.theta_priors)
+            if self.use_etas
+            else {}
+        )
         self.beta_prior = {"a_beta": 2.0, "b_beta": 1.0} | dict(
             self.config.beta_prior
         )
         self._validate_fixed_parameters()
+        parent_time_window = (
+            self.config.parent_time_window if self.use_etas else None
+        )
+        self.parent_candidate_graph = (
+            None
+            if parent_time_window is None
+            else TemporalCandidateGraph.from_times(
+                self.catalog.t,
+                parent_time_window,
+            )
+        )
         self.state = self.initialize_state()
 
 
@@ -199,6 +308,8 @@ class SPINHVI:
 
     # **************************************** OUTILS BACKGROUND ****************************************
     def _validate_fixed_parameters(self):
+        if not self.use_etas:
+            return
         if not self.model.etas_parameters.marked:
             marked_fixed = {"alpha", "gamma"}.intersection(self.config.fixed_etas)
             if marked_fixed:
@@ -213,16 +324,6 @@ class SPINHVI:
                     "Cannot initialize marked Gamma factors for an unmarked model: "
                     f"{sorted(marked_initial)}"
                 )
-        for name, value in self.config.fixed_etas.items():
-            if name == "A" and value < 0:
-                raise ValueError("A must be non-negative.")
-            if name in {"alpha", "gamma"} and value < 0:
-                raise ValueError(f"{name} must be non-negative.")
-            if name in {"c", "d"} and value <= 0:
-                raise ValueError(f"{name} must be positive.")
-            if name in {"p", "q"} and value <= 1:
-                raise ValueError(f"{name} must be greater than one.")
-
     def _default_theta_priors(self) -> dict[str, float]:
         return {
             "a_A": 2.0, "b_A": 2.0,
@@ -294,9 +395,15 @@ class SPINHVI:
         )
         missing_domains = np.flatnonzero(points_per_domain == 0)
         if missing_domains.size:
-            raise ValueError(
-                "The VI quadrature grid has no point in domain(s) "
-                f"{missing_domains.tolist()}; increase quadrature_nx/quadrature_ny."
+            representative_points = []
+            for domain in missing_domains:
+                point = self.model.domains.polygons[domain].representative_point()
+                representative_points.append((float(point.x), float(point.y)))
+            grid_xy = np.vstack([grid_xy, representative_points])
+            domain_index = np.concatenate([domain_index, missing_domains])
+            points_per_domain = np.bincount(
+                domain_index,
+                minlength=self.model.n_domains,
             )
         domain_areas = np.asarray(self.model.domains.areas, dtype=float)
         quadrature_weights = (
@@ -378,6 +485,8 @@ class SPINHVI:
 
     # ************************************************ OUTILS TRIGGERING ************************************************
     def _free_etas_factor_names(self, include_A: bool = True) -> list[str]:
+        if not self.use_etas:
+            return []
         names = ["A", "c", "p", "d", "q"]
         if self.model.etas_parameters.marked:
             names.extend(["alpha", "gamma"])
@@ -389,6 +498,15 @@ class SPINHVI:
         if not include_A:
             names = [name for name in names if name != "A"]
         return names
+
+    def _alpha_rate_floor(self) -> float:
+        """Smallest numerically safe rate for a finite productivity moment."""
+        if not self.use_etas or not self.model.etas_parameters.marked:
+            return 0.0
+        excess = self._magnitudes() - self.model.magnitude_min
+        max_excess = float(np.max(excess)) if excess.size else 0.0
+        margin = max(self.config.jitter, 1e-8 * max(1.0, max_excess))
+        return max_excess + margin
 
     def _fixed_or_factor_value(self, name: str, moment: str = "mean") -> float:
         parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(name, name)
@@ -441,17 +559,12 @@ class SPINHVI:
         return ETASParameters(**current)
 
     def _sync_etas_means(self):
-        self.state.etas.parameters_mean = self._parameters_with_fixed(
-            self._etas_mean_from_factors()
-        )
+        if self.use_etas:
+            self.state.etas.parameters_mean = self._parameters_with_fixed(
+                self._etas_mean_from_factors()
+            )
         if self.state.etas.beta_gamma is not None:
             self.state.etas.beta_mean = self.state.etas.beta_gamma.mean
-
-    @staticmethod
-    def _gamma_prior_log_density(value: float, a: float, b: float) -> float:
-        if value <= 0:
-            return -np.inf
-        return float(a * np.log(b) - gammaln(a) + (a - 1.0) * np.log(value) - b * value)
 
     @staticmethod
     def _gamma_prior_entropy_term(factor: GammaFactor, a: float, b: float) -> float:
@@ -467,7 +580,9 @@ class SPINHVI:
         self,
         factor: GammaFactor,
     ) -> tuple[np.ndarray, np.ndarray]:
-        n_nodes = self.config.etas_quadrature_nodes
+        n_nodes = self.config.gamma_quadrature_nodes
+        if self.use_etas and self.config.etas_quadrature_nodes is not None:
+            n_nodes = self.config.etas_quadrature_nodes
         if factor.shape < 160.0:
             nodes, weights = roots_genlaguerre(n_nodes, factor.shape - 1.0)
             weight_sum = float(np.sum(weights))
@@ -708,9 +823,7 @@ class SPINHVI:
         return float(np.sum(productivity * temporal * spatial))
 
     def _etas_expected_log_likelihood_terms(self) -> tuple[float, float]:
-        q_parent = np.tril(self.state.branching.probabilities[:, 1:], k=-1)
-        child_idx, parent_idx = np.nonzero(q_parent > 0)
-        weights = q_parent[child_idx, parent_idx]
+        child_idx, parent_idx, weights = self.state.branching.parent_entries()
         if weights.size:
             pair_ll = float(
                 np.sum(weights * self._pair_expected_log_etas(child_idx, parent_idx))
@@ -723,16 +836,11 @@ class SPINHVI:
 
     def _etas_prior_entropy_elbo(self) -> float:
         total = 0.0
-        values = self.state.etas.parameters_mean.as_dict()
-        for name, value in values.items():
+        for name in self.state.etas.parameters_mean.as_dict():
             factor_name = _ETAS_PARAMETER_TO_FACTOR.get(name, name)
-            shifted = value - 1.0 if name in {"p", "q"} else value
             a = self.priors.get(f"a_{name}", 1.0)
             b = self.priors.get(f"b_{name}", 1.0)
             if name in self.config.fixed_etas:
-                continue
-            if factor_name not in self.state.etas.gamma_factors:
-                total += self._gamma_prior_log_density(shifted, a, b)
                 continue
             total += self._gamma_prior_entropy_term(
                 self.state.etas.gamma_factors[factor_name],
@@ -759,19 +867,18 @@ class SPINHVI:
         lower = self.model.magnitude_min
         upper = self.model.magnitude_max
         excess = magnitudes - lower
-        a = self.beta_prior.get("a_beta", 2.0)
-        b = self.beta_prior.get("b_beta", 1.0)
         beta_factor = self.state.etas.beta_gamma
         if beta_factor is None:
             beta = float(self.state.etas.beta_mean)
             value = len(magnitudes) * np.log(beta) - beta * np.sum(excess)
-            value += self._gamma_prior_log_density(beta, a, b)
             if upper is not None:
                 width = max(upper - lower, self.config.jitter)
                 value -= len(magnitudes) * np.log(
                     max(1.0 - np.exp(-beta * width), self.config.jitter)
                 )
             return float(value)
+        a = self.beta_prior.get("a_beta", 2.0)
+        b = self.beta_prior.get("b_beta", 1.0)
         value = len(magnitudes) * beta_factor.expected_log - beta_factor.mean * np.sum(excess)
         if upper is not None:
             width = max(upper - lower, self.config.jitter)
@@ -790,13 +897,42 @@ class SPINHVI:
 
     def _update_branching(self):
         n_events = len(self.catalog)
-        probabilities = np.zeros((n_events, n_events), dtype=float)
         eps = self.state.eps.mean
         bg_log = eps[self.domain_index] + self._observed_log_sigmoid_expectation(
             self.state.gp.f_data_mean,
             self.state.gp.f_data_var,
             self.state.polya_gamma.observed_mean,
         )
+
+        graph = self.parent_candidate_graph
+        if graph is not None:
+            pair_log_weights = self._pair_expected_log_etas(
+                graph.child_indices,
+                graph.parent_indices,
+            )
+            probability_indptr = graph.indptr + np.arange(n_events + 1)
+            probability_indices = np.empty(n_events + graph.n_edges, dtype=int)
+            probability_values = np.empty(n_events + graph.n_edges, dtype=float)
+            for child in range(n_events):
+                edge_slice = graph.row_slice(child)
+                output_start = child + edge_slice.start
+                output_stop = child + edge_slice.stop + 1
+                weights = np.concatenate(
+                    ([bg_log[child]], pair_log_weights[edge_slice])
+                )
+                row_probabilities = np.exp(weights - logsumexp(weights))
+                probability_indices[output_start] = 0
+                probability_indices[output_start + 1 : output_stop] = (
+                    graph.parent_indices[edge_slice] + 1
+                )
+                probability_values[output_start:output_stop] = row_probabilities
+            self.state.branching.probabilities = csr_matrix(
+                (probability_values, probability_indices, probability_indptr),
+                shape=(n_events, max(1, n_events)),
+            )
+            return
+
+        probabilities = np.zeros((n_events, max(1, n_events)), dtype=float)
         for i in range(n_events):
             weights = [bg_log[i]]
             if i > 0:
@@ -938,8 +1074,7 @@ class SPINHVI:
 
     def _update_etas(self, optimize_nonconjugate: bool = True):
         if "A" not in self.config.fixed_etas and "A" in self.state.etas.gamma_factors:
-            q_parent = np.tril(self.state.branching.probabilities[:, 1:], k=-1)
-            expected_offspring = float(np.sum(q_parent))
+            expected_offspring = self.state.branching.expected_offspring
             a = self.priors.get("a_A", 1.0)
             b = self.priors.get("b_A", 1.0)
             proposed = GammaFactor(
@@ -980,11 +1115,25 @@ class SPINHVI:
             return -value
 
         initial_objective = negative_elbo_block(start)
+        bounds = []
+        for name in free_names:
+            rate_floor = (
+                max(1e-3, self._alpha_rate_floor())
+                if name == "alpha"
+                else 1e-3
+            )
+            rate_upper = max(1e5, 100.0 * rate_floor)
+            bounds.extend(
+                [
+                    (np.log(1e-3), np.log(1e3)),
+                    (np.log(rate_floor), np.log(rate_upper)),
+                ]
+            )
         result = minimize(
             negative_elbo_block,
             start,
             method="COBYQA",
-            bounds=[(np.log(1e-3), np.log(1e3)), (np.log(1e-3), np.log(1e5))] * len(free_names),
+            bounds=bounds,
             options={
                 "maxiter": self.config.max_optimizer_iter,
                 "maxfev": max(40, 3 * self.config.max_optimizer_iter),
@@ -1085,9 +1234,7 @@ class SPINHVI:
         )
     
     def _branching_entropy(self):
-        probabilities = self.state.branching.probabilities
-        positive = probabilities > 0.0
-        return -float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
+        return self.state.branching.entropy()
 
     def _latent_poisson_elbo(self):
         latent = self.state.latent_poisson
@@ -1212,23 +1359,26 @@ class SPINHVI:
         return expected_log_prior + entropy
 
     def _elbo(self) -> tuple[float, dict[str, float]]:
-        etas_parent_term, etas_compensator_term = (
-            self._etas_expected_log_likelihood_terms()
-        )
-        etas_prior_entropy = self._etas_prior_entropy_elbo()
-        beta = self._beta_elbo()
         terms = {
             "background_observed_augmented": self._background_observation_elbo(),
-            "branching_entropy": self._branching_entropy(),
             "latent_poisson_augmented": self._latent_poisson_elbo(),
             "poisson_envelope_compensator": self._poisson_envelope_compensator_elbo(),
             "epsilon_prior_entropy": self._epsilon_prior_elbo(),
             "gp_prior_entropy": self._gp_prior_elbo(),
-            "etas_parent_log_likelihood": etas_parent_term,
-            "etas_triggering_compensator": etas_compensator_term,
-            "etas_prior_entropy": etas_prior_entropy,
-            "beta_expected_likelihood_prior_entropy": beta,
+            "beta_expected_likelihood_prior_entropy": self._beta_elbo(),
         }
+        if self.use_etas:
+            etas_parent_term, etas_compensator_term = (
+                self._etas_expected_log_likelihood_terms()
+            )
+            terms.update(
+                {
+                    "branching_entropy": self._branching_entropy(),
+                    "etas_parent_log_likelihood": etas_parent_term,
+                    "etas_triggering_compensator": etas_compensator_term,
+                    "etas_prior_entropy": self._etas_prior_entropy_elbo(),
+                }
+            )
         non_finite = {
             name: value for name, value in terms.items() if not np.isfinite(value)
         }
@@ -1241,11 +1391,12 @@ class SPINHVI:
         total = float(sum(terms.values()))
         if not np.isfinite(total):
             raise FloatingPointError(f"Non-finite ELBO total: {total!r}")
-        terms["etas_expected_complete_likelihood_prior_entropy"] = (
-            terms["etas_parent_log_likelihood"]
-            + terms["etas_triggering_compensator"]
-            + terms["etas_prior_entropy"]
-        )
+        if self.use_etas:
+            terms["etas_expected_complete_likelihood_prior_entropy"] = (
+                terms["etas_parent_log_likelihood"]
+                + terms["etas_triggering_compensator"]
+                + terms["etas_prior_entropy"]
+            )
         return total, terms
 
 
@@ -1261,6 +1412,12 @@ class SPINHVI:
         configured = self.config.initial_gamma_factors.get(factor_name)
         if configured is not None:
             shape, rate = configured
+            if factor_name == "alpha" and rate < self._alpha_rate_floor():
+                raise ValueError(
+                    "The initial q(alpha) rate must be greater than every "
+                    "observed magnitude excess m_i - magnitude_min so that "
+                    "E[exp(alpha * (m_i - magnitude_min))] is finite."
+                )
             return GammaFactor(shape=shape, rate=rate)
         if factor_name == "beta":
             return GammaFactor(
@@ -1268,9 +1425,16 @@ class SPINHVI:
                 rate=self.beta_prior["b_beta"],
             )
         parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
+        rate = self.priors[f"b_{parameter_name}"]
+        if factor_name == "alpha":
+            rate_floor = self._alpha_rate_floor()
+            rate = max(
+                rate,
+                rate_floor + max(1.0, 0.25 * rate_floor),
+            )
         return GammaFactor(
             shape=self.priors[f"a_{parameter_name}"],
-            rate=self.priors[f"b_{parameter_name}"],
+            rate=rate,
         )
 
     def initialize_state(self) -> SPINHVIState:
@@ -1296,25 +1460,33 @@ class SPINHVI:
         if self.sparse_gp is not None:
             probe_xy = grid_xy[:1] if grid_xy.size else self.catalog.xy[:1]
             sparse_dimension = self._sparse_design(probe_xy).shape[1]
-        params = self._parameters_with_fixed(self.model.etas_parameters)
         gamma_factors: dict[str, GammaFactor] = {}
-        for factor_name in self._free_etas_factor_names():
-            gamma_factors[factor_name] = self._initial_gamma_factor(factor_name)
-        initial_values = params.as_dict()
-        for factor_name, factor in gamma_factors.items():
-            parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
-            initial_values[parameter_name] = factor.mean + (
-                1.0 if parameter_name in {"p", "q"} else 0.0
-            )
-        params = self._parameters_with_fixed(ETASParameters(**initial_values))
+        params = None
+        if self.use_etas:
+            params = self._parameters_with_fixed(self.model.etas_parameters)
+            for factor_name in self._free_etas_factor_names():
+                gamma_factors[factor_name] = self._initial_gamma_factor(factor_name)
+            initial_values = params.as_dict()
+            for factor_name, factor in gamma_factors.items():
+                parameter_name = _ETAS_FACTOR_TO_PARAMETER.get(factor_name, factor_name)
+                initial_values[parameter_name] = factor.mean + (
+                    1.0 if parameter_name in {"p", "q"} else 0.0
+                )
+            params = self._parameters_with_fixed(ETASParameters(**initial_values))
         beta_gamma = None
-        if self.config.fixed_beta is None:
+        if self.catalog.magnitudes is None:
+            beta = None
+        elif self.config.fixed_beta is None:
             beta_gamma = self._initial_gamma_factor("beta")
             beta = beta_gamma.mean
         else:
             beta = float(self.config.fixed_beta)
         return SPINHVIState(
-            branching=BranchingFactor.background_initialization(n_events),
+            branching=BranchingFactor.background_initialization(
+                n_events,
+                include_parents=self.use_etas,
+                sparse=self.parent_candidate_graph is not None,
+            ),
             polya_gamma=PolyaGammaFactor(
                 observed_mean=np.full(n_events, 0.25, dtype=float),
                 observed_tilt=np.zeros(n_events, dtype=float),
@@ -1343,35 +1515,75 @@ class SPINHVI:
                 beta_mean=beta,
                 gamma_factors=gamma_factors,
                 beta_gamma=beta_gamma,
-                fixed_etas=dict(self.config.fixed_etas),
+                fixed_etas=(dict(self.config.fixed_etas) if self.use_etas else {}),
             ),
         )
 
-    def _print_progress(self, iteration: int, elbo: float):
+    def _progress_message(self, iteration: int, elbo: float) -> str:
+        if not self.use_etas:
+            beta_text = (
+                ""
+                if self.state.etas.beta_mean is None
+                else f" beta={self.state.etas.beta_mean:.3f}"
+            )
+            return (
+                f"[VI {iteration:04d}] elbo={elbo:.3f} "
+                f"E[pi_S]={self.state.latent_poisson.expected_count:.2f}"
+                f"{beta_text}"
+            )
         params = self.state.etas.parameters_mean
-        print(
+        beta_text = (
+            ""
+            if self.state.etas.beta_mean is None
+            else f" beta={self.state.etas.beta_mean:.3f}"
+        )
+        p_background = self.state.branching.p_background
+        p_background_text = (
+            f"{p_background.mean():.3f}" if p_background.size else "n/a"
+        )
+        marked_text = ""
+        if params.alpha is not None and params.gamma is not None:
+            marked_text = (
+                f" alpha={params.alpha:.3f} gamma={params.gamma:.3f}"
+            )
+        return (
             f"[VI {iteration:04d}] elbo={elbo:.3f} "
-            f"p_bg={self.state.branching.p_background.mean():.3f} "
+            f"p_bg={p_background_text} "
             f"E[pi_S]={self.state.latent_poisson.expected_count:.2f} "
-            f"A={params.A:.3f} alpha={params.alpha:.3f} c={params.c:.4f} p={params.p:.3f} "
-            f"d={params.d:.4f} q={params.q:.3f} gamma={params.gamma:.3f} beta={self.state.etas.beta_mean:.3f}"
+            f"A={params.A:.3f} c={params.c:.4f} p={params.p:.3f} "
+            f"d={params.d:.4f} q={params.q:.3f}"
+            f"{marked_text}"
+            f"{beta_text}"
         )
 
-    def fit(self) -> SPINHVIResults:
+    def fit(self) -> VIResults:
         elbo_trace: list[float] = []
         elbo_iterations: list[int] = []
         convergence_iterations: list[int] = []
         previous_checkpoint = -np.inf
         converged = False
         iteration = -1
-        has_nonconjugate_etas = bool(
+        has_free_etas = self.use_etas and bool(
+            self._free_etas_factor_names(include_A=True)
+        )
+        has_nonconjugate_etas = self.use_etas and bool(
             self._free_etas_factor_names(include_A=False)
         )
-        for iteration in range(self.config.n_iter):
+        progress = tqdm(
+            range(self.config.n_iter),
+            desc="SPIN-H MF-VI" if self.use_etas else "SSGC MF-VI",
+            unit="iter",
+            disable=not self.config.verbose,
+            dynamic_ncols=True,
+            miniters=self.config.verbose_every,
+            file=sys.stdout,
+        )
+        for iteration in progress:
+            updated_etas = False
             optimized_nonconjugate_etas = False
             if self.config.update_polya_gamma:
                 self._update_polya_gamma()
-            if self.config.update_z:
+            if self.use_etas and self.config.update_z:
                 self._update_branching()
             if self.config.update_latent_poisson:
                 self._update_latent_poisson()
@@ -1379,9 +1591,15 @@ class SPINHVI:
                 self._update_eps()
             if self.config.update_gp:
                 self._update_gp()
-            if self.config.update_etas and iteration >= self.config.etas_update_start:
+            if (
+                self.use_etas
+                and self.config.update_etas
+                and iteration >= self.config.etas_update_start
+            ):
+                updated_etas = True
                 optimized_nonconjugate_etas = (
-                    (iteration - self.config.etas_update_start)
+                    has_nonconjugate_etas
+                    and (iteration - self.config.etas_update_start)
                     % self.config.etas_update_every
                     == 0
                 )
@@ -1406,11 +1624,21 @@ class SPINHVI:
             elbo_trace.append(elbo)
             elbo_iterations.append(iteration)
             if self.config.verbose and iteration % self.config.verbose_every == 0:
-                self._print_progress(iteration, elbo)
+                progress.set_postfix_str(
+                    self._progress_message(iteration, elbo),
+                    refresh=False,
+                )
             convergence_checkpoint = (
-                not self.config.update_etas
-                or not has_nonconjugate_etas
-                or optimized_nonconjugate_etas
+                not self.use_etas
+                or not self.config.update_etas
+                or not has_free_etas
+                or (
+                    updated_etas
+                    and (
+                        not has_nonconjugate_etas
+                        or optimized_nonconjugate_etas
+                    )
+                )
             )
             if not convergence_checkpoint:
                 continue
@@ -1424,6 +1652,7 @@ class SPINHVI:
                     converged = True
                     break
             previous_checkpoint = elbo
+        progress.close()
         diagnostics = {
             "converged": converged,
             "n_iter_run": iteration + 1,
@@ -1434,11 +1663,20 @@ class SPINHVI:
                 dtype=int,
             ),
             "expected_latent_poisson_count": self.state.latent_poisson.expected_count,
+            "use_etas": self.use_etas,
+            "model_type": "spinh" if self.use_etas else "ssgc",
             "use_calibration": self.config.use_calibration,
             "gp_prior_variance": self.model.gp_prior.variance,
             "gp_prior_length_scale": self.model.gp_prior.length_scale,
         }
-        return SPINHVIResults(
+        if self.parent_candidate_graph is not None:
+            diagnostics["branching_truncation"] = {
+                **self.parent_candidate_graph.diagnostics(),
+                "branching_probability_memory_bytes": (
+                    self.state.branching.memory_bytes
+                ),
+            }
+        return VIResults(
             self.state,
             self.model,
             self.catalog,

@@ -1,77 +1,62 @@
-"""Public API for SSGC and SPIN-H modelling, inference and simulation."""
+"""Public API for SSGC and SPIN-H modelling, inference and simulation.
 
-from data import EventCatalog
-from simulation import (
-    HawkesProcessSimulation,
-    SimulationGrid,
-    SpatialProcessSimulation,
-    generate_voronoi_cells,
-    simulate_hawkes_process,
-    simulate_spatial_process,
-)
-from spatial import DomainPartition, SpatialDomain
-from visualization import (
-    FIGURE_DPI,
-    plot_field,
-    plot_process_dashboard,
-    plot_voronoi_cells,
-    save_figure,
-)
+Exports are loaded lazily so importing a low-level module such as
+``simulation`` does not create a cycle through this convenience namespace.
+"""
 
-from .config import (
-    ETASParameters,
-    GPParameters,
-    GibbsConfig,
-    SPINHGibbsConfig,
-    SPINHVIConfig,
-)
-from .inference import (
-    GibbsResults,
-    SPINHVI,
-    SPINHVIResults,
-    SPINHVIState,
-    SparseGP,
-)
-from .models import (
-    ETASKernel,
-    OmoriKernel,
-    PointProcessModel,
-    ProductivityKernel,
-    SPINHModel,
-    SSGCModel,
-    SpatialPowerLawKernel,
-)
+from importlib import import_module
 
-__all__ = [
-    "DomainPartition",
-    "ETASKernel",
-    "ETASParameters",
-    "EventCatalog",
-    "FIGURE_DPI",
-    "GPParameters",
-    "GibbsConfig",
-    "GibbsResults",
-    "SPINHVI",
-    "SPINHVIConfig",
-    "SPINHVIResults",
-    "SPINHVIState",
-    "HawkesProcessSimulation",
-    "OmoriKernel",
-    "PointProcessModel",
-    "ProductivityKernel",
-    "SPINHGibbsConfig",
-    "SPINHModel",
-    "SSGCModel",
-    "SimulationGrid",
-    "SparseGP",
-    "SpatialDomain",
-    "SpatialPowerLawKernel",
-    "SpatialProcessSimulation",
-    "generate_voronoi_cells",
-    "plot_field",
-    "plot_process_dashboard",
-    "plot_voronoi_cells",
-    "save_figure",
-    "simulate_hawkes_process",
-    "simulate_spatial_process",
-]
+
+_EXPORTS = {
+    "EventCatalog": ("data", "EventCatalog"),
+    "HawkesProcessSimulation": ("simulation", "HawkesProcessSimulation"),
+    "SimulationGrid": ("simulation", "SimulationGrid"),
+    "SpatialProcessSimulation": ("simulation", "SpatialProcessSimulation"),
+    "generate_voronoi_cells": ("simulation", "generate_voronoi_cells"),
+    "simulate_hawkes_process": ("simulation", "simulate_hawkes_process"),
+    "simulate_spatial_process": ("simulation", "simulate_spatial_process"),
+    "DomainPartition": ("spatial", "DomainPartition"),
+    "SpatialDomain": ("spatial", "SpatialDomain"),
+    "FIGURE_DPI": ("visualization", "FIGURE_DPI"),
+    "plot_field": ("visualization", "plot_field"),
+    "plot_process_dashboard": ("visualization", "plot_process_dashboard"),
+    "plot_voronoi_cells": ("visualization", "plot_voronoi_cells"),
+    "save_figure": ("visualization", "save_figure"),
+    "ETASParameters": ("package.config", "ETASParameters"),
+    "GPParameters": ("package.config", "GPParameters"),
+    "GibbsConfig": ("package.config", "GibbsConfig"),
+    "SPINHGibbsConfig": ("package.config", "SPINHGibbsConfig"),
+    "SPINHVIConfig": ("package.config", "SPINHVIConfig"),
+    "SSGCVIConfig": ("package.config", "SSGCVIConfig"),
+    "GibbsResults": ("package.inference", "GibbsResults"),
+    "SPINHVI": ("package.inference", "SPINHVI"),
+    "SPINHVIResults": ("package.inference", "SPINHVIResults"),
+    "SPINHVIState": ("package.inference", "SPINHVIState"),
+    "SparseGP": ("package.inference", "SparseGP"),
+    "TemporalCandidateGraph": ("package.inference", "TemporalCandidateGraph"),
+    "VIResults": ("package.inference", "VIResults"),
+    "ETASKernel": ("package.models", "ETASKernel"),
+    "OmoriKernel": ("package.models", "OmoriKernel"),
+    "PointProcessModel": ("package.models", "PointProcessModel"),
+    "ProductivityKernel": ("package.models", "ProductivityKernel"),
+    "SPINHModel": ("package.models", "SPINHModel"),
+    "SSGCModel": ("package.models", "SSGCModel"),
+    "SpatialPowerLawKernel": ("package.models", "SpatialPowerLawKernel"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    """Load one public object on first access and cache it in this module."""
+    try:
+        module_name, attribute_name = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from error
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

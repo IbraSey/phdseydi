@@ -17,11 +17,19 @@ class SpatialDomain:
     initial_log_intensity: float = 0.0
 
     def __post_init__(self):
+        if not all(
+            hasattr(self.polygon, attribute)
+            for attribute in ("is_empty", "is_valid", "area")
+        ):
+            raise TypeError("polygon must be a Shapely geometry.")
         if self.polygon.is_empty or not self.polygon.is_valid:
             raise ValueError("Spatial-domain polygons must be non-empty and valid.")
         if self.polygon.area <= 0:
             raise ValueError("Spatial-domain polygons must have positive area.")
-        object.__setattr__(self, "initial_log_intensity", float(self.initial_log_intensity))
+        initial_log_intensity = float(self.initial_log_intensity)
+        if not np.isfinite(initial_log_intensity):
+            raise ValueError("initial_log_intensity must be finite.")
+        object.__setattr__(self, "initial_log_intensity", initial_log_intensity)
         object.__setattr__(self, "prepared_polygon", prep(self.polygon))
 
     @property
@@ -59,7 +67,7 @@ class DomainPartition:
         if np.isscalar(initial_log_intensities):
             eps = np.full(len(polygons), float(initial_log_intensities))
         else:
-            eps = np.asarray(initial_log_intensities, dtype=float)
+            eps = np.asarray(initial_log_intensities, dtype=float).reshape(-1)
         if len(polygons) != eps.size:
             raise ValueError("One initial log-intensity is required per polygon.")
         return cls(
@@ -99,6 +107,8 @@ class DomainPartition:
         y = np.asarray(y, dtype=float).reshape(-1)
         if x.size != y.size:
             raise ValueError("x and y must have the same length.")
+        if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+            raise ValueError("x and y must contain only finite coordinates.")
         indices = np.full(x.size, -1, dtype=int)
         for i, (xi, yi) in enumerate(zip(x, y)):
             for j, domain in enumerate(self.domains):
@@ -114,4 +124,3 @@ class DomainPartition:
             preview = ", ".join(map(str, outside[:5]))
             raise ValueError(f"Events outside every spatial domain at indices: {preview}.")
         return indices
-

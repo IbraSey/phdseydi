@@ -21,51 +21,31 @@ MALA step par (scénario, modèle, J_infer) :
 # =============================================================================
 # Imports
 # =============================================================================
-import warnings
 import sys
+import warnings
+
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import openturns as ot
-from functools import partial
 from pathlib import Path
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint, box as shapely_box
 from shapely.ops import unary_union
 from shapely.prepared import prep
-from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-try:
-    from package import (
-        EventCatalog,
-        GPParameters,
-        GibbsConfig,
-        SSGCModel,
-        generate_voronoi_cells,
-        simulate_spatial_process,
-    )
-    from visualization import (
-        plot_process_dashboard,
-        plot_voronoi_cells,
-        save_figure,
-    )
-except ImportError:
-    from package import (
-        EventCatalog,
-        GPParameters,
-        GibbsConfig,
-        SSGCModel,
-        generate_voronoi_cells,
-        simulate_spatial_process,
-    )
-    from visualization import (
-        plot_process_dashboard,
-        plot_voronoi_cells,
-        save_figure,
-    )
+from package import (
+    GPParameters,
+    GibbsConfig,
+    SSGCModel,
+    generate_voronoi_cells,
+    simulate_spatial_process,
+)
+from visualization import plot_process_dashboard, plot_voronoi_cells
 
 
 # =============================================================================
@@ -85,13 +65,12 @@ STEP_NU_INIT  = 0.0009
 VERBOSE       = True
 VERBOSE_EVERY = 50
 SEED          = 42
-NX, NY        = 30, 30
 NX_POST, NY_POST = 60, 60
 N_CHAINS      = 2
 XB, YB        = (0.0, 2.0), (0.0, 2.0)
-N_JOBS       = 1
 GP_BACKEND   = "sparse"
 COMPUTE_EMU  = False
+POSTERIOR_N_MC = 500
 
 # Calibrated with rng_seed=15 to generate about 1000 events per catalog.
 T_PROFILE_1 = {"A": 180.7, "B": 98.2}
@@ -100,21 +79,9 @@ GRID_RES_BY_SETTING = {"A": 100, "B": 300}
 
 
 # =============================================================================
-# MALA step par (scénario, label_modèle)
-#
-# Motivations :
-#   J=1  : une seule composante ε, postérieure très concentrée, gradient simple.
-#           Step plus petit pour ne pas dépasser le mode.
-#   J=4  : 4 composantes, zones plus grandes donc plus de données localement,
-#           gradient moins bruité qu'avec J=6 → step légèrement plus grand.
-#   J=5  : proche de J=6 mais chaque zone reçoit en moyenne moins d'observations
-#           (mauvaise partition → zones potentiellement déséquilibrées).
-#           Step légèrement réduit pour les zones les plus petites.
-#   J=6  : référence, step calibré empiriquement sur Profile 1.
-#
-# Schéma : MALA_STEP[(scenario, label)] où label identifie le modèle testé.
-# On utilise le label plutôt que J seul car deux modèles peuvent avoir le même J
-# mais des postérieures différentes (oracle vs misspec).
+# MALA step par (scénario, modèle). Les modèles J=1 utilisent un pas plus petit
+# que les modèles multizones. Le label reste explicite afin que chaque scénario
+# puisse être recalibré indépendamment sans modifier une règle implicite.
 # =============================================================================
 MALA_STEP = {
     # Calibrated on 100--200 sparse-GP Gibbs iterations for about 1000 events.
@@ -305,87 +272,115 @@ def build_partial_partition(zones_raw, mus_vec):
 
 
 # =============================================================================
-# Helpers picklables
+# Construction des modèles et chaînes
 # =============================================================================
-def mu_star_func_picklable(x, y, zones_raw, mus_vec, f_func):
-    from scipy.special import expit
-    from shapely.prepared import prep
-    from shapely.geometry import Point as ShapelyPoint
-    import numpy as np
-    x_flat     = np.atleast_1d(x).flatten()
-    y_flat     = np.atleast_1d(y).flatten()
-    mu_tilde   = np.zeros(len(x_flat))
-    unassigned = np.ones(len(x_flat), dtype=bool)
-    for j, pz in enumerate([prep(z) for z in zones_raw]):
-        idx = np.where(unassigned)[0]
-        if len(idx) == 0:
-            break
-        inside = idx[[pz.covers(ShapelyPoint(x_flat[i], y_flat[i])) for i in idx]]
-        if len(inside) > 0:
-            mu_tilde[inside]   = mus_vec[j]
-            unassigned[inside] = False
-    return (mu_tilde * expit(f_func(x_flat, y_flat))).reshape(np.shape(x))
+def make_reference_intensity(zones, mus, latent_field):
+    prepared_zones = [prep(zone) for zone in zones]
+
+    def reference_intensity(x, y):
+        x_values, y_values = np.broadcast_arrays(
+            np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        )
+        flat_x = x_values.reshape(-1)
+        flat_y = y_values.reshape(-1)
+        baseline = np.zeros(flat_x.size, dtype=float)
+        unassigned = np.ones(flat_x.size, dtype=bool)
+
+        for intensity, zone in zip(mus, prepared_zones):
+            indices = np.flatnonzero(unassigned)
+            if indices.size == 0:
+                break
+            inside = np.fromiter(
+                (
+                    zone.covers(ShapelyPoint(flat_x[i], flat_y[i]))
+                    for i in indices
+                ),
+                dtype=bool,
+                count=indices.size,
+            )
+            selected = indices[inside]
+            baseline[selected] = intensity
+            unassigned[selected] = False
+
+        values = baseline * expit(latent_field(flat_x, flat_y))
+        return values.reshape(x_values.shape)
+
+    return reference_intensity
 
 
-def run_chain(k, seed, zones_raw, x_arr, y_arr, t_arr, T,
-              Xb, Yb, nu_init, lambda_nu, delta, jitter,
-              mala_step, t0_nu, step_nu_init,
-              n_iter, thin, verbose, verbose_every,
-              mu_star_func, nx, ny):
-    chain_seed       = seed + k
-    model = SSGCModel.from_polygons(
-        polygons=zones_raw,
-        duration=T,
-        x_bounds=Xb,
-        y_bounds=Yb,
+def make_model(zones, duration):
+    return SSGCModel.from_polygons(
+        polygons=zones,
+        duration=duration,
+        x_bounds=XB,
+        y_bounds=YB,
         initial_log_intensities=0.0,
-        gp_prior=GPParameters(*nu_init),
-        eps_prior_variance=delta[0],
-        eps_prior_length_scale=delta[1],
-        nu_prior_rate=lambda_nu,
-        jitter=jitter,
+        gp_prior=GPParameters(
+            variance=NU_INIT[0], length_scale=NU_INIT[1]
+        ),
+        eps_prior_variance=DELTA[0],
+        eps_prior_length_scale=DELTA[1],
+        nu_prior_rate=LAMBDA_NU,
+        jitter=JITTER,
     )
-    config = GibbsConfig(
-        mala_step=mala_step, learn_nu=LEARN_NU,
-        t0_nu=t0_nu, step_nu_init=step_nu_init,
-        n_iter=n_iter, thin=thin,
-        verbose=verbose, verbose_every=verbose_every,
+
+
+def make_gibbs_config(mala_step):
+    return GibbsConfig(
+        n_iter=N_ITER,
+        thin=THIN,
+        mala_step=mala_step,
+        learn_nu=LEARN_NU,
         use_calibration=USE_CALIB,
-        grid_nx=nx, grid_ny=ny,
+        verbose=VERBOSE,
+        verbose_every=VERBOSE_EVERY,
+        t0_nu=T0_NU,
+        step_nu_init=STEP_NU_INIT,
         compute_emu=COMPUTE_EMU,
     )
-    results_k = model.gibbs(
-        EventCatalog(t=t_arr, x=x_arr, y=y_arr),
-        config=config,
+
+
+def run_chain(
+    chain_index, zones, catalog, duration, mala_step, reference_intensity
+):
+    chain_seed = SEED + chain_index
+    model = make_model(zones, duration)
+    result = model.gibbs(
+        catalog,
+        config=make_gibbs_config(mala_step),
         rng_seed=chain_seed,
-        reference_intensity=mu_star_func,
+        reference_intensity=reference_intensity,
         gp_backend=GP_BACKEND,
     )
-    print(f"  [Chain {k+1}] done (seed={chain_seed})")
-    return results_k
+    print(f"  [Chain {chain_index + 1}] done (seed={chain_seed})")
+    return result
 
 
-def launch_chains(zones_raw_list, x_arr, y_arr, t_arr, T,
-                  mala_step, mu_star_func):
-    chain_outputs = Parallel(n_jobs=N_JOBS, prefer="processes")(
-        delayed(run_chain)(
-            k, SEED, zones_raw_list,
-            x_arr, y_arr, t_arr, T,
-            XB, YB, NU_INIT, LAMBDA_NU, DELTA, JITTER,
-            mala_step, T0_NU, STEP_NU_INIT,
-            N_ITER, THIN, VERBOSE, VERBOSE_EVERY,
-            mu_star_func, NX, NY,
+def launch_chains(zones, catalog, duration, mala_step, reference_intensity):
+    """Run independent chains sequentially; Gibbs results contain OT objects."""
+    return [
+        run_chain(
+            chain_index, zones, catalog, duration, mala_step, reference_intensity
         )
-        for k in range(N_CHAINS)
-    )
-    return list(chain_outputs)
+        for chain_index in tqdm(
+            range(N_CHAINS),
+            desc="Gibbs chains",
+            unit="chain",
+            leave=False,
+            dynamic_ncols=True,
+        )
+    ]
+
+
+def reference_chain(results):
+    return results[len(results) // 2]
 
 
 # =============================================================================
 # Fit + eval générique
 # =============================================================================
-def fit_and_eval(scenario, label, zones_raw_infer, x_arr, y_arr, t_arr, T,
-                 mu_star_func_true, setting,
+def fit_and_eval(scenario, label, zones_infer, catalog, duration,
+                 reference_intensity, setting,
                  cmap_intensities="inferno", savefigure=False):
     """Run independent chains and evaluate one representative posterior.
 
@@ -395,27 +390,26 @@ def fit_and_eval(scenario, label, zones_raw_infer, x_arr, y_arr, t_arr, T,
         Identifiant du scénario ("M1", "M2", "M2b", "M3").
     label : str
         Identifiant du modèle (clé pour get_mala_step et noms de fichiers).
-    zones_raw_infer : list
+    zones_infer : list
         Partition utilisée pour l'inférence.
-    mu_star_func_true : callable
+    reference_intensity : callable
         Vraie intensité (générée avec la vraie partition).
     """
     step = get_mala_step(scenario, label)
-    J    = len(zones_raw_infer)
+    J    = len(zones_infer)
     print(f"\n  >> [{scenario}] {label} (J_infer={J})  — mala_step={step}")
 
     all_results = launch_chains(
-        zones_raw_infer, x_arr, y_arr, t_arr, T,
-        step, mu_star_func_true,
+        zones_infer, catalog, duration, step, reference_intensity,
     )
-    k_ref = N_CHAINS // 2
-    out = all_results[k_ref].posterior_intensity(
+    out = reference_chain(all_results).posterior_intensity(
         nx=NX_POST, ny=NY_POST, burn_in=BURN_IN,
         cmap=cmap_intensities,
-        mu_star_func=mu_star_func_true,
+        mu_star_func=reference_intensity,
         savefigure=savefigure, savefigure_Emu=savefigure and COMPUTE_EMU,
         title_savefig=f"ssgc/experiment_3/exp3_{scenario}_{label}_{setting}",
         title_savefig_Emu=f"ssgc/experiment_3/exp3_{scenario}_{label}_Emu_{setting}",
+        n_mc=POSTERIOR_N_MC,
     )
     return {
         "rmse": out["rmse"], "mae": out["mae"],
@@ -428,45 +422,52 @@ def fit_and_eval(scenario, label, zones_raw_infer, x_arr, y_arr, t_arr, T,
 # Génération des données
 # =============================================================================
 def generate_data_profile1(setting_name, f_star_func):
-    T = T_PROFILE_1[setting_name]
+    duration = T_PROFILE_1[setting_name]
     cells, germs = generate_voronoi_cells(
         n_germs=PROFILE_1["n_germs"], X_bounds=XB, Y_bounds=YB,
         rng_seed=PROFILE_1["rng_seed"],
     )
     simulation = simulate_spatial_process(
-        X_bounds=XB, Y_bounds=YB, T=T,
+        X_bounds=XB, Y_bounds=YB, T=duration,
         polygons=cells, mus=PROFILE_1["mus"],
         f=f_star_func, grid_res=GRID_RES_BY_SETTING[setting_name], rng_seed=15,
     )
-    X_data = simulation.sample; N = X_data.getSize()
-    x_arr  = np.array([float(X_data[i, 0]) for i in range(N)])
-    y_arr  = np.array([float(X_data[i, 1]) for i in range(N)])
-    t_arr  = np.array([float(X_data[i, 2]) for i in range(N)])
-    zones_raw_true = list(simulation.domains.polygons)
-    mus_vec_true   = list(simulation.baseline_intensities)
-    mu_star_true   = partial(mu_star_func_picklable,
-                             zones_raw=zones_raw_true, mus_vec=mus_vec_true,
-                             f_func=f_star_func)
-    return x_arr, y_arr, t_arr, T, zones_raw_true, mus_vec_true, mu_star_true, \
-           cells, germs, simulation
+    zones_true = list(simulation.domains.polygons)
+    mus_true = list(simulation.baseline_intensities)
+    reference_intensity = make_reference_intensity(
+        zones_true, mus_true, f_star_func
+    )
+    return (
+        simulation.catalog,
+        duration,
+        zones_true,
+        mus_true,
+        reference_intensity,
+        cells,
+        germs,
+        simulation,
+    )
 
 
 def generate_data_homogeneous(setting_name, f_star_func):
-    T = T_HOMOGENE[setting_name]
+    duration = T_HOMOGENE[setting_name]
     domain_poly = shapely_box(XB[0], YB[0], XB[1], YB[1])
     simulation = simulate_spatial_process(
-        X_bounds=XB, Y_bounds=YB, T=T,
+        X_bounds=XB, Y_bounds=YB, T=duration,
         polygons=[domain_poly], mus=(MU_HOMOGENE,),
         f=f_star_func, grid_res=GRID_RES_BY_SETTING[setting_name], rng_seed=15,
     )
-    X_data = simulation.sample; N = X_data.getSize()
-    x_arr = np.array([float(X_data[i, 0]) for i in range(N)])
-    y_arr = np.array([float(X_data[i, 1]) for i in range(N)])
-    t_arr = np.array([float(X_data[i, 2]) for i in range(N)])
-    mu_star_true = partial(mu_star_func_picklable,
-                           zones_raw=[domain_poly], mus_vec=[MU_HOMOGENE],
-                           f_func=f_star_func)
-    return x_arr, y_arr, t_arr, T, [domain_poly], mu_star_true, simulation
+    zones_true = [domain_poly]
+    reference_intensity = make_reference_intensity(
+        zones_true, [MU_HOMOGENE], f_star_func
+    )
+    return (
+        simulation.catalog,
+        duration,
+        zones_true,
+        reference_intensity,
+        simulation,
+    )
 
 
 def get_inference_partition(profile):
@@ -480,9 +481,24 @@ def get_inference_partition(profile):
 # =============================================================================
 # Tableau récapitulatif
 # =============================================================================
-def _save(fig, name):
-    path = save_figure(fig, f"ssgc/experiment_3/{name}")
-    print(f"  Figure sauvegardée : {path}")
+def print_metrics_table(records):
+    print(f"\n{'=' * 86}")
+    print("  Experiment 3 — Robustesse à la partition")
+    print(f"{'=' * 86}")
+    print(
+        f"  {'Scenario':<10} {'Setting':<9} {'Model':<38}"
+        f" {'RMSE':>8} {'MAE':>8} {'CRPS':>8}"
+    )
+    print(f"  {'-' * 82}")
+    for record in records:
+        crps = record["crps"]
+        crps_text = "--" if crps is None else f"{crps:.4f}"
+        print(
+            f"  {record['scenario']:<10} {record['setting']:<9} "
+            f"{record['model']:<38} {record['rmse']:>8.4f} "
+            f"{record['mae']:>8.4f} {crps_text:>8}"
+        )
+    print(f"{'=' * 86}\n")
 
 
 # =============================================================================
@@ -496,18 +512,18 @@ def run_scenario_M1(setting_name, cmap_voronoi="cividis",
     print(f"  EXP3 — Scenario M1 (superfluous zones), Setting {setting_name}")
     print(f"{'#'*70}")
 
-    x_arr, y_arr, t_arr, T, zones_true, mu_star_true, simulation = \
+    catalog, duration, zones_true, reference_intensity, simulation = (
         generate_data_homogeneous(setting_name, f_star_func)
+    )
     plot_process_dashboard(simulation, cmap=cmap_intensities,
         title=f"M1 données homogènes — Setting {setting_name}",
         savefigure=savefigure, title_savefig=f"ssgc/experiment_3/exp3_M1_dashboard_{setting_name}")
 
     records = []
-    domain_poly = shapely_box(XB[0], YB[0], XB[1], YB[1])
 
     # Oracle J=1
-    r = fit_and_eval("M1", "oracle_J1", [domain_poly],
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+    r = fit_and_eval("M1", "oracle_J1", zones_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M1", "setting": setting_name,
                     "model": "Homogeneous SGCP (oracle J=1)",
@@ -520,7 +536,7 @@ def run_scenario_M1(setting_name, cmap_voronoi="cividis",
         title=f"M1 — Partition superflue J=6 (Setting {setting_name})",
         savefigure=savefigure, title_savefig=f"ssgc/experiment_3/exp3_M1_voronoi_J6_{setting_name}")
     r = fit_and_eval("M1", "superfluous_J6", zones_J6,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M1", "setting": setting_name,
                     "model": "SSGC, superfluous zones (J=6)",
@@ -541,9 +557,16 @@ def run_scenario_M2(setting_name, cmap_voronoi="cividis",
     print(f"  EXP3 — Scenario M2 (wrong partition), Setting {setting_name}")
     print(f"{'#'*70}")
 
-    x_arr, y_arr, t_arr, T, zones_true, _, mu_star_true, \
-        cells_true, germs_true, simulation = \
-        generate_data_profile1(setting_name, f_star_func)
+    (
+        catalog,
+        duration,
+        zones_true,
+        _,
+        reference_intensity,
+        cells_true,
+        germs_true,
+        simulation,
+    ) = generate_data_profile1(setting_name, f_star_func)
     plot_voronoi_cells(cells_true, germs_true, X_bounds=XB, Y_bounds=YB,
         cmap_name=cmap_voronoi, title=f"M2 — Vraie partition J*=6 (Setting {setting_name})",
         savefigure=savefigure, title_savefig=f"ssgc/experiment_3/exp3_M2_voronoi_true_{setting_name}")
@@ -555,7 +578,7 @@ def run_scenario_M2(setting_name, cmap_voronoi="cividis",
 
     # Oracle J=6
     r = fit_and_eval("M2", "oracle_J6", zones_true,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M2", "setting": setting_name,
                     "model": "SSGC, oracle (J=6)",
@@ -568,7 +591,7 @@ def run_scenario_M2(setting_name, cmap_voronoi="cividis",
         title=f"M2 — Mauvaise partition J=5 (Setting {setting_name})",
         savefigure=savefigure, title_savefig=f"ssgc/experiment_3/exp3_M2_voronoi_wrong_{setting_name}")
     r = fit_and_eval("M2", "wrong_J5", zones_wrong,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M2", "setting": setting_name,
                     "model": "SSGC, wrong partition (J=5)",
@@ -596,13 +619,20 @@ def run_scenario_M2b(setting_name, cmap_voronoi="cividis",
     print(f"  EXP3 — Scenario M2b (partial/nested partition), Setting {setting_name}")
     print(f"{'#'*70}")
 
-    x_arr, y_arr, t_arr, T, zones_true, mus_vec_true, mu_star_true, \
-        cells_true, germs_true, simulation = \
-        generate_data_profile1(setting_name, f_star_func)
+    (
+        catalog,
+        duration,
+        zones_true,
+        mus_true,
+        reference_intensity,
+        cells_true,
+        germs_true,
+        simulation,
+    ) = generate_data_profile1(setting_name, f_star_func)
 
     # Construction de la partition à J=4
-    zones_partial, mus_partial, merge_map = build_partial_partition(
-        zones_true, mus_vec_true,
+    zones_partial, _, merge_map = build_partial_partition(
+        zones_true, mus_true,
     )
     J_partial = len(zones_partial)
     assert J_partial == 4, f"Attendu J=4, obtenu J={J_partial}"
@@ -634,7 +664,7 @@ def run_scenario_M2b(setting_name, cmap_voronoi="cividis",
 
     # Oracle J=6
     r = fit_and_eval("M2b", "oracle_J6", zones_true,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M2b", "setting": setting_name,
                     "model": "SSGC, oracle (J=6)",
@@ -642,7 +672,7 @@ def run_scenario_M2b(setting_name, cmap_voronoi="cividis",
 
     # Partition partielle J=4
     r = fit_and_eval("M2b", "partial_J4", zones_partial,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M2b", "setting": setting_name,
                     "model": "SSGC, partial partition (J=4)",
@@ -663,9 +693,16 @@ def run_scenario_M3(setting_name, cmap_voronoi="cividis",
     print(f"  EXP3 — Scenario M3 (missing zones), Setting {setting_name}")
     print(f"{'#'*70}")
 
-    x_arr, y_arr, t_arr, T, zones_true, _, mu_star_true, \
-        cells_true, germs_true, simulation = \
-        generate_data_profile1(setting_name, f_star_func)
+    (
+        catalog,
+        duration,
+        zones_true,
+        _,
+        reference_intensity,
+        _,
+        _,
+        simulation,
+    ) = generate_data_profile1(setting_name, f_star_func)
     plot_process_dashboard(simulation, cmap=cmap_intensities,
         title=f"M3 données Profile 1 — Setting {setting_name}",
         savefigure=savefigure, title_savefig=f"ssgc/experiment_3/exp3_M3_dashboard_{setting_name}")
@@ -674,7 +711,7 @@ def run_scenario_M3(setting_name, cmap_voronoi="cividis",
 
     # Oracle J=6
     r = fit_and_eval("M3", "oracle_J6", zones_true,
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M3", "setting": setting_name,
                     "model": "SSGC, oracle (J=6)",
@@ -683,7 +720,7 @@ def run_scenario_M3(setting_name, cmap_voronoi="cividis",
     # J=1 (zones manquantes)
     domain_poly = shapely_box(XB[0], YB[0], XB[1], YB[1])
     r = fit_and_eval("M3", "missing_J1", [domain_poly],
-                     x_arr, y_arr, t_arr, T, mu_star_true,
+                     catalog, duration, reference_intensity,
                      setting_name, cmap_intensities, savefigure)
     records.append({"scenario": "M3", "setting": setting_name,
                     "model": "Homogeneous SGCP, missing zones (J=1)",
@@ -701,7 +738,12 @@ if __name__ == "__main__":
     SAVEFIGURE  = True
     all_records = []
 
-    for setting in ["A", "B"]:
+    for setting in tqdm(
+        ["A", "B"],
+        desc="Experiment 3 settings",
+        unit="setting",
+        dynamic_ncols=True,
+    ):
         all_records.extend(run_scenario_M1(setting,  savefigure=SAVEFIGURE))
         all_records.extend(run_scenario_M2(setting,  savefigure=SAVEFIGURE))
         all_records.extend(run_scenario_M2b(setting, savefigure=SAVEFIGURE))

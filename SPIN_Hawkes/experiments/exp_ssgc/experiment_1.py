@@ -21,6 +21,7 @@ from pathlib import Path
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint, box as shapely_box
 from shapely.prepared import prep
+from tqdm.auto import tqdm
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE_ROOT))
@@ -53,14 +54,14 @@ T0_NU            = 50
 STEP_NU_INIT     = 0.0009
 VERBOSE          = True
 VERBOSE_EVERY    = 50
-SEED             = 42
+SEED             = 15
 NX_POST, NY_POST = 60, 60
-POSTERIOR_N_MC = 200
-CLOSE_FIGURES  = True
+POSTERIOR_N_MC   = 200
+CLOSE_FIGURES    = True
 XB, YB           = (0.0, 2.0), (0.0, 2.0)
 N_CHAINS         = 2
 GP_BACKEND       = "sparse"
-
+TESSELLATION_SEED = 13
 
 MALA_STEP = {
     #  (profile_name, setting, model) -> step
@@ -97,11 +98,7 @@ def get_mala_step(profile_name, setting_name, model):
         MALA step size h.
     """
     key = (profile_name, setting_name, model)
-    if key not in MALA_STEP:
-        raise KeyError(
-            f"Pas de MALA step défini pour {key}. "
-            f"Ajouter une entrée dans MALA_STEP."
-        )
+
     return MALA_STEP[key]
 
 
@@ -109,15 +106,15 @@ def get_mala_step(profile_name, setting_name, model):
 # Profils de zones
 # ==================
 PROFILE_1 = {
-    "name": "1", "n_germs": 6, "rng_seed_voronoi": 20,
+    "name": "1", "n_germs": 6, "rng_seed_voronoi": TESSELLATION_SEED,
     "mus": (10.0, 1.0, 2.0, 10.0, 8.0, 2.0), "J": 6
 }
 PROFILE_2 = {
-    "name": "2", "n_germs": 5, "rng_seed_voronoi": 20,
+    "name": "2", "n_germs": 5, "rng_seed_voronoi": TESSELLATION_SEED,
     "mus": (3.5, 2.0, 4.0, 3.0, 2.5), "J": 5
 }
 PROFILE_3 = {
-    "name": "3", "n_germs": 7, "rng_seed_voronoi": 20,
+    "name": "3", "n_germs": 7, "rng_seed_voronoi": TESSELLATION_SEED,
     "mus": (20.0, 1.0, 1.0, 1.0, 1.0, 1.0, 20.0), "J": 7
 }
 
@@ -255,7 +252,13 @@ def launch_chains(zones, catalog, duration, mala_step, reference_intensity):
             mala_step,
             reference_intensity,
         )
-        for chain_index in range(N_CHAINS)
+        for chain_index in tqdm(
+            range(N_CHAINS),
+            desc="Gibbs chains",
+            unit="chain",
+            leave=False,
+            dynamic_ncols=True,
+        )
     ]
 
 
@@ -299,13 +302,25 @@ def compute_kde_metrics(mu_kde, mu_star_grid):
 def plot_kde_vs_true(mu_star_grid, mu_kde, GX, GY,
                      profile_name, setting_name, cmap="inferno", savefigure=False):
     ny_r, nx_r = GX.shape
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(13, 5.5),
+        layout="constrained",
+    )
     for ax, field, title in zip(
         axes,
         [mu_star_grid, mu_kde],
         [r"Vraie intensité $\mu^\star(s)$", r"KDE $\hat{\mu}_{\mathrm{KDE}}(s)$"],
     ):
-        im = ax.contourf(GX, GY, field.reshape(ny_r, nx_r), levels=30, cmap=cmap)
+        im = ax.pcolormesh(
+            GX,
+            GY,
+            field.reshape(ny_r, nx_r),
+            shading="auto",
+            cmap=cmap,
+            rasterized=True,
+        )
         plt.colorbar(im, ax=ax)
         ax.set_title(title)
         ax.set_xlim(XB); ax.set_ylim(YB)
@@ -315,7 +330,6 @@ def plot_kde_vs_true(mu_star_grid, mu_kde, GX, GY,
         f"Experiment 1 — Profile {profile_name}, Setting {setting_name} — KDE",
         fontsize=12,
     )
-    plt.tight_layout()
     if savefigure:
         _save_figure(fig, f"exp1_true_intensity_{profile_name}{setting_name}")
     plt.show()
@@ -484,7 +498,12 @@ if __name__ == "__main__":
         (PROFILE_3, "B"),
     ]
 
-    for profile, setting in configs:
+    for profile, setting in tqdm(
+        configs,
+        desc="Experiment 1 configurations",
+        unit="config",
+        dynamic_ncols=True,
+    ):
         records = run_exp1_config(profile, setting, savefigure=SAVEFIGURE)
         all_records.extend(records)
         if CLOSE_FIGURES:

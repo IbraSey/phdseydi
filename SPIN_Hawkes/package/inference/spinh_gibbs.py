@@ -1,14 +1,16 @@
-import math
+import sys
 
 import numpy as np
 import openturns as ot
 from polyagamma import random_polyagamma
-from shapely.geometry import Point as ShapelyPoint
+from scipy.special import expit
+from tqdm.auto import tqdm
 
 from package.config import ETASParameters
 from ..models import SPINHModel
 
 from .backends import SparseGP
+from .branching import TemporalCandidateGraph
 
 from .ssgc_gibbs import SSGC_GibbsSampler
 
@@ -122,7 +124,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             value = float(value)
             if not np.isfinite(value):
                 raise ValueError(f"fixed_etas['{name}'] must be finite.")
-            if name in {"A", "alpha", "c", "d", "gamma"} and value <= 0.0:
+            if name in {"A", "alpha", "gamma"} and value < 0.0:
+                raise ValueError(f"fixed_etas['{name}'] must be >= 0.")
+            if name in {"c", "d"} and value <= 0.0:
                 raise ValueError(f"fixed_etas['{name}'] must be > 0.")
             if name in {"p", "q"} and value <= 1.0:
                 raise ValueError(f"fixed_etas['{name}'] must be > 1.")
@@ -231,34 +235,36 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             np.asarray([float(value) for value in t]), parameters
         )
 
-    def _spatial_integration_grid(self, n=40):
-        """Build and cache a rectangular midpoint-like quadrature grid.
-        
-        Parameters
-        ----------
-        n : int, optional
-            Number of grid coordinates along each axis.
-        
-        Returns
-        -------
-        xy : ndarray, shape (n*n, 2)
-            Quadrature locations over the bounding rectangle.
-        weight : float
-            Common area weight assigned to each location."""
-        cache_key = f"_spatial_quad_{n}"
-        if hasattr(self, cache_key):
-            return getattr(self, cache_key)
+    def _prepare_parent_candidates(self, parent_time_window=None):
+        """Cache dense pair geometry or a sparse temporal candidate graph."""
+        times = self._t_obs_arr
+        x = self._x_obs_arr
+        y = self._y_obs_arr
+        if parent_time_window is None:
+            self._parent_candidate_graph = None
+            self._etas_dt_mat = times[:, None] - times[None, :]
+            self._etas_valid_mat = np.tril(self._etas_dt_mat > 0.0, k=-1)
+            dx = x[:, None] - x[None, :]
+            dy = y[:, None] - y[None, :]
+            self._etas_r2_mat = dx * dx + dy * dy
+            self._etas_candidate_r2 = None
+            self._branching_truncation_diagnostics = None
+            return
 
-        xmin, xmax = self.X_bounds
-        ymin, ymax = self.Y_bounds
-        gx = np.linspace(xmin, xmax, n)
-        gy = np.linspace(ymin, ymax, n)
-        GX, GY = np.meshgrid(gx, gy)
-        xy = np.column_stack([GX.ravel(), GY.ravel()])
-        area = (xmax - xmin) * (ymax - ymin)
-        quad = (xy, area / xy.shape[0])
-        setattr(self, cache_key, quad)
-        return quad
+        graph = TemporalCandidateGraph.from_times(times, parent_time_window)
+        dx = x[graph.child_indices] - x[graph.parent_indices]
+        dy = y[graph.child_indices] - y[graph.parent_indices]
+        candidate_r2 = dx * dx + dy * dy
+        candidate_r2.setflags(write=False)
+        self._parent_candidate_graph = graph
+        self._etas_candidate_r2 = candidate_r2
+        self._etas_dt_mat = None
+        self._etas_valid_mat = None
+        self._etas_r2_mat = None
+        self._branching_truncation_diagnostics = {
+            **graph.diagnostics(),
+            "candidate_distance_memory_bytes": int(candidate_r2.nbytes),
+        }
 
     def _spatial_truncation_factors(self, x, y, d=None, q=None, gamma=None, n_grid=40):
         """Approximate spatial ETAS mass retained inside the observation window.
@@ -306,42 +312,6 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         )
 
     # ─────────────────────────────────────────────────────────
-    #  Triggering kernel  φ_{ij}
-    # ─────────────────────────────────────────────────────────
-
-    def _phi_ij(self, i, j, t, x, y):
-        """Evaluate the ETAS triggering density from event ``j`` to event ``i``.
-        
-        Parameters
-        ----------
-        i, j : int
-            Zero-based child and candidate-parent indices.
-        t, x, y : array_like, shape (N,)
-            Event times and coordinates.
-        
-        Returns
-        -------
-        float
-            ``A * phi_m * phi_t * phi_s`` when ``t[i] > t[j]``; otherwise zero."""
-        delta_t = float(t[i]) - float(t[j])
-        if delta_t <= 0:
-            return 0.0
-        magnitude = self.m[j] if self.use_magnitudes else self.m_c
-        distance_squared = (
-            (float(x[i]) - float(x[j])) ** 2
-            + (float(y[i]) - float(y[j])) ** 2
-        )
-        return float(
-            self.model.etas_kernel.pairwise(
-                np.asarray(delta_t),
-                np.asarray(distance_squared),
-                np.asarray(magnitude),
-                self._etas_parameters(),
-                self.m_c,
-            )
-        )
-
-    # ─────────────────────────────────────────────────────────
     #  Branching structure  Z
     # ─────────────────────────────────────────────────────────
 
@@ -378,7 +348,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             y_arr = np.array([float(y[i]) for i in range(N)], dtype=float)
             XY = ot.Sample(np.column_stack([x_arr, y_arr]).tolist())
         mu_t = self.compute_mu_tilde(XY, eps=eps_arr)
-        sig = 1.0 / (1.0 + np.exp(-np.array(f_data)))
+        sig = expit(np.asarray(f_data, dtype=float))
         mu = mu_t * sig
 
         Z_new = np.zeros(N)
@@ -387,19 +357,31 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 Z_new[i] = 0.0
                 continue
 
-            dt_mat = getattr(self, "_etas_dt_mat", None)
-            valid_mat = getattr(self, "_etas_valid_mat", None)
-            if dt_mat is not None and valid_mat is not None and dt_mat.shape == (N, N):
-                dt = dt_mat[i, :i]
-                valid = valid_mat[i, :i]
+            graph = getattr(self, "_parent_candidate_graph", None)
+            if graph is not None and graph.n_events == N:
+                edge_slice = graph.row_slice(i)
+                parent_idx = graph.parent_indices[edge_slice]
+                dt_valid = graph.time_lags[edge_slice]
             else:
-                dt = t_arr[i] - t_arr[:i]
-                valid = dt > 0.0
-            labels = np.concatenate(([0], np.arange(1, i + 1)[valid]))
-
-            if np.any(valid):
-                tp = self.theta_phi
+                dt_mat = getattr(self, "_etas_dt_mat", None)
+                valid_mat = getattr(self, "_etas_valid_mat", None)
+                if (
+                    dt_mat is not None
+                    and valid_mat is not None
+                    and dt_mat.shape == (N, N)
+                ):
+                    dt = dt_mat[i, :i]
+                    valid = valid_mat[i, :i]
+                else:
+                    dt = t_arr[i] - t_arr[:i]
+                    valid = dt > 0.0
                 parent_idx = np.arange(i)[valid]
+                dt_valid = dt[valid]
+                edge_slice = None
+            labels = np.concatenate(([0], parent_idx + 1))
+
+            if parent_idx.size:
+                tp = self.theta_phi
                 prod = np.full(parent_idx.size, tp["A"], dtype=float)
                 if self.use_magnitudes:
                     dm_all = getattr(self, "_etas_dm", None)
@@ -409,24 +391,30 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 else:
                     R = np.full(parent_idx.size, tp["d"], dtype=float)
 
-                dt_valid = dt[valid]
                 phi_t = (
                     (tp["p"] - 1.0)
                     * tp["c"] ** (tp["p"] - 1.0)
                     * (dt_valid + tp["c"]) ** (-tp["p"])
                 )
-                r2_mat = getattr(self, "_etas_r2_mat", None)
-                if r2_mat is not None and r2_mat.shape == (N, N):
-                    r2 = r2_mat[i, parent_idx]
+                if edge_slice is not None:
+                    r2 = self._etas_candidate_r2[edge_slice]
                 else:
-                    r2 = (x_arr[i] - x_arr[parent_idx]) ** 2 + (y_arr[i] - y_arr[parent_idx]) ** 2
+                    r2_mat = getattr(self, "_etas_r2_mat", None)
+                    if r2_mat is not None and r2_mat.shape == (N, N):
+                        r2 = r2_mat[i, parent_idx]
+                    else:
+                        r2 = (x_arr[i] - x_arr[parent_idx]) ** 2 + (y_arr[i] - y_arr[parent_idx]) ** 2
                 phi_s = (tp["q"] - 1.0) / (np.pi * R) * (1.0 + r2 / R) ** (-tp["q"])
                 weights = np.concatenate(([mu[i]], prod * phi_t * phi_s))
             else:
                 weights = np.array([mu[i]])
 
             total = weights.sum()
-            Z_new[i] = np.random.choice(labels, p=weights / total) if total > 0 else 0
+            if not np.all(np.isfinite(weights)) or not np.isfinite(total):
+                raise FloatingPointError(
+                    f"Non-finite branching weights for event {i}."
+                )
+            Z_new[i] = self.rng.choice(labels, p=weights / total) if total > 0 else 0
         return ot.Point(Z_new.tolist())
 
     # ─────────────────────────────────────────────────────────
@@ -457,9 +445,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         -------
         float
             Log-posterior value, or ``-inf`` outside the support."""
-        if A <= 0:
+        if A < 0 or (A == 0 and "A" not in self.fixed_etas):
             return -np.inf
-        if self.use_magnitudes and alpha <= 0:
+        if self.use_magnitudes and (
+            alpha < 0 or (alpha == 0 and "alpha" not in self.fixed_etas)
+        ):
             return -np.inf
 
         tp = self.theta_phi_priors
@@ -470,7 +460,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         T_j = self._compute_T_j(t)  # uses current c, p
         S_j = self._spatial_truncation_factors(x, y)
 
-        log_lik = o_j.sum() * np.log(A)
+        offspring_count = float(o_j.sum())
+        if A == 0.0 and offspring_count > 0.0:
+            return -np.inf
+        log_lik = offspring_count * np.log(A) if A > 0.0 else 0.0
         if self.use_magnitudes:
             dm = self.m - self.m_c
             log_lik += alpha * np.sum(o_j * dm)
@@ -478,8 +471,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         else:
             log_lik -= A * np.sum(T_j * S_j)
 
-        log_pr = (tp["a_A"] - 1) * np.log(A) - tp["b_A"] * A
-        if self.use_magnitudes:
+        log_pr = 0.0
+        if "A" not in self.fixed_etas:
+            log_pr += (tp["a_A"] - 1) * np.log(A) - tp["b_A"] * A
+        if self.use_magnitudes and "alpha" not in self.fixed_etas:
             log_pr += (tp["a_alpha"] - 1) * np.log(alpha) - tp["b_alpha"] * alpha
         return log_lik + log_pr
 
@@ -571,8 +566,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         else:
             log_lik -= A_cur * np.sum(T_j * S_j)
 
-        log_pr = (tp["a_c"] - 1) * np.log(c) - tp["b_c"] * c
-        log_pr += (tp["a_p"] - 1) * np.log(p - 1) - tp["b_p"] * (p - 1)
+        log_pr = 0.0
+        if "c" not in self.fixed_etas:
+            log_pr += (tp["a_c"] - 1) * np.log(c) - tp["b_c"] * c
+        if "p" not in self.fixed_etas:
+            log_pr += (tp["a_p"] - 1) * np.log(p - 1) - tp["b_p"] * (p - 1)
         return log_lik + log_pr
 
     def update_c_p(self, t, x, y, Z, history, it):
@@ -630,7 +628,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             or ``-inf`` outside the support."""
         if d <= 0 or q <= 1:
             return -np.inf
-        if self.use_magnitudes and gamma <= 0:
+        if self.use_magnitudes and (
+            gamma < 0 or (gamma == 0 and "gamma" not in self.fixed_etas)
+        ):
             return -np.inf
         tp = self.theta_phi_priors
         Z_arr = np.asarray([int(float(Z[i])) for i in range(len(Z))], dtype=int)
@@ -664,9 +664,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         else:
             log_lik -= A_cur * np.sum(T_j * S_j)
 
-        log_pr = (tp["a_d"] - 1) * np.log(d) - tp["b_d"] * d
-        log_pr += (tp["a_q"] - 1) * np.log(q - 1) - tp["b_q"] * (q - 1)
-        if self.use_magnitudes:
+        log_pr = 0.0
+        if "d" not in self.fixed_etas:
+            log_pr += (tp["a_d"] - 1) * np.log(d) - tp["b_d"] * d
+        if "q" not in self.fixed_etas:
+            log_pr += (tp["a_q"] - 1) * np.log(q - 1) - tp["b_q"] * (q - 1)
+        if self.use_magnitudes and "gamma" not in self.fixed_etas:
             log_pr += (tp["a_gamma"] - 1) * np.log(gamma) - tp["b_gamma"] * gamma
         return log_lik + log_pr
 
@@ -705,6 +708,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
     def run(self, t, x, y, mala_step=0.05, n_iter=1000,
             learn_nu=False, fixed_beta=None,
             sample_z=True, known_z=None, fixed_etas=None,
+            parent_time_window=None,
             t0_nu=50, step_nu_init=0.1,
             verbose=True, verbose_every=100, use_calibration=True,
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
@@ -738,6 +742,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         fixed_etas : dict or None, optional
             ETAS parameters kept fixed while the other coordinates are sampled.
             For example ``{"c": 0.02, "p": 1.3}``.
+        parent_time_window : float or None, optional
+            Maximum parent-child time lag. A finite value builds a sparse
+            candidate-parent graph; ``None`` retains every earlier event.
         t0_nu : int, optional
             Warm-up length for GP-hyperparameter adaptation.
         step_nu_init : float, optional
@@ -791,22 +798,20 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             raise ValueError("gp_backend must be 'exact' or 'sparse'.")
 
         N = len(t)
+        if self.use_magnitudes and self.m.size != N:
+            raise ValueError("One magnitude is required per observed event.")
         sample_z = bool(sample_z)
         self._t_obs_arr = np.asarray([float(v) for v in t], dtype=float)
         self._x_obs_arr = np.asarray([float(v) for v in x], dtype=float)
         self._y_obs_arr = np.asarray([float(v) for v in y], dtype=float)
         self._XY_obs = ot.Sample(np.column_stack([self._x_obs_arr, self._y_obs_arr]).tolist())
         self._compute_event_domain_indices(self._x_obs_arr, self._y_obs_arr)
-        self._etas_dt_mat = self._t_obs_arr[:, None] - self._t_obs_arr[None, :]
-        self._etas_valid_mat = np.tril(self._etas_dt_mat > 0.0, k=-1)
-        dx = self._x_obs_arr[:, None] - self._x_obs_arr[None, :]
-        dy = self._y_obs_arr[:, None] - self._y_obs_arr[None, :]
-        self._etas_r2_mat = dx * dx + dy * dy
+        self._prepare_parent_candidates(parent_time_window)
         self._etas_dm = (self.m - self.m_c) if self.m is not None else np.zeros(N)
         if fixed_beta is not None:
             fixed_beta = float(fixed_beta)
-            if fixed_beta <= 0.0:
-                raise ValueError("fixed_beta must be positive.")
+            if not np.isfinite(fixed_beta) or fixed_beta <= 0.0:
+                raise ValueError("fixed_beta must be finite and positive.")
             self.beta = fixed_beta
         sample_beta = bool(self.use_magnitudes and fixed_beta is None)
 
@@ -823,20 +828,27 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         free_etas_blocks = {
             key: self._free_etas_names(names) for key, names in etas_blocks.items()
         }
+        for name in {
+            parameter
+            for block in free_etas_blocks.values()
+            for parameter in block
+        }:
+            if name in {"A", "alpha", "gamma"} and self.theta_phi[name] == 0.0:
+                lower, _ = self._LOG_BOUNDS[self._etas_log_bound_name(name)]
+                self.theta_phi[name] = float(np.exp(lower))
         sample_theta = any(free_etas_blocks.values())
         n_tp = len(tp_names)
 
         # ── Calibration GP ──────────────────────────────────────────────────
         if use_calibration:
             if verbose: print("[Pre-run] Calibrating GP hyperparameters")
-            _, _, eps_mle_all = self.calibrate_nu(
+            self.calibrate_nu(
                 x, y, verbose=verbose,
                 plot_kde=plot_calibration_kde,
                 kde_cmap=calibration_kde_cmap,
             )
-        else:
-            if verbose: print(f"[Pre-run] nu_init = {list(self.nu)}")
-            eps_mle_all = self.estimate_eps_mle(x, y)
+        elif verbose:
+            print(f"[Pre-run] nu_init = {list(self.nu)}")
 
         if gp_backend == "sparse":
             if sparse_gp is None:
@@ -860,10 +872,19 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         f_data = ot.Point([0.0] * N)
 
         # Initial branching labels. Passing known_z enables oracle-Z experiments.
+        known_z_arr = None
         if known_z is None:
             Z = ot.Point([0.0] * N)
         else:
-            known_z_arr = np.asarray(known_z, dtype=int).reshape(-1)
+            try:
+                known_z_values = np.asarray(known_z, dtype=float).reshape(-1)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("known_z labels must be finite integers.") from exc
+            if not np.all(np.isfinite(known_z_values)) or np.any(
+                known_z_values != np.floor(known_z_values)
+            ):
+                raise ValueError("known_z labels must be finite integers.")
+            known_z_arr = known_z_values.astype(int)
             if known_z_arr.size != N:
                 raise ValueError("known_z must contain one label per event.")
             if np.any(known_z_arr < 0):
@@ -936,14 +957,27 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             print(f"{'':>32}Gibbs : {n_iter} iter, N={N}{'':>32}")
             print("=" * 100)
 
-        for it in range(n_iter):
+        progress = tqdm(
+            range(n_iter),
+            desc=f"SPIN-H Gibbs (N={N})",
+            unit="iter",
+            disable=not verbose,
+            dynamic_ncols=True,
+            miniters=verbose_every,
+            file=sys.stdout,
+        )
+        for it in progress:
             try:
                 # ── Steps 1-3 : ω, π_S, latent GP ─────────────────────────
                 if gp_backend == "sparse":
                     f_data_np = sparse_design_observed @ np.asarray(gp_coeffs, dtype=float)
                     f_data = ot.Point(f_data_np.tolist())
                     omega = ot.Point(
-                        __import__("polyagamma").random_polyagamma(1.0, f_data_np)
+                        random_polyagamma(
+                            1.0,
+                            f_data_np,
+                            random_state=self.rng,
+                        )
                     )
                     Pi_S = self.sample_Pi_S_sparse(eps, sparse_gp, gp_coeffs)
                     gp_coeffs = self.update_sparse_gp_coeffs(
@@ -955,7 +989,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     idx_bg = [i for i in range(N) if float(Z[i]) == 0.0]
                 else:
                     omega = ot.Point(
-                        __import__("polyagamma").random_polyagamma(1.0, np.array(f_data))
+                        random_polyagamma(
+                            1.0,
+                            np.array(f_data),
+                            random_state=self.rng,
+                        )
                     )
 
                     # Condition the thinned PP only on background events so that
@@ -1048,7 +1086,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     if learn_nu:
                         msg += f" acc_ν={an/denom*100:.0f}%"
                     if it > self.t0_etas: msg += " [AM]"
-                    print(msg)
+                    progress.set_postfix_str(msg, refresh=False)
 
                 # ── E_μ (diagnostic, background GP only) ────────────────────
                 if compute_emu and it % emu_every == 0:
@@ -1087,7 +1125,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     si += 1
 
             except Exception as e:
-                print(f"\n[ERROR] iter {it}: {e}"); raise
+                progress.write(f"[ERROR] iter {it}: {e}")
+                raise
+
+        progress.close()
 
         if verbose:
             print("=" * 100 + "\n")
@@ -1138,7 +1179,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "learn_nu": learn_nu,
             "sample_z": sample_z,
             "fixed_etas": dict(self.fixed_etas),
-            "known_z": np.asarray(known_z, dtype=int) if known_z is not None else None,
+            "known_z": known_z_arr.copy() if known_z_arr is not None else None,
+            "branching_truncation": self._branching_truncation_diagnostics,
             "am_history": {
                 "A_alpha":   np.array(hAa) if hAa else None,
                 "c_p":       np.array(hcp) if hcp else None,

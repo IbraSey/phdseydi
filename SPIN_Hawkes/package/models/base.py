@@ -8,7 +8,7 @@ from data.catalog import EventCatalog
 
 
 class PointProcessModel(ABC):
-    """Base class for models that can be estimated with Gibbs sampling."""
+    """Base class for point-process models with public inference methods."""
 
     @staticmethod
     def _resolve_gp_backend(gp_backend):
@@ -27,6 +27,8 @@ class PointProcessModel(ABC):
                 f"config must be a {config_type.__name__} instance."
             )
         self.validate_catalog(catalog)
+        if len(catalog) == 0:
+            raise ValueError("Gibbs inference requires at least one observed event.")
         return config, self._resolve_gp_backend(gp_backend)
 
     def _run_gibbs(

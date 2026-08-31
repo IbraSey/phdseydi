@@ -1,4 +1,5 @@
-import math
+import sys
+from numbers import Integral
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -6,6 +7,7 @@ import openturns as ot
 from polyagamma import random_polyagamma
 from scipy.special import expit
 from shapely.geometry import Point as ShapelyPoint
+from tqdm.auto import tqdm
 
 from ..models import SSGCModel
 
@@ -79,6 +81,8 @@ class SSGC_GibbsSampler:
             self.use_magnitudes = False
         else:
             self.m = np.asarray(m, dtype=float).reshape(-1)
+            if not np.all(np.isfinite(self.m)):
+                raise ValueError("Magnitudes must be finite.")
             self.m_max = (
                 float(model.magnitude_max)
                 if model.magnitude_max is not None
@@ -107,8 +111,13 @@ class SSGC_GibbsSampler:
         self.J = self.n_domains
 
         if rng_seed is not None:
-            ot.RandomGenerator.SetSeed(int(rng_seed))
-            self.rng_state = ot.RandomGenerator.GetState()
+            if isinstance(rng_seed, bool) or not isinstance(rng_seed, Integral):
+                raise ValueError("rng_seed must be a non-negative integer or None.")
+            rng_seed = int(rng_seed)
+            if rng_seed < 0:
+                raise ValueError("rng_seed must be a non-negative integer or None.")
+            ot.RandomGenerator.SetSeed(rng_seed)
+        self.rng = np.random.default_rng(rng_seed)
 
         self.centroids_xy, self.Sigma_eps = self.compute_Sigma_eps()
         Sigma_eps_reg = ot.CovarianceMatrix(
@@ -320,8 +329,10 @@ class SSGC_GibbsSampler:
             Unnormalised log-posterior log p(ν | f, D_f) (up to a constant).
         """
         nu0, nu1 = map(float, nu_vals)
+        if not np.isfinite([nu0, nu1]).all() or nu0 <= 0.0 or nu1 <= 0.0:
+            return -np.inf
         log_prior = -self.lambda_nu * (nu0 + nu1)
-        kernel = ot.SquaredExponential([nu1, nu1], [nu0])
+        kernel = ot.SquaredExponential([nu1, nu1], [np.sqrt(nu0)])
         N = D_f_sample.getSize()
         K_mat = kernel.discretize(D_f_sample)
         for i in range(N):
@@ -703,7 +714,11 @@ class SSGC_GibbsSampler:
         if mask.size == 0:
             return ot.Sample(0, 3)
 
-        omega = random_polyagamma(1.0, f_cand[mask])
+        omega = random_polyagamma(
+            1.0,
+            f_cand[mask],
+            random_state=self.rng,
+        )
         values = np.column_stack([np.asarray(XY_cand)[mask], omega])
         return ot.Sample(values.tolist())
 
@@ -777,7 +792,7 @@ class SSGC_GibbsSampler:
             XY_acc[k, 1] = XY_cand[i, 1]
             f_acc[k] = float(f_star[i])
 
-        omega_acc = random_polyagamma(1.0, f_acc)
+        omega_acc = random_polyagamma(1.0, f_acc, random_state=self.rng)
         n_acc = len(omega_acc)
         Pi_S = ot.Sample(n_acc, 3)
         for i in range(n_acc):
@@ -956,19 +971,16 @@ class SSGC_GibbsSampler:
         eps_mle : ndarray, shape (J,)
             Initial envelope log-intensity estimates.
         """
-        counts = np.zeros(self.J)
-        for i in range(len(x)):
-            pt = ShapelyPoint(float(x[i]), float(y[i]))
-            for j, poly in enumerate(self.areas):
-                if poly.covers(pt):
-                    counts[j] += 1
-                    break
-        eps_mle = np.zeros(self.J)
-        for j in range(self.J):
-            area_j = self.polygons[j].area
-            rate_j = max(2.0 * counts[j] / (self.T * area_j), 1e-6)
-            eps_mle[j] = np.log(rate_j) 
-        return eps_mle
+        zones = self._compute_event_domain_indices(x, y)
+        counts = np.bincount(
+            zones[zones >= 0],
+            minlength=self.J,
+        )[:self.J].astype(float)
+        rates = np.maximum(
+            2.0 * counts / (self.T * self.domain_areas),
+            1e-6,
+        )
+        return np.log(rates)
     
     def calibrate_nu(self, x, y, verbose=True, plot_kde=False, kde_cmap="viridis"):
         """Heuristic calibration of GP hyperparameters via linearised sigmoid inversion.
@@ -992,13 +1004,15 @@ class SSGC_GibbsSampler:
             If True, plot the KDE.
         Returns
         -------
-        v : float
-            Calibrated GP amplitude stored as ``v²`` by the sampler.
+        v_sq : float
+            Calibrated GP variance.
         l_ot : float
             Calibrated length scale.
         eps_mle : ndarray, shape (J,)
             MLE of zonal log-intensities (computed as a by-product).
         """
+        if len(x) < 2 or len(y) < 2:
+            raise ValueError("GP calibration requires at least two observed events.")
         obs_pts = np.column_stack([
             np.asarray([float(v) for v in x]),
             np.asarray([float(v) for v in y]),
@@ -1013,8 +1027,15 @@ class SSGC_GibbsSampler:
             GX, GY = np.meshgrid(gx, gy)
             grid = ot.Sample(np.column_stack([GX.ravel(), GY.ravel()]).tolist())
             density = np.asarray(kde.computePDF(grid), dtype=float).reshape(GX.shape)
-            fig, ax = plt.subplots(figsize=(6, 5))
-            contour = ax.contourf(GX, GY, density, levels=20, cmap=kde_cmap)
+            fig, ax = plt.subplots(figsize=(6, 5), layout="constrained")
+            contour = ax.pcolormesh(
+                GX,
+                GY,
+                density,
+                shading="auto",
+                cmap=kde_cmap,
+                rasterized=True,
+            )
             ax.scatter(
                 obs_pts[:, 0], obs_pts[:, 1], s=10, c="white",
                 edgecolors="black", linewidths=0.3,
@@ -1023,7 +1044,6 @@ class SSGC_GibbsSampler:
             ax.set_title("Kernel-density estimate")
             ax.set_xlim(self.X_bounds)
             ax.set_ylim(self.Y_bounds)
-            plt.tight_layout()
             plt.show()
 
         eps_mle = self.estimate_eps_mle(x, y)
@@ -1044,10 +1064,29 @@ class SSGC_GibbsSampler:
             covariance_model,
             basis,
         )
+        # The KDE-inverted target is estimated rather than observed exactly.
+        # A small noise term prevents the GP fitter from treating local KDE
+        # fluctuations as an interpolation constraint and sending v^2 to an
+        # effectively unbounded value on some spatial training folds.
+        target_variance = float(np.var(target))
+        noise_variance = max(1e-8, 0.01 * target_variance)
+        fitter.setNoise([noise_variance] * len(target))
+        optimizer = fitter.getOptimizationAlgorithm()
+        optimizer.setMaximumCallsNumber(5000)
+        fitter.setOptimizationAlgorithm(optimizer)
         fitter.run()
+        optimization_result = fitter.getOptimizationAlgorithm().getResult()
+        if optimization_result.getStatus() != ot.OptimizationResult.SUCCESS:
+            raise RuntimeError(
+                "GP calibration did not converge: "
+                f"{optimization_result.getStatusMessage()}"
+            )
         fitted_covariance = fitter.getResult().getCovarianceModel()
         l_ot = float(np.min(np.asarray(fitted_covariance.getScale(), dtype=float)))
-        v_sq = float(fitted_covariance.getAmplitude()[0])
+        amplitude = float(fitted_covariance.getAmplitude()[0])
+        v_sq = amplitude**2
+        if not np.isfinite(v_sq) or v_sq <= 0.0 or not np.isfinite(l_ot) or l_ot <= 0.0:
+            raise RuntimeError("GP calibration returned invalid hyperparameters.")
         self.nu = ot.Point([v_sq, l_ot])
         
         if verbose:
@@ -1127,10 +1166,12 @@ class SSGC_GibbsSampler:
             state; covariance metadata; and storage settings."""
 
         N = len(t)
+        if self.use_magnitudes and self.m.size != N:
+            raise ValueError("One magnitude is required per observed event.")
         if fixed_beta is not None:
             fixed_beta = float(fixed_beta)
-            if fixed_beta <= 0.0:
-                raise ValueError("fixed_beta must be positive.")
+            if not np.isfinite(fixed_beta) or fixed_beta <= 0.0:
+                raise ValueError("fixed_beta must be finite and positive.")
             if self.use_magnitudes:
                 self.beta = fixed_beta
         sample_beta = bool(self.use_magnitudes and fixed_beta is None)
@@ -1229,13 +1270,28 @@ class SSGC_GibbsSampler:
             )
             print("=" * 100)
 
-        for it in range(n_iter):
+        progress = tqdm(
+            range(n_iter),
+            desc=f"SSGC Gibbs (N={N})",
+            unit="iter",
+            disable=not verbose,
+            dynamic_ncols=True,
+            miniters=verbose_every,
+            file=sys.stdout,
+        )
+        for it in progress:
             try:
                 # Steps 1-3: Polya-Gamma marks, latent process, and GP update.
                 if gp_backend == "sparse":
                     f_data_np = sparse_design_observed @ np.asarray(gp_coeffs, dtype=float)
                     f_data = ot.Point(f_data_np.tolist())
-                    omega_D0 = ot.Point(random_polyagamma(1.0, f_data_np))
+                    omega_D0 = ot.Point(
+                        random_polyagamma(
+                            1.0,
+                            f_data_np,
+                            random_state=self.rng,
+                        )
+                    )
                     Pi_S = self.sample_Pi_S_sparse(eps, sparse_gp, gp_coeffs)
                     gp_coeffs = self.update_sparse_gp_coeffs(
                         x, y, Z, omega_D0, Pi_S, sparse_gp
@@ -1245,7 +1301,13 @@ class SSGC_GibbsSampler:
                     f_Df = D_f_xy = None
                 else:
                     f_data_np = np.array(f_data)
-                    omega_D0 = ot.Point(random_polyagamma(1.0, f_data_np))
+                    omega_D0 = ot.Point(
+                        random_polyagamma(
+                            1.0,
+                            f_data_np,
+                            random_state=self.rng,
+                        )
+                    )
                     Pi_S = self.sample_Pi_S(x, y, f_data, eps)
                     f_D0, f_Df, D_f_xy, _ = self.update_f(x, y, Z, omega_D0, Pi_S)
                     f_data = f_D0
@@ -1289,7 +1351,7 @@ class SSGC_GibbsSampler:
                             )
                         else:
                             msg += f" | beta = {self.beta:.3f} fixed"
-                    print(msg)
+                    progress.set_postfix_str(msg, refresh=False)
 
                 # ---------- Calcul de Eps_mu^(t) ----------
                 # Calcul de Eps_mu toutes les X itérations seulement
@@ -1334,9 +1396,10 @@ class SSGC_GibbsSampler:
                     store_idx += 1
 
             except Exception as e:
-                print(f"\nError at iteration {it} : {e}")
+                progress.write(f"Error at iteration {it}: {e}")
                 raise           
-        
+        progress.close()
+
         if verbose:
             print("=" * 100)
             print("-" * 41 + " Gibbs terminé !! " + "-" * 41)

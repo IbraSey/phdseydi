@@ -14,9 +14,9 @@ class EventCatalog:
     magnitudes: np.ndarray | None = None
 
     def __post_init__(self):
-        t = np.asarray(self.t, dtype=float).reshape(-1)
-        x = np.asarray(self.x, dtype=float).reshape(-1)
-        y = np.asarray(self.y, dtype=float).reshape(-1)
+        t = np.array(self.t, dtype=float, copy=True).reshape(-1)
+        x = np.array(self.x, dtype=float, copy=True).reshape(-1)
+        y = np.array(self.y, dtype=float, copy=True).reshape(-1)
         if not (t.size == x.size == y.size):
             raise ValueError("t, x, and y must have the same length.")
         if not np.all(np.isfinite(np.column_stack([t, x, y]))):
@@ -25,11 +25,14 @@ class EventCatalog:
             raise ValueError("Events must be sorted by non-decreasing time.")
         magnitudes = self.magnitudes
         if magnitudes is not None:
-            magnitudes = np.asarray(magnitudes, dtype=float).reshape(-1)
+            magnitudes = np.array(magnitudes, dtype=float, copy=True).reshape(-1)
             if magnitudes.size != t.size:
                 raise ValueError("One magnitude is required per event.")
             if not np.all(np.isfinite(magnitudes)):
                 raise ValueError("Magnitudes must be finite.")
+        for values in (t, x, y, magnitudes):
+            if values is not None:
+                values.setflags(write=False)
         object.__setattr__(self, "t", t)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", y)
@@ -43,7 +46,9 @@ class EventCatalog:
         return np.column_stack([self.x, self.y])
 
     def history_before(self, time: float) -> "EventCatalog":
-        mask = self.t < float(time)
+        time = float(time)
+        if not np.isfinite(time):
+            raise ValueError("time must be finite.")
+        mask = self.t < time
         magnitudes = None if self.magnitudes is None else self.magnitudes[mask]
         return EventCatalog(self.t[mask], self.x[mask], self.y[mask], magnitudes)
-
