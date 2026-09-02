@@ -1,5 +1,7 @@
 """Fourier-basis approximation of a two-dimensional squared-exponential GP."""
 
+from functools import partial
+
 import numpy as np
 import openturns as ot
 
@@ -7,6 +9,14 @@ import openturns as ot
 def fourier_mode(x, index, radius):
     """Evaluate a normalized sine basis mode on ``[-radius, radius]``."""
     return np.sin(np.pi * index * (x + radius) / (2.0 * radius)) / np.sqrt(radius)
+
+
+def _basis_values(points, *, center, radii, modes, spectral_scale):
+    """Evaluate points or samples without retaining the owning SparseGP object."""
+    points = np.asarray(points, dtype=float)
+    phi_x = fourier_mode(points[..., 0, None] - center[0], modes[0], radii[0])
+    phi_y = fourier_mode(points[..., 1, None] - center[1], modes[1], radii[1])
+    return phi_x * phi_y * spectral_scale
 
 
 class SparseGP:
@@ -52,9 +62,19 @@ class SparseGP:
             )
         )
         self.sqrt_Delta = np.sqrt(spectral_variance)
-        self.regressorOT = ot.MemoizeFunction(
-            ot.PythonFunction(2, self.m, self._regressor_point)
+        # A bound callback creates a Python/C++ ownership cycle that GC cannot
+        # reclaim. This callback owns only the small, immutable basis arrays.
+        evaluator = partial(
+            _basis_values, center=(self.c1, self.c2), radii=(self.L1, self.L2),
+            modes=self.S, spectral_scale=self.sqrt_Delta,
         )
+        self.regressorOT = ot.MemoizeFunction(
+            ot.PythonFunction(2, self.m, func=evaluator, func_sample=evaluator)
+        )
+        # Observed designs are stored by inference; changing latent locations
+        # must not fill a separate high-dimensional cache on every chain.
+        self.regressorOT.disableCache()
+        self.regressorOT.disableHistory()
 
     @classmethod
     def from_bounds(cls, x_bounds, y_bounds, variance, length_scale):
@@ -73,6 +93,7 @@ class SparseGP:
                     radius_x, radius_y, variance))
 
     def _regressor_point(self, point):
-        phi_x = fourier_mode(point[0] - self.c1, self.S[0], self.L1)
-        phi_y = fourier_mode(point[1] - self.c2, self.S[1], self.L2)
-        return (phi_x * phi_y * self.sqrt_Delta).tolist()
+        return _basis_values(
+            point, center=(self.c1, self.c2), radii=(self.L1, self.L2),
+            modes=self.S, spectral_scale=self.sqrt_Delta,
+        ).tolist()

@@ -259,39 +259,53 @@ levels_joint = np.linspace(
 
 #%% Plot — Posterior mean
 
-fig = plt.figure(figsize=(10, 10))
-plt.contourf(xx, yy, intensity_mean, levels_joint)
-plt.colorbar()
-plt.scatter(
+fig, ax = plt.subplots(figsize=(10, 10), layout="constrained")
+image = ax.pcolormesh(
+    xx,
+    yy,
+    intensity_mean,
+    shading="auto",
+    vmin=levels_joint[0],
+    vmax=levels_joint[-1],
+    rasterized=True,
+)
+fig.colorbar(image, ax=ax)
+ax.scatter(
     D_select[:, 0], D_select[:, 1],
     s=np.sqrt(D_select[:, 2]),
     c='r', marker='o',
     alpha=(1. / D_select[:, 2]) / max(1. / D_select[:, 2]),
 )
 for line in SM.coastlines:
-    plt.plot(line[0], line[1], 'w', linewidth=1.5)
-plt.title("Seismic intensity — Posterior mean", fontsize=20)
-plt.tight_layout()
-plt.savefig("intensity_post_mean.png")
+    ax.plot(line[0], line[1], 'w', linewidth=1.5)
+ax.set_title("Seismic intensity — Posterior mean", fontsize=20)
+fig.savefig("intensity_post_mean.png", bbox_inches="tight", pad_inches=0.08)
 plt.close()
 
 
 #%% Plot — Posterior std
 
-fig = plt.figure(figsize=(10, 10))
-plt.contourf(xx, yy, intensity_std, levels_joint)
-plt.colorbar()
-plt.scatter(
+fig, ax = plt.subplots(figsize=(10, 10), layout="constrained")
+image = ax.pcolormesh(
+    xx,
+    yy,
+    intensity_std,
+    shading="auto",
+    vmin=levels_joint[0],
+    vmax=levels_joint[-1],
+    rasterized=True,
+)
+fig.colorbar(image, ax=ax)
+ax.scatter(
     D_select[:, 0], D_select[:, 1],
     s=np.sqrt(D_select[:, 2]),
     c='r', marker='o',
     alpha=(1. / D_select[:, 2]) / max(1. / D_select[:, 2]),
 )
 for line in SM.coastlines:
-    plt.plot(line[0], line[1], 'w', linewidth=1.5)
-plt.title("Seismic intensity — Posterior std", fontsize=20)
-plt.tight_layout()
-plt.savefig("intensity_post_mean_std.png")
+    ax.plot(line[0], line[1], 'w', linewidth=1.5)
+ax.set_title("Seismic intensity — Posterior std", fontsize=20)
+fig.savefig("intensity_post_mean_std.png", bbox_inches="tight", pad_inches=0.08)
 plt.close()
 
 

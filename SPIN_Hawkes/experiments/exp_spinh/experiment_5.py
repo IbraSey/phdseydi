@@ -6,11 +6,11 @@ import csv
 import sys
 import warnings
 from pathlib import Path
-import numpy as np
+
 import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
-from package import ETASParameters
+from tqdm.auto import tqdm
 
 try:
     from joblib import Parallel, delayed
@@ -26,6 +26,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 sys.path.insert(0, str(EXPERIMENT_DIR))
 
 from package import (
+    ETASParameters,
     GPParameters,
     SPINHGibbsConfig,
     SPINHModel,
@@ -217,7 +218,8 @@ THIN = 3
 BURN_IN = 0.5
 SIGMA_MH_ETAS = 0.05
 SIGMA_MH_BETA = 0.1
-USE_SPARSE_GP = True
+GP_BACKEND = "sparse"
+USE_CALIBRATION = True
 VERBOSE = True
 VERBOSE_EVERY = 300
 LAMBDA_GRID_SIZE = 35
@@ -226,10 +228,45 @@ RESULTS_DIR = PACKAGE_ROOT / "figures" / "experiments" / "exp_spinh"
 ERROR_PLOT_FLOOR = 1e-4
 
 
-def run_realization(polygons, scenario, realization):
-    seed = BASE_SEED + 1000 * int(scenario["difficulty"]) + realization
-    field = lambda x, y: latent_field(x, y, scenario["field_scale"])
-    simulation = simulate_hawkes_process(
+def make_model(polygons, scenario, etas_parameters=INITIAL_ETAS):
+    return SPINHModel.from_polygons(
+        polygons=polygons,
+        duration=scenario["duration"],
+        x_bounds=X_BOUNDS,
+        y_bounds=Y_BOUNDS,
+        gp_prior=GPParameters(variance=5.0, length_scale=0.2),
+        eps_prior_variance=1.0,
+        eps_prior_length_scale=0.01,
+        nu_prior_rate=0.5,
+        jitter=1e-5,
+        etas_parameters=etas_parameters,
+        magnitude_min=MAGNITUDE_MIN,
+        magnitude_max=MAGNITUDE_MAX,
+    )
+
+
+def make_gibbs_config(scenario):
+    return SPINHGibbsConfig(
+        n_iter=N_ITER,
+        thin=THIN,
+        mala_step=scenario["mala_step"],
+        verbose=VERBOSE and N_JOBS == 1,
+        verbose_every=VERBOSE_EVERY,
+        use_calibration=USE_CALIBRATION,
+        beta_init=INITIAL_BETA,
+        theta_priors=THETA_PRIORS,
+        sigma_mh_etas=SIGMA_MH_ETAS,
+        sigma_mh_beta=SIGMA_MH_BETA,
+        adaptation_start=200,
+        proposal_jitter=1e-6,
+    )
+
+
+def simulate_scenario(polygons, scenario, seed):
+    def field(x, y):
+        return latent_field(x, y, scenario["field_scale"])
+
+    return simulate_hawkes_process(
         X_bounds=X_BOUNDS,
         Y_bounds=Y_BOUNDS,
         T=scenario["duration"],
@@ -243,38 +280,16 @@ def run_realization(polygons, scenario, realization):
         rng_seed=seed,
     )
 
-    model = SPINHModel.from_polygons(
-        polygons=polygons,
-        duration=scenario["duration"],
-        x_bounds=X_BOUNDS,
-        y_bounds=Y_BOUNDS,
-        gp_prior=GPParameters(variance=5.0, length_scale=0.2),
-        eps_prior_variance=1.0,
-        eps_prior_length_scale=0.01,
-        nu_prior_rate=0.5,
-        jitter=1e-5,
-        etas_parameters=INITIAL_ETAS,
-        magnitude_min=MAGNITUDE_MIN,
-        magnitude_max=MAGNITUDE_MAX,
-    )
+
+def run_realization(polygons, scenario, realization):
+    seed = BASE_SEED + 1000 * int(scenario["difficulty"]) + realization
+    simulation = simulate_scenario(polygons, scenario, seed)
+    model = make_model(polygons, scenario)
 
     fit = model.gibbs(
         simulation.catalog,
-        config=SPINHGibbsConfig(
-            n_iter=N_ITER,
-            thin=THIN,
-            mala_step=scenario["mala_step"],
-            verbose=VERBOSE,
-            verbose_every=VERBOSE_EVERY,
-            use_calibration=True,
-            beta_init=INITIAL_BETA,
-            theta_priors=THETA_PRIORS,
-            sigma_mh_etas=SIGMA_MH_ETAS,
-            sigma_mh_beta=SIGMA_MH_BETA,
-            adaptation_start=200,
-            proposal_jitter=1e-6,
-        ),
-        gp_backend="sparse" if USE_SPARSE_GP else "exact",
+        config=make_gibbs_config(scenario),
+        gp_backend=GP_BACKEND,
         rng_seed=seed,
     )
     summary = fit.summary(burn_in=BURN_IN)
@@ -366,7 +381,13 @@ def print_summary(records):
 def plot_recovery_summary(records):
     difficulties = [scenario["difficulty"] for scenario in SCENARIOS]
     labels = [scenario["name"].replace("_", "\n") for scenario in SCENARIOS]
-    fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.8), sharex=True)
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(16.0, 5.2),
+        sharex=True,
+        layout="constrained",
+    )
     for ax, (title, parameter_names) in zip(axes, PARAMETER_BLOCKS.items()):
         for name in parameter_names:
             values = []
@@ -386,7 +407,6 @@ def plot_recovery_summary(records):
         ax.legend()
     axes[0].set_ylabel("Mean absolute relative error (log scale)")
     fig.suptitle("SPIN-H posterior recovery across increasing difficulty")
-    fig.tight_layout()
     save_figure(fig, "package/experiment_5/posterior_recovery")
     plt.show()
     return fig
@@ -396,7 +416,7 @@ def main():
     print("Experiment 5 — SPIN-H posterior recovery")
     print(
         f"scenarios={len(SCENARIOS)}, realizations={N_REALIZATIONS}, "
-        f"n_iter={N_ITER}, thin={THIN}, sparse={USE_SPARSE_GP}, n_jobs={N_JOBS}"
+        f"n_iter={N_ITER}, thin={THIN}, gp_backend={GP_BACKEND}, n_jobs={N_JOBS}"
     )
     print({scenario["name"]: scenario["mala_step"] for scenario in SCENARIOS})
 
@@ -414,14 +434,28 @@ def main():
     if N_JOBS == 1:
         records = [
             run_realization(polygons, scenario, realization)
-            for scenario, realization in tasks
+            for scenario, realization in tqdm(
+                tasks,
+                desc="Experiment 5 realizations",
+                unit="run",
+                dynamic_ncols=True,
+            )
         ]
     else:
         if Parallel is None:
             raise ImportError("joblib is required when N_JOBS != 1.")
-        records = Parallel(n_jobs=N_JOBS)(
+        completed = Parallel(n_jobs=N_JOBS, return_as="generator")(
             delayed(run_realization)(polygons, scenario, realization)
             for scenario, realization in tasks
+        )
+        records = list(
+            tqdm(
+                completed,
+                total=len(tasks),
+                desc="Experiment 5 realizations",
+                unit="run",
+                dynamic_ncols=True,
+            )
         )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)

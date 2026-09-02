@@ -1,4 +1,5 @@
 import sys
+import time
 
 import numpy as np
 import openturns as ot
@@ -178,7 +179,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 step = np.array(
                     ot.Normal(
                         ot.Point(dim, 0.0),
-                        ot.CovarianceMatrix(cov.tolist()),
+                        ot.CovarianceMatrix(cov),
                     ).getRealization()
                 )
         else:
@@ -189,7 +190,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 step = np.array(
                     ot.Normal(
                         ot.Point(dim, 0.0),
-                        ot.CovarianceMatrix(cov.tolist()),
+                        ot.CovarianceMatrix(cov),
                     ).getRealization()
                 )
 
@@ -346,7 +347,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             t_arr = np.array([float(t[i]) for i in range(N)], dtype=float)
             x_arr = np.array([float(x[i]) for i in range(N)], dtype=float)
             y_arr = np.array([float(y[i]) for i in range(N)], dtype=float)
-            XY = ot.Sample(np.column_stack([x_arr, y_arr]).tolist())
+            XY = ot.Sample(np.column_stack([x_arr, y_arr]))
         mu_t = self.compute_mu_tilde(XY, eps=eps_arr)
         sig = expit(np.asarray(f_data, dtype=float))
         mu = mu_t * sig
@@ -804,7 +805,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         self._t_obs_arr = np.asarray([float(v) for v in t], dtype=float)
         self._x_obs_arr = np.asarray([float(v) for v in x], dtype=float)
         self._y_obs_arr = np.asarray([float(v) for v in y], dtype=float)
-        self._XY_obs = ot.Sample(np.column_stack([self._x_obs_arr, self._y_obs_arr]).tolist())
+        self._XY_obs = ot.Sample(np.column_stack([self._x_obs_arr, self._y_obs_arr]))
         self._compute_event_domain_indices(self._x_obs_arr, self._y_obs_arr)
         self._prepare_parent_candidates(parent_time_window)
         self._etas_dm = (self.m - self.m_c) if self.m is not None else np.zeros(N)
@@ -924,7 +925,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             GX, GY     = np.meshgrid(np.linspace(xmin, xmax, grid_nx),
                                       np.linspace(ymin, ymax, grid_ny))
             grid_x, grid_y = GX.ravel(), GY.ravel()
-            Xg          = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
+            Xg          = ot.Sample(np.column_stack([grid_x, grid_y]))
             M_grid      = len(grid_x)
             domain_area = (xmax - xmin) * (ymax - ymin)
             mu_star_grid = mu_star_func(grid_x, grid_y)
@@ -949,7 +950,14 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         si       = 0
 
         ae, an, ab = 0, 0, 0
+        branching_update_seconds = 0.0
         acc        = {"A_alpha": 0, "c_p": 0, "d_q_gamma": 0}
+        acceptance_history = {"eps": np.zeros(n_iter, dtype=bool)}
+        for block, free_names in free_etas_blocks.items():
+            if free_names:
+                acceptance_history[block] = np.zeros(n_iter, dtype=bool)
+        if sample_beta:
+            acceptance_history["beta"] = np.zeros(n_iter, dtype=bool)
         hnu, hAa, hcp, hdqg, hb = [], [], [], [], []
 
         if verbose:
@@ -1017,8 +1025,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                     idx_trig = [i for i in range(N) if float(Z[i]) != 0.0]
                     if idx_trig and idx0:
-                        XY_bg  = ot.Sample([[float(x[i]), float(y[i])] for i in idx0])
-                        XY_tr  = ot.Sample([[float(x[i]), float(y[i])] for i in idx_trig])
+                        XY_bg = ot.Sample(np.column_stack([self._x_obs_arr[idx0], self._y_obs_arr[idx0]]))
+                        XY_tr = ot.Sample(np.column_stack([self._x_obs_arr[idx_trig], self._y_obs_arr[idx_trig]]))
                         K_bg   = self.compute_kernel(XY_bg)
                         for ii in range(len(idx0)):
                             K_bg[ii, ii] += self.jitter
@@ -1033,6 +1041,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 # ── Step 4 : ε | f, π_S  (MALA) ────────────────────────────
                 N_j, M_j = self._count_events_per_zone(x, y, Z, Pi_S)
                 ea, ok   = self.update_eps(eps, N_j, M_j, step=mala_step)
+                acceptance_history["eps"][it] = ok
                 eps      = ot.Point(ea.tolist()); ae += int(ok)
 
                 # ── Step 5 : ν | f  (AM, optional) ─────────────────────────
@@ -1044,19 +1053,29 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                 # ── Step 6 : Z | f, ε, θ_φ ──────────────────────────────────
                 if sample_z:
+                    branching_started = time.perf_counter()
                     Z = self.update_Z(t, x, y, ea, f_data)
+                    branching_update_seconds += time.perf_counter() - branching_started
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
                 if free_etas_blocks["A_alpha"]:
-                    acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                    ok = self.update_A_alpha(t, x, y, Z, hAa, it)
+                    acceptance_history["A_alpha"][it] = ok
+                    acc["A_alpha"] += int(ok)
                 if free_etas_blocks["c_p"]:
-                    acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
+                    ok = self.update_c_p(t, x, y, Z, hcp, it)
+                    acceptance_history["c_p"][it] = ok
+                    acc["c_p"] += int(ok)
                 if free_etas_blocks["d_q_gamma"]:
-                    acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
+                    ok = self.update_d_q_gamma(t, x, y, Z, hdqg, it)
+                    acceptance_history["d_q_gamma"][it] = ok
+                    acc["d_q_gamma"] += int(ok)
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
                 if sample_beta:
-                    ab += int(self.update_beta(hb, it))
+                    ok = self.update_beta(hb, it)
+                    acceptance_history["beta"][it] = ok
+                    ab += int(ok)
 
                 # ── Verbose ───────────────────────────────────────────────────
                 if verbose and (it % verbose_every == 0 or it == n_iter - 1):
@@ -1094,17 +1113,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         grid_design = np.asarray(sparse_gp.regressorOT(Xg), dtype=float)
                         fg = grid_design @ np.asarray(gp_coeffs, dtype=float)
                     else:
-                        XY_bg_g = ot.Sample(np.column_stack([self._x_obs_arr[idx_bg], self._y_obs_arr[idx_bg]]).tolist())
+                        XY_bg_g = ot.Sample(np.column_stack([self._x_obs_arr[idx_bg], self._y_obs_arr[idx_bg]]))
                         f_bg_pt = ot.Point([float(f_data[i]) for i in idx_bg])
                         Kd, Kg, Kgg = self.compute_kernel(XY_bg_g, Xg)
                         Kr = ot.CovarianceMatrix(Kd)
                         for ii in range(len(idx_bg)): Kr[ii, ii] += self.jitter
                         alpha = Kr.solveLinearSystem(f_bg_pt)
                         mg   = np.array(Kg * alpha).flatten()
-                        solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T.tolist()))
+                        solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T))
                         S    = np.array(Kgg) - np.array(Kg * solved_cross)
                         S    = .5*(S+S.T) + self.jitter*np.eye(M_grid)
-                        S_cov = ot.CovarianceMatrix(S.tolist())
+                        S_cov = ot.CovarianceMatrix(S)
                         fg   = np.array(ot.Normal(ot.Point(mg.tolist()), S_cov).getRealization())
                     mt   = self.compute_mu_tilde(Xg, eps=ea)
                     Emu[it] = (domain_area/M_grid) * np.sum(
@@ -1160,6 +1179,13 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "acceptance_eps":   ae/n_iter,
             "acceptance_nu":    an/n_iter if learn_nu else None,
             "acceptance_beta":  ab/n_iter if sample_beta else None,
+            "acceptance_history": acceptance_history,
+            "proposal_steps": {
+                "mala_step": float(mala_step),
+                "sigma_mh_etas": float(self.sigma_MH_etas),
+                "sigma_mh_beta": float(self.sigma_MH_beta),
+                "adaptation_start": int(self.t0_etas),
+            },
             "acceptance_etas": {
                 k: (v / n_iter if free_etas_blocks[k] else None)
                 for k, v in acc.items()
@@ -1181,6 +1207,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "fixed_etas": dict(self.fixed_etas),
             "known_z": known_z_arr.copy() if known_z_arr is not None else None,
             "branching_truncation": self._branching_truncation_diagnostics,
+            "branching_update_seconds": float(branching_update_seconds),
             "am_history": {
                 "A_alpha":   np.array(hAa) if hAa else None,
                 "c_p":       np.array(hcp) if hcp else None,

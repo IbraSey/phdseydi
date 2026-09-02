@@ -18,6 +18,7 @@ corresponding parameter is learned. Parameters can still be fixed with
 """
 
 import sys
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1563,6 +1564,7 @@ class SPINHVI:
         previous_checkpoint = -np.inf
         converged = False
         iteration = -1
+        branching_update_seconds = 0.0
         has_free_etas = self.use_etas and bool(
             self._free_etas_factor_names(include_A=True)
         )
@@ -1584,7 +1586,9 @@ class SPINHVI:
             if self.config.update_polya_gamma:
                 self._update_polya_gamma()
             if self.use_etas and self.config.update_z:
+                branching_started = time.perf_counter()
                 self._update_branching()
+                branching_update_seconds += time.perf_counter() - branching_started
             if self.config.update_latent_poisson:
                 self._update_latent_poisson()
             if self.config.update_eps:
@@ -1668,6 +1672,7 @@ class SPINHVI:
             "use_calibration": self.config.use_calibration,
             "gp_prior_variance": self.model.gp_prior.variance,
             "gp_prior_length_scale": self.model.gp_prior.length_scale,
+            "branching_update_seconds": float(branching_update_seconds),
         }
         if self.parent_candidate_graph is not None:
             diagnostics["branching_truncation"] = {

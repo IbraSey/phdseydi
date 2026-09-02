@@ -149,7 +149,7 @@ class VIResults:
             coefficients_covariance = self.state.gp.coefficients_covariance
             if coefficients_mean is None or coefficients_covariance is None:
                 raise RuntimeError("The sparse variational GP factor is unavailable.")
-            points = ot.Sample(evaluation_xy.tolist())
+            points = ot.Sample(evaluation_xy)
             design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
             coefficient_draws = self._gaussian_draws(
                 coefficients_mean,
@@ -673,12 +673,12 @@ class GibbsResults(Mapping):
 
         observed_array = np.column_stack([x_obs, y_obs])
         evaluation_array = np.column_stack([x_eval, y_eval])
-        all_points = ot.Sample(np.vstack([observed_array, evaluation_array]).tolist())
+        all_points = ot.Sample(np.vstack([observed_array, evaluation_array]))
         covariance = np.asarray(kernel.discretize(all_points), dtype=float)
-        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
+        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs])
         for index in range(n_obs):
             K_obs[index, index] += self.model.jitter
-        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
+        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs])
         alpha_gp = K_obs.solveLinearSystem(ot.Point(f_obs.tolist()))
         return np.asarray(K_eval_obs * alpha_gp, dtype=float).reshape(-1)
 
@@ -742,7 +742,7 @@ class GibbsResults(Mapping):
                     0, available_indices.size - 1, int(n_samples)
                 ).round().astype(int)
                 draw_indices = available_indices[positions]
-                points = ot.Sample(np.column_stack([x_flat, y_flat]).tolist())
+                points = ot.Sample(np.column_stack([x_flat, y_flat]))
                 design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
                 samples = np.empty((x_flat.size, draw_indices.size), dtype=float)
                 for column, index in enumerate(draw_indices):
@@ -762,14 +762,14 @@ class GibbsResults(Mapping):
         nu0, nu1 = map(float, np.asarray(summary["nu_hat"]).reshape(-1))
         kernel = ot.SquaredExponential([nu1, nu1], [np.sqrt(nu0)])
         all_points = ot.Sample(
-            np.vstack([self.catalog.xy, evaluation_xy]).tolist()
+            np.vstack([self.catalog.xy, evaluation_xy])
         )
         covariance = np.asarray(kernel.discretize(all_points), dtype=float)
         n_obs = len(self.catalog)
-        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs].tolist())
+        K_obs = ot.CovarianceMatrix(covariance[:n_obs, :n_obs])
         for index in range(n_obs):
             K_obs[index, index] += self.model.jitter
-        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs].tolist())
+        K_eval_obs = ot.Matrix(covariance[n_obs:, :n_obs])
         K_eval = covariance[n_obs:, n_obs:]
 
         f_data_hat = ot.Point(np.asarray(summary["f_data_hat"]).tolist())
@@ -777,7 +777,7 @@ class GibbsResults(Mapping):
             K_eval_obs * K_obs.solveLinearSystem(f_data_hat), dtype=float
         ).reshape(-1)
         solved_cross = K_obs.solveLinearSystem(
-            ot.Matrix(np.asarray(K_eval_obs).T.tolist())
+            ot.Matrix(np.asarray(K_eval_obs).T)
         )
         conditional_covariance = K_eval - np.asarray(K_eval_obs * solved_cross)
         conditional_covariance = 0.5 * (
@@ -792,7 +792,7 @@ class GibbsResults(Mapping):
                     (
                         conditional_covariance
                         + jitter * np.eye(x_flat.size)
-                    ).tolist()
+                    )
                 )
                 latent_samples = np.asarray(
                     ot.Normal(
@@ -865,7 +865,7 @@ class GibbsResults(Mapping):
         if sparse_gp is not None and gp_coeffs is not None:
             gp_coeffs = np.asarray(gp_coeffs, dtype=float)
             if gp_coeffs.size:
-                points = ot.Sample(np.column_stack([x_flat, y_flat]).tolist())
+                points = ot.Sample(np.column_stack([x_flat, y_flat]))
                 design = np.asarray(sparse_gp.regressorOT(points), dtype=float)
                 mu_sum = np.zeros(np.asarray(x_flat).size, dtype=float)
                 for index in draw_indices:

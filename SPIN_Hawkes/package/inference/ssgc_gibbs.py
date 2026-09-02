@@ -121,7 +121,7 @@ class SSGC_GibbsSampler:
 
         self.centroids_xy, self.Sigma_eps = self.compute_Sigma_eps()
         Sigma_eps_reg = ot.CovarianceMatrix(
-            (self.Sigma_eps + self.jitter * np.eye(self.J)).tolist()
+            self.Sigma_eps + self.jitter * np.eye(self.J)
         )
         self.Sigma_eps_cov = Sigma_eps_reg
 
@@ -222,7 +222,7 @@ class SSGC_GibbsSampler:
         sigma_amp = np.sqrt(nu0)      # OT attend sigma, pas sigma^2
 
         if not isinstance(XY_data, ot.Sample):
-            XY_data = ot.Sample(np.asarray(XY_data).tolist())
+            XY_data = ot.Sample(np.asarray(XY_data))
         N_data = XY_data.getSize()
         XY_data_arr = np.asarray(XY_data)
 
@@ -230,10 +230,10 @@ class SSGC_GibbsSampler:
 
         if XY_new is None:
             K = kernel.discretize(XY_data)
-            return ot.CovarianceMatrix(np.array(K).tolist())
+            return ot.CovarianceMatrix(K)
 
         if not isinstance(XY_new, ot.Sample):
-            XY_new = ot.Sample(np.asarray(XY_new).tolist())
+            XY_new = ot.Sample(np.asarray(XY_new))
         N_new = XY_new.getSize()
         XY_new_arr = np.asarray(XY_new)
 
@@ -247,9 +247,9 @@ class SSGC_GibbsSampler:
 
         K_all = np.asarray(kernel.discretize(XY_all), dtype=float)
 
-        K_dd = ot.CovarianceMatrix(K_all[:N_data, :N_data].tolist())
-        K_new_data = ot.Matrix(K_all[N_data:, :N_data].tolist())
-        K_new_new = ot.CovarianceMatrix(K_all[N_data:, N_data:].tolist())
+        K_dd = ot.CovarianceMatrix(K_all[:N_data, :N_data])
+        K_new_data = ot.Matrix(K_all[N_data:, :N_data])
+        K_new_new = ot.CovarianceMatrix(K_all[N_data:, N_data:])
 
         return K_dd, K_new_data, K_new_new
 
@@ -574,10 +574,11 @@ class SSGC_GibbsSampler:
         K_arr = np.array(K_ff)
         Omega_arr = np.array(Omega)
         left_arr = np.eye(N_f) + K_arr @ Omega_arr
-        left = ot.Matrix(left_arr.tolist())
-        Sigma_arr = np.array(left.solveLinearSystem(ot.Matrix(K_arr.tolist())))
+        # Pass arrays directly: nested lists leak memory with OpenTURNS 1.27.
+        left = ot.Matrix(left_arr)
+        Sigma_arr = np.array(left.solveLinearSystem(ot.Matrix(K_arr)))
         Sigma_arr = 0.5 * (Sigma_arr + Sigma_arr.T) + self.jitter * np.eye(N_f)
-        Sigma_post = ot.CovarianceMatrix(Sigma_arr.tolist())
+        Sigma_post = ot.CovarianceMatrix(Sigma_arr)
         mu_post = left.solveLinearSystem(K_ff * kappa)
 
         # 8) Tirage sur D_f entier
@@ -626,7 +627,7 @@ class SSGC_GibbsSampler:
                             break
             candidates.extend(accepted)
 
-        return ot.Sample(candidates) if candidates else ot.Sample(0, 2)
+        return ot.Sample(np.asarray(candidates)) if candidates else ot.Sample(0, 2)
 
     @staticmethod
     def _validate_sparse_gp(sparse_gp):
@@ -668,13 +669,13 @@ class SSGC_GibbsSampler:
         if not idx_bg:
             raise ValueError("No background event is available for the sparse GP update.")
 
-        D0 = ot.Sample([[float(x[i]), float(y[i])] for i in idx_bg])
+        D0 = ot.Sample(np.column_stack([x, y])[idx_bg])
         phi_bg = np.asarray(sparse_gp.regressorOT(D0), dtype=float)
         omega_bg = np.asarray([float(omega_D0[i]) for i in idx_bg], dtype=float)
 
         n_pi = Pi_S.getSize()
         if n_pi:
-            pi_xy = ot.Sample([[float(Pi_S[i, 0]), float(Pi_S[i, 1])] for i in range(n_pi)])
+            pi_xy = ot.Sample(np.asarray(Pi_S)[:, :2])
             phi_pi = np.asarray(sparse_gp.regressorOT(pi_xy), dtype=float)
             omega_pi = np.asarray([float(Pi_S[i, 2]) for i in range(n_pi)], dtype=float)
             design = np.vstack([phi_bg, phi_pi])
@@ -690,14 +691,14 @@ class SSGC_GibbsSampler:
             raise ValueError(f"regressorOT returned {design.shape[1]} columns, expected sparse_gp.m={m}.")
         precision = np.eye(m) + design.T @ (omega[:, None] * design)
         precision = 0.5 * (precision + precision.T) + self.jitter * np.eye(m)
-        precision_ot = ot.CovarianceMatrix(precision.tolist())
+        precision_ot = ot.CovarianceMatrix(precision)
         rhs = ot.Point((design.T @ kappa).tolist())
         mean = precision_ot.solveLinearSystem(rhs)
         covariance = np.asarray(
-            precision_ot.solveLinearSystem(ot.Matrix(np.eye(m).tolist())), dtype=float
+            precision_ot.solveLinearSystem(ot.Matrix(np.eye(m))), dtype=float
         )
         covariance = 0.5 * (covariance + covariance.T) + self.jitter * np.eye(m)
-        return ot.Normal(mean, ot.CovarianceMatrix(covariance.tolist())).getRealization()
+        return ot.Normal(mean, ot.CovarianceMatrix(covariance)).getRealization()
 
     def sample_Pi_S_sparse(self, eps, sparse_gp, gp_coeffs):
         """Sample ``Pi_S`` using a sparse basis representation of the GP."""
@@ -720,7 +721,7 @@ class SSGC_GibbsSampler:
             random_state=self.rng,
         )
         values = np.column_stack([np.asarray(XY_cand)[mask], omega])
-        return ot.Sample(values.tolist())
+        return ot.Sample(values)
 
     def sample_Pi_S(self, x, y, f_data, eps):
         """Sample the latent marked thinned Poisson process ``Pi_S``.
@@ -750,7 +751,7 @@ class SSGC_GibbsSampler:
         
         """
         N = len(x)
-        XY_data = ot.Sample([[x[i], y[i]] for i in range(N)])
+        XY_data = ot.Sample(np.column_stack([x, y]))
         XY_cand = self._sample_poisson_envelope(eps)
         N_cand = XY_cand.getSize()
         if N_cand == 0:
@@ -765,7 +766,7 @@ class SSGC_GibbsSampler:
         alpha = K_dd_reg.solveLinearSystem(f_data_pt)
         mu_star = K_star_d * alpha
 
-        K_star_d_t = ot.Matrix(np.array(K_star_d).T.tolist())
+        K_star_d_t = ot.Matrix(np.array(K_star_d).T)
         solved_cross = K_dd_reg.solveLinearSystem(K_star_d_t)
 
         Sigma_arr = (
@@ -773,7 +774,7 @@ class SSGC_GibbsSampler:
             - np.array(K_star_d * solved_cross)
         )
         Sigma_arr = 0.5 * (Sigma_arr + Sigma_arr.T) + self.jitter * np.eye(N_cand)
-        Sigma_star = ot.CovarianceMatrix(Sigma_arr.tolist())
+        Sigma_star = ot.CovarianceMatrix(Sigma_arr)
 
         f_star = ot.Normal(mu_star, Sigma_star).getRealization()
 
@@ -834,25 +835,33 @@ class SSGC_GibbsSampler:
         """
         eps_arr = np.array(eps)
 
-        # MALA proposaal
+        # Reject numerical overflow in a proposal, never an invalid current state.
         grad_cur  = self._grad_log_posterior_eps(eps_arr, N_j, M_j)
+        log_p_cur = self._log_posterior_eps(eps_arr, N_j, M_j)
+        if not np.all(np.isfinite(grad_cur)) or not np.isfinite(log_p_cur):
+            raise FloatingPointError("Non-finite current state in the MALA update.")
         eta = np.array(ot.Normal(self.J).getRealization())
         eps_star = eps_arr + 0.5 * step**2 * grad_cur + step * eta
-
-        grad_star = self._grad_log_posterior_eps(eps_star, N_j, M_j)
-        log_p_cur  = self._log_posterior_eps(eps_arr, N_j, M_j)
-        log_p_star = self._log_posterior_eps(eps_star, N_j, M_j)
+        if not np.all(np.isfinite(eps_star)):
+            return eps_arr, False
+        with np.errstate(over="ignore", invalid="ignore"):
+            grad_star = self._grad_log_posterior_eps(eps_star, N_j, M_j)
+            log_p_star = self._log_posterior_eps(eps_star, N_j, M_j)
+        if not np.all(np.isfinite(grad_star)) or not np.isfinite(log_p_star):
+            return eps_arr, False
 
         diff_fwd = eps_star - eps_arr - 0.5 * step**2 * grad_cur
         diff_bwd = eps_arr - eps_star - 0.5 * step**2 * grad_star 
 
-        # Ratio d'Hasrtings
-        log_q_ratio = (
-            - 0.5 / step**2 * np.dot(diff_bwd, diff_bwd)
-            + 0.5 / step**2 * np.dot(diff_fwd, diff_fwd)
-        )
-
-        log_alpha = min(0.0, (log_p_star - log_p_cur) + log_q_ratio)
+        with np.errstate(over="ignore", invalid="ignore"):
+            log_q_ratio = (
+                - 0.5 / step**2 * np.dot(diff_bwd, diff_bwd)
+                + 0.5 / step**2 * np.dot(diff_fwd, diff_fwd)
+            )
+            log_ratio = (log_p_star - log_p_cur) + log_q_ratio
+        if not np.isfinite(log_ratio):
+            return eps_arr, False
+        log_alpha = min(0.0, log_ratio)
 
         if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < log_alpha:
             return eps_star, True
@@ -913,7 +922,7 @@ class SSGC_GibbsSampler:
             proposal_cov = step_nu_init * np.eye(2)
  
         # --- Proposal on log scale ---
-        log_nu_star = log_nu_cur + np.array(ot.Normal(ot.Point(2, 0.0), ot.CovarianceMatrix(proposal_cov.tolist())).getRealization())
+        log_nu_star = log_nu_cur + np.array(ot.Normal(ot.Point(2, 0.0), ot.CovarianceMatrix(proposal_cov)).getRealization())
  
         # Reject out-of-support proposals instead of clipping them.
         # v^2 in (1e-6, 10),  l in (1e-4, 20)
@@ -1017,7 +1026,7 @@ class SSGC_GibbsSampler:
             np.asarray([float(v) for v in x]),
             np.asarray([float(v) for v in y]),
         ])
-        sample_ot = ot.Sample(obs_pts.tolist())
+        sample_ot = ot.Sample(obs_pts)
         kde = ot.KernelSmoothing().build(sample_ot)
         p_hat = np.asarray(kde.computePDF(sample_ot), dtype=float).reshape(-1)
         
@@ -1025,7 +1034,7 @@ class SSGC_GibbsSampler:
             gx = np.linspace(self.X_bounds[0], self.X_bounds[1], 80)
             gy = np.linspace(self.Y_bounds[0], self.Y_bounds[1], 80)
             GX, GY = np.meshgrid(gx, gy)
-            grid = ot.Sample(np.column_stack([GX.ravel(), GY.ravel()]).tolist())
+            grid = ot.Sample(np.column_stack([GX.ravel(), GY.ravel()]))
             density = np.asarray(kde.computePDF(grid), dtype=float).reshape(GX.shape)
             fig, ax = plt.subplots(figsize=(6, 5), layout="constrained")
             contour = ax.pcolormesh(
@@ -1060,7 +1069,7 @@ class SSGC_GibbsSampler:
         )
         fitter = ot.GaussianProcessFitter(
             sample_ot,
-            ot.Sample(target.reshape(-1, 1).tolist()),
+            ot.Sample(target.reshape(-1, 1)),
             covariance_model,
             basis,
         )
@@ -1204,7 +1213,7 @@ class SSGC_GibbsSampler:
             if learn_nu:
                 raise ValueError("learn_nu=True is not supported with gp_backend='sparse'.")
             gp_coeffs = ot.Point(int(sparse_gp.m), 0.0)
-            XY_observed = ot.Sample([[float(x[i]), float(y[i])] for i in range(N)])
+            XY_observed = ot.Sample(np.column_stack([x, y]))
             sparse_design_observed = np.asarray(sparse_gp.regressorOT(XY_observed), dtype=float)
         else:
             gp_coeffs = None
@@ -1234,7 +1243,7 @@ class SSGC_GibbsSampler:
             GX, GY = np.meshgrid(gx, gy)
             grid_x = GX.ravel()
             grid_y = GY.ravel()
-            XY_grid = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
+            XY_grid = ot.Sample(np.column_stack([grid_x, grid_y]))
             M_grid = len(grid_x)
             domain_area = (xmax - xmin) * (ymax - ymin)
             mu_star_grid = mu_star_func(grid_x, grid_y)
@@ -1360,7 +1369,7 @@ class SSGC_GibbsSampler:
                         grid_design = np.asarray(sparse_gp.regressorOT(XY_grid), dtype=float)
                         f_draw_g = grid_design @ np.asarray(gp_coeffs, dtype=float)
                     else:
-                        XY_data_ot = ot.Sample([[x[i], y[i]] for i in range(N)])
+                        XY_data_ot = ot.Sample(np.column_stack([x, y]))
                         K_dd, K_gd, K_gg = self.compute_kernel(XY_data_ot, XY_grid)
                         K_dd_reg = ot.CovarianceMatrix(K_dd)
                         for ii in range(N):
@@ -1369,11 +1378,11 @@ class SSGC_GibbsSampler:
                         alpha = K_dd_reg.solveLinearSystem(f_data_pt)
                         mu_g = np.array(K_gd * alpha).flatten()
                         solved_cross = K_dd_reg.solveLinearSystem(
-                            ot.Matrix(np.array(K_gd).T.tolist())
+                            ot.Matrix(np.array(K_gd).T)
                         )
                         Sigma_g = np.array(K_gg) - np.array(K_gd * solved_cross)
                         Sigma_g = 0.5 * (Sigma_g + Sigma_g.T) + self.jitter * np.eye(M_grid)
-                        Sigma_g_cov = ot.CovarianceMatrix(Sigma_g.tolist())
+                        Sigma_g_cov = ot.CovarianceMatrix(Sigma_g)
                         f_draw_g = np.array(
                             ot.Normal(ot.Point(mu_g.tolist()), Sigma_g_cov).getRealization()
                         )
