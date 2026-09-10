@@ -10,12 +10,35 @@ import numpy as np
 import openturns as ot
 from matplotlib.colors import LogNorm
 from scipy.special import expit, log_expit
+from scipy.stats import gaussian_kde
 
 from package.config import ETASParameters
 from data.catalog import EventCatalog
 from .backends import SparseGP
 from ..models.ssgc import SSGCModel
 from visualization import plot_field, save_figure
+
+
+SPINH_POSTERIOR_PARAMETERS = (
+    "beta",
+    "A",
+    "alpha",
+    "c",
+    "p",
+    "d",
+    "q",
+    "gamma",
+)
+_SPINH_PARAMETER_LABELS = {
+    "beta": r"$\beta$",
+    "A": r"$A$",
+    "alpha": r"$\alpha$",
+    "c": r"$c$",
+    "p": r"$p$",
+    "d": r"$d$",
+    "q": r"$q$",
+    "gamma": r"$\gamma$",
+}
 
 
 def _positive_integer(name, value, *, minimum=1) -> int:
@@ -68,6 +91,64 @@ class VIResults:
         return {
             name: factor.as_dict()
             for name, factor in self.state.etas.gamma_factors.items()
+        }
+
+    def etas_parameter_samples(
+        self,
+        n_samples: int = 500,
+        rng_seed: int | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Draw ETAS parameters from the classical mean-field Gamma factors."""
+        self._require_etas("ETAS posterior sampling")
+        n_samples = _positive_integer("n_samples", n_samples)
+        if rng_seed is not None:
+            rng_seed = _positive_integer("rng_seed", rng_seed, minimum=0)
+        rng = np.random.default_rng(rng_seed)
+        factor_draws = {
+            name: rng.gamma(factor.shape, 1.0 / factor.rate, size=n_samples)
+            for name, factor in self.state.etas.gamma_factors.items()
+        }
+        shifted = {"p": "p_minus_1", "q": "q_minus_1"}
+        samples = {}
+        for name in self.state.etas.parameters_mean.as_dict():
+            if name in self.state.etas.fixed_etas:
+                values = np.full(n_samples, self.state.etas.fixed_etas[name])
+            else:
+                values = factor_draws[shifted.get(name, name)].copy()
+                if name in shifted:
+                    values += 1.0
+            samples[name] = values
+        return samples
+
+    def posterior_parameter_samples(
+        self,
+        n_samples: int = 500,
+        rng_seed: int | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Draw all available marked SPIN-H scalar parameters from q."""
+        if rng_seed is not None:
+            rng_seed = _positive_integer("rng_seed", rng_seed, minimum=0)
+        child_seeds = np.random.SeedSequence(rng_seed).spawn(2)
+        etas_seed = int(child_seeds[0].generate_state(1)[0])
+        beta_seed = int(child_seeds[1].generate_state(1)[0])
+        samples = self.etas_parameter_samples(n_samples, etas_seed)
+        beta = self.beta_mean()
+        if beta is None:
+            return samples
+        factor = self.state.etas.beta_gamma
+        if factor is None:
+            samples["beta"] = np.full(n_samples, beta)
+        else:
+            rng = np.random.default_rng(beta_seed)
+            samples["beta"] = rng.gamma(
+                factor.shape,
+                1.0 / factor.rate,
+                size=n_samples,
+            )
+        return {
+            name: samples[name]
+            for name in SPINH_POSTERIOR_PARAMETERS
+            if name in samples
         }
 
     def beta_gamma_parameters(self) -> dict | None:
@@ -572,6 +653,11 @@ class GibbsResults(Mapping):
         return np.asarray(self.raw["eps"])
 
     @property
+    def eps_diagnostic_chain(self) -> np.ndarray:
+        """Return the unthinned epsilon trace when available."""
+        return np.asarray(self.raw.get("eps_trace", self.raw["eps"]))
+
+    @property
     def latent_point_counts(self) -> np.ndarray:
         return np.asarray(self.raw["nPi"])
 
@@ -589,6 +675,74 @@ class GibbsResults(Mapping):
     def beta_chain(self) -> np.ndarray | None:
         values = self.raw.get("beta")
         return None if values is None else np.asarray(values)
+
+    @property
+    def etas_diagnostic_chain(self) -> np.ndarray | None:
+        """Return the unthinned ETAS trace when available."""
+        values = self.raw.get("theta_phi_trace", self.raw.get("theta_phi"))
+        return None if values is None else np.asarray(values)
+
+    @property
+    def beta_diagnostic_chain(self) -> np.ndarray | None:
+        """Return the unthinned beta trace when available."""
+        values = self.raw.get("beta_trace", self.raw.get("beta"))
+        return None if values is None else np.asarray(values)
+
+    def posterior_parameter_samples(
+        self,
+        n_samples: int | None = None,
+        rng_seed: int | None = None,
+        burn_in: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Return post-burn-in draws of all available SPIN-H parameters.
+
+        ``n_samples`` is an optional upper bound. When fewer draws are
+        requested, the chain is subsampled without replacement.
+        """
+        theta = self.etas_diagnostic_chain
+        if theta is None:
+            raise TypeError("SPIN-H posterior sampling requires an ETAS Gibbs fit.")
+        if theta.ndim != 2 or theta.shape[0] == 0:
+            raise ValueError("The stored ETAS chain is empty or malformed.")
+        if rng_seed is not None:
+            rng_seed = _positive_integer("rng_seed", rng_seed, minimum=0)
+        names = tuple(self.raw.get("theta_phi_names") or ())
+        if len(names) != theta.shape[1]:
+            defaults = (
+                ("A", "alpha", "c", "p", "d", "q", "gamma")
+                if theta.shape[1] == 7
+                else ("A", "c", "p", "d", "q")
+            )
+            names = defaults[: theta.shape[1]]
+        burn = self._burn_index(theta.shape[0], burn_in)
+        indices = np.arange(burn, theta.shape[0])
+        if n_samples is not None:
+            n_samples = _positive_integer("n_samples", n_samples)
+            if n_samples < indices.size:
+                if rng_seed is None:
+                    positions = np.linspace(0, indices.size - 1, n_samples).round().astype(int)
+                    indices = indices[np.unique(positions)]
+                else:
+                    indices = np.sort(
+                        np.random.default_rng(rng_seed).choice(
+                            indices, size=n_samples, replace=False
+                        )
+                    )
+        samples = {
+            name: np.asarray(theta[indices, column], dtype=float)
+            for column, name in enumerate(names)
+        }
+        beta = self.beta_diagnostic_chain
+        if beta is not None:
+            beta = np.asarray(beta, dtype=float).reshape(-1)
+            if beta.size != theta.shape[0]:
+                raise ValueError("The stored beta and ETAS chains are not aligned.")
+            samples["beta"] = beta[indices]
+        return {
+            name: samples[name]
+            for name in SPINH_POSTERIOR_PARAMETERS
+            if name in samples
+        }
 
     @property
     def acceptance_rates(self) -> dict:
@@ -612,11 +766,14 @@ class GibbsResults(Mapping):
     def summary(self, burn_in: float | None = None) -> dict:
         """Compute posterior mean estimates from stored Gibbs chains."""
         eps_chain = np.asarray(self.raw["eps"])
+        eps_diagnostic_chain = self.eps_diagnostic_chain
         f_chain = np.asarray(self.raw["f_data"])
         nu_chain = np.asarray(self.raw["nu"])
         burn = self._burn_index(eps_chain.shape[0], burn_in)
         summary = {
-            "eps_hat": eps_chain[burn:].mean(axis=0),
+            "eps_hat": eps_diagnostic_chain[
+                self._burn_index(eps_diagnostic_chain.shape[0], burn_in):
+            ].mean(axis=0),
             "f_data_hat": f_chain[burn:].mean(axis=0),
             "nu_hat": nu_chain[burn:].mean(axis=0),
         }
@@ -627,18 +784,21 @@ class GibbsResults(Mapping):
                 summary["gp_coeffs_hat"] = gp_coeffs[burn:].mean(axis=0)
 
         if self.raw.get("use_etas", False) and self.raw.get("theta_phi") is not None:
-            theta_chain = np.asarray(self.raw["theta_phi"])
+            theta_chain = self.etas_diagnostic_chain
             names = self.raw.get("theta_phi_names", [])
             if not names:
                 names = ["A", "alpha", "c", "p", "d", "q", "gamma"][:theta_chain.shape[1]]
+            theta_burn = self._burn_index(theta_chain.shape[0], burn_in)
             summary["theta_phi_hat"] = {
-                name: theta_chain[burn:, index].mean()
+                name: theta_chain[theta_burn:, index].mean()
                 for index, name in enumerate(names)
             }
             summary["p_background"] = self.background_probabilities(burn_in)
 
         if self.raw.get("beta") is not None:
-            summary["beta_hat"] = np.asarray(self.raw["beta"])[burn:].mean()
+            beta_chain = self.beta_diagnostic_chain
+            beta_burn = self._burn_index(beta_chain.shape[0], burn_in)
+            summary["beta_hat"] = beta_chain[beta_burn:].mean()
         return summary
 
     def background_probabilities(self, burn_in: float | None = None) -> np.ndarray:
@@ -1478,7 +1638,7 @@ class GibbsResults(Mapping):
             raise ValueError("burn_in must be in [0, 1).")
 
         if self.etas_chain is not None:
-            chain = self.etas_chain
+            chain = self.etas_diagnostic_chain
             names = self.raw.get("theta_phi_names", [])
             chains = [(name, chain[:, index]) for index, name in enumerate(names)]
             if (
@@ -1487,14 +1647,14 @@ class GibbsResults(Mapping):
                     "sample_beta", self.raw.get("acceptance_beta") is not None
                 )
             ):
-                chains.append(("beta", np.asarray(self.raw["beta"])))
+                chains.append(("beta", self.beta_diagnostic_chain))
             tex = {
                 "A": r"$A$", "alpha": r"$\alpha$", "c": r"$c$", "p": r"$p$",
                 "d": r"$d$", "q": r"$q$", "gamma": r"$\gamma$", "beta": r"$\beta$",
             }
             title_savefig = title_savefig or "traces_etas"
         else:
-            eps_chain = self.eps_chain
+            eps_chain = self.eps_diagnostic_chain
             chains = [
                 (rf"$\varepsilon_{{{j}}}$", eps_chain[:, j])
                 for j in range(eps_chain.shape[1])
@@ -1509,7 +1669,7 @@ class GibbsResults(Mapping):
             tex = {"beta": r"$\beta$"}
             title_savefig = title_savefig or "traces_eps"
 
-        thin = self.raw.get("thin", 1)
+        thin = 1 if self.raw.get("theta_phi_trace") is not None else self.raw.get("thin", 1)
         n_store = len(chains[0][1]) if chains else 0
         burn = int(n_store * burn_in)
         iters = np.arange(n_store) * thin
@@ -1585,37 +1745,44 @@ class GibbsResults(Mapping):
         figsize=(8, 6),
         savefigure=False,
         title_savefig="trace_acf",
+        etas_only=False,
     ):
         """Plot post-burn-in autocorrelations for the stored Gibbs chains."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         if not 0.0 <= burn_in < 1.0:
             raise ValueError("burn_in must be in [0, 1).")
-        eps_chain = self.eps_chain
-        burn = int(burn_in * eps_chain.shape[0])
-        n_post = eps_chain.shape[0] - burn
+        diagnostic_etas = self.etas_diagnostic_chain
+        base_chain = diagnostic_etas if diagnostic_etas is not None else self.eps_diagnostic_chain
+        burn = int(burn_in * base_chain.shape[0])
+        n_post = base_chain.shape[0] - burn
         max_lag = min(int(max_lag), n_post - 1)
         if max_lag < 1:
             print(f"[plot_acf] Not enough post-burn-in draws ({n_post}).")
             return None
 
-        plots = [
-            (rf"$\varepsilon_{{{j}}}$", eps_chain[burn:, j])
-            for j in range(eps_chain.shape[1])
-        ]
-        if self.raw.get("acceptance_nu") is not None:
+        plots = []
+        if not (etas_only and diagnostic_etas is not None):
+            eps_chain = self.eps_diagnostic_chain
+            eps_burn = int(burn_in * eps_chain.shape[0])
+            plots.extend([
+                (rf"$\varepsilon_{{{j}}}$", eps_chain[eps_burn:, j])
+                for j in range(eps_chain.shape[1])
+            ])
+        if not etas_only and self.raw.get("acceptance_nu") is not None:
             nu_chain = np.asarray(self.raw["nu"])
-            plots.extend([(r"$v^2$", nu_chain[burn:, 0]), (r"$\ell$", nu_chain[burn:, 1])])
-        if self.etas_chain is not None:
+            nu_burn = int(burn_in * nu_chain.shape[0])
+            plots.extend([(r"$v^2$", nu_chain[nu_burn:, 0]), (r"$\ell$", nu_chain[nu_burn:, 1])])
+        if diagnostic_etas is not None:
             names = self.raw.get("theta_phi_names", [])
             for index, name in enumerate(names):
-                plots.append((name, self.etas_chain[burn:, index]))
+                plots.append((name, diagnostic_etas[burn:, index]))
         if (
             self.beta_chain is not None
             and self.raw.get(
                 "sample_beta", self.raw.get("acceptance_beta") is not None
             )
         ):
-            plots.append((r"$\beta$", self.beta_chain[burn:]))
+            plots.append((r"$\beta$", self.beta_diagnostic_chain[burn:]))
 
         fig, axes = plt.subplots(
             len(plots),
@@ -1625,7 +1792,12 @@ class GibbsResults(Mapping):
             layout="constrained",
         )
         lags = np.arange(max_lag + 1)
-        thin = self.raw.get("thin", 1)
+        thin = (
+            1
+            if self.raw.get("theta_phi_trace") is not None
+            or self.raw.get("eps_trace") is not None
+            else self.raw.get("thin", 1)
+        )
         for ax, (label, chain) in zip(axes[:, 0], plots):
             values = self._acf(chain, max_lag)
             ax.plot(lags[:len(values)], values)
@@ -1847,3 +2019,279 @@ class GibbsResults(Mapping):
             })
 
         return diagnostics
+
+
+def _collect_spinh_parameter_samples(
+    posterior,
+    *,
+    n_samples: int,
+    burn_in: float | None,
+    rng_seed: int,
+) -> dict[str, np.ndarray]:
+    """Normalize one result, several chains/fits, or an explicit sample map."""
+    if isinstance(posterior, Mapping) and not isinstance(posterior, GibbsResults):
+        collected = {
+            str(name): np.asarray(values, dtype=float).reshape(-1)
+            for name, values in posterior.items()
+        }
+    else:
+        fits = posterior if isinstance(posterior, (list, tuple)) else (posterior,)
+        if not fits:
+            raise ValueError("A posterior collection cannot be empty.")
+        chunks = []
+        per_fit = max(1, int(np.ceil(n_samples / len(fits))))
+        for index, fit in enumerate(fits):
+            if isinstance(fit, GibbsResults):
+                chunks.append(
+                    fit.posterior_parameter_samples(
+                        n_samples=None,
+                        burn_in=burn_in,
+                    )
+                )
+            elif isinstance(fit, VIResults):
+                chunks.append(
+                    fit.posterior_parameter_samples(
+                        n_samples=per_fit,
+                        rng_seed=rng_seed + index,
+                    )
+                )
+            else:
+                raise TypeError(
+                    "Each posterior must be GibbsResults, VIResults, or a sample mapping."
+                )
+        common = set(chunks[0]).intersection(*(set(chunk) for chunk in chunks[1:]))
+        collected = {
+            name: np.concatenate([chunk[name] for chunk in chunks])
+            for name in common
+        }
+
+    rng = np.random.default_rng(rng_seed)
+    normalized = {}
+    for name, values in collected.items():
+        values = np.asarray(values, dtype=float).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError(f"Posterior samples for {name!r} contain no finite values.")
+        if values.size > n_samples:
+            values = values[
+                np.sort(rng.choice(values.size, size=n_samples, replace=False))
+            ]
+        normalized[name] = values
+    return normalized
+
+
+def plot_spinh_parameter_marginals(
+    posteriors,
+    *,
+    reference_posterior=None,
+    reference_label="Reference posterior",
+    true_parameters=None,
+    true_beta=None,
+    parameters=SPINH_POSTERIOR_PARAMETERS,
+    n_samples=4000,
+    burn_in: float | None = None,
+    rng_seed=0,
+    figsize=(12, 6),
+    title=None,
+    savefigure=False,
+    title_savefig="spinh_parameter_marginals",
+    output_dir=None,
+    show=True,
+):
+    """Compare Gibbs and mean-field VI marginals for SPIN-H parameters.
+
+    Parameters
+    ----------
+    posteriors : mapping
+        Display label mapped to a :class:`GibbsResults`, :class:`VIResults`,
+        sequence of such results, or ``{parameter: samples}`` mapping.
+    reference_posterior : result, sequence or sample mapping, optional
+        Numerical reference displayed in black. In simulation studies this is
+        commonly a sufficiently converged exact-GP Gibbs fit; it is not an
+        analytically known posterior.
+    true_parameters : ETASParameters or mapping, optional
+        Generating parameter values, displayed as dotted vertical lines.
+    true_beta : float, optional
+        Generating Gutenberg--Richter rate.
+
+    Returns
+    -------
+    dict
+        Figure, axes, plotted samples, reference samples, truth and saved path.
+    """
+    if not isinstance(posteriors, Mapping) or not posteriors:
+        raise ValueError("posteriors must be a non-empty label-to-posterior mapping.")
+    n_samples = _positive_integer("n_samples", n_samples)
+    rng_seed = _positive_integer("rng_seed", rng_seed, minimum=0)
+    parameters = tuple(parameters)
+    unknown = set(parameters).difference(SPINH_POSTERIOR_PARAMETERS)
+    if unknown or not parameters:
+        raise ValueError(
+            "parameters must be a non-empty subset of "
+            f"{SPINH_POSTERIOR_PARAMETERS}; got {sorted(unknown)}."
+        )
+
+    samples = {
+        str(label): _collect_spinh_parameter_samples(
+            posterior,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            rng_seed=rng_seed + 1009 * index,
+        )
+        for index, (label, posterior) in enumerate(posteriors.items())
+    }
+    reference_samples = None
+    if reference_posterior is not None:
+        reference_samples = _collect_spinh_parameter_samples(
+            reference_posterior,
+            n_samples=n_samples,
+            burn_in=burn_in,
+            rng_seed=rng_seed + 1_000_003,
+        )
+
+    truth = {}
+    if true_parameters is not None:
+        if isinstance(true_parameters, ETASParameters):
+            truth.update(true_parameters.as_dict())
+        elif isinstance(true_parameters, Mapping):
+            truth.update(
+                {
+                    str(name): float(value)
+                    for name, value in true_parameters.items()
+                }
+            )
+        else:
+            raise TypeError("true_parameters must be ETASParameters or a mapping.")
+    if true_beta is not None:
+        true_beta = float(true_beta)
+        if not np.isfinite(true_beta) or true_beta <= 0.0:
+            raise ValueError("true_beta must be finite and positive.")
+        truth["beta"] = true_beta
+    unknown_truth = set(truth).difference(SPINH_POSTERIOR_PARAMETERS)
+    if unknown_truth:
+        raise ValueError(f"Unknown generating parameters: {sorted(unknown_truth)}.")
+    if any(not np.isfinite(value) for value in truth.values()):
+        raise ValueError("Generating parameter values must be finite.")
+
+    missing = {
+        name: [label for label, values in samples.items() if name not in values]
+        for name in parameters
+    }
+    if reference_samples is not None:
+        for name in parameters:
+            if name not in reference_samples:
+                missing[name].append(reference_label)
+    missing = {name: labels for name, labels in missing.items() if labels}
+    if missing:
+        details = "; ".join(f"{name}: {', '.join(labels)}" for name, labels in missing.items())
+        raise ValueError(f"Requested parameters are unavailable in {details}.")
+
+    n_columns = min(4, len(parameters))
+    n_rows = int(np.ceil(len(parameters) / n_columns))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_columns,
+        figsize=figsize,
+        squeeze=False,
+        layout="constrained",
+    )
+    palette = plt.get_cmap("tab10")
+
+    def draw_density(axis, name, values, *, label, color, linewidth, zorder):
+        values = np.asarray(values, dtype=float)
+        scale = max(1.0, float(np.max(np.abs(values))))
+        if values.size < 2 or float(np.std(values)) <= 1e-10 * scale:
+            axis.axvline(
+                float(np.mean(values)),
+                color=color,
+                linewidth=linewidth,
+                label=label,
+                zorder=zorder,
+            )
+            return
+        density = gaussian_kde(values)
+        low, high = np.quantile(values, [0.0025, 0.9975])
+        width = max(high - low, 1e-6 * scale)
+        support_lower = 1.0 if name in {"p", "q"} else 0.0
+        grid = np.linspace(
+            max(support_lower, low - 0.08 * width),
+            high + 0.08 * width,
+            300,
+        )
+        axis.plot(
+            grid,
+            density(grid),
+            color=color,
+            linewidth=linewidth,
+            label=label,
+            zorder=zorder,
+        )
+
+    for axis, name in zip(axes.flat, parameters):
+        if reference_samples is not None:
+            draw_density(
+                axis,
+                name,
+                reference_samples[name],
+                label=reference_label,
+                color="black",
+                linewidth=2.2,
+                zorder=5,
+            )
+        for index, (label, values) in enumerate(samples.items()):
+            draw_density(
+                axis,
+                name,
+                values[name],
+                label=label,
+                color=palette(index % 10),
+                linewidth=1.5,
+                zorder=3,
+            )
+        if name in truth:
+            axis.axvline(
+                truth[name],
+                color="0.3",
+                linestyle=":",
+                linewidth=1.6,
+                label="Generating value",
+                zorder=6,
+            )
+        axis.set_title(_SPINH_PARAMETER_LABELS[name])
+        axis.set_ylabel("Density")
+        axis.grid(alpha=0.2)
+    for axis in axes.flat[len(parameters):]:
+        axis.set_visible(False)
+
+    unique = {}
+    for axis in axes.flat[: len(parameters)]:
+        handles, labels = axis.get_legend_handles_labels()
+        unique.update(zip(labels, handles))
+    if unique:
+        fig.legend(
+            unique.values(),
+            unique.keys(),
+            loc="outside lower center",
+            ncols=min(4, len(unique)),
+            frameon=False,
+        )
+    if title:
+        fig.suptitle(title)
+    saved_path = None
+    if savefigure:
+        saved_path = save_figure(
+            fig,
+            title_savefig,
+            output_dir=output_dir,
+            figure_type="vector",
+        )
+    if show:
+        plt.show()
+    return {
+        "figure": fig,
+        "axes": axes,
+        "samples": samples,
+        "reference_samples": reference_samples,
+        "truth": truth,
+        "saved_path": saved_path,
+    }

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pickle
 import threading
 import time
 import warnings
 from contextlib import contextmanager
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, is_dataclass
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -25,13 +27,21 @@ except ImportError:  # pragma: no cover - sequential fallback remains usable
     Parallel = delayed = None
 
 try:
-    from joblib.externals.loky import get_reusable_executor
+    from joblib.externals.loky import ProcessPoolExecutor, get_reusable_executor
 except ImportError:  # pragma: no cover - only affects explicit pool cleanup
-    get_reusable_executor = None
+    ProcessPoolExecutor = get_reusable_executor = None
 
 
 _CALIBRATION_SEMAPHORE = None
 _CALIBRATION_LOCK_PATHS = ()
+_CANCELLED_TASK = object()
+
+# Execution safeguards, not statistical budgets. Scheduling uses a realistic
+# allowance, while the larger hard limit catches an unexpectedly large worker.
+MAX_FULL_WORKERS = 4
+WORKER_MEMORY_RESERVATION_GIB = 3.0
+WORKER_MEMORY_LIMIT_GIB = 5.0
+SYSTEM_MEMORY_RESERVE_GIB = 3.0
 
 
 def _set_calibration_semaphore(semaphore):
@@ -79,12 +89,44 @@ def calibration_slot():
     yield
 
 
-def resolve_n_jobs(profile, n_jobs):
-    """Default to one fit at a time, independently of the scientific profile."""
+def resolve_n_jobs(
+    profile,
+    n_jobs,
+    *,
+    max_full_workers=MAX_FULL_WORKERS,
+    worker_memory_reservation_gib=WORKER_MEMORY_RESERVATION_GIB,
+):
+    """Default to one fit and cap full runs by CPU, RAM and a safe maximum."""
     if n_jobs is None:
         return 1
     if isinstance(n_jobs, bool) or not isinstance(n_jobs, Integral) or n_jobs == 0:
         raise ValueError("n_jobs must be a non-zero integer (use -1 for all CPUs).")
+    if (
+        isinstance(max_full_workers, bool)
+        or not isinstance(max_full_workers, Integral)
+        or max_full_workers < 1
+    ):
+        raise ValueError("max_full_workers must be a positive integer.")
+    if (
+        isinstance(worker_memory_reservation_gib, bool)
+        or not isinstance(worker_memory_reservation_gib, Real)
+        or not math.isfinite(worker_memory_reservation_gib)
+        or worker_memory_reservation_gib <= 0
+    ):
+        raise ValueError("worker_memory_reservation_gib must be positive and finite.")
+    if profile == "full":
+        import psutil
+        available_gib = psutil.virtual_memory().available / 1024**3
+        memory_workers = max(
+            1,
+            int(
+                (available_gib - SYSTEM_MEMORY_RESERVE_GIB)
+                / worker_memory_reservation_gib
+            ),
+        )
+        requested = effective_worker_count(n_jobs)
+        resolved = min(requested, memory_workers, int(max_full_workers))
+        return resolved
     if n_jobs < 0:
         warnings.warn(
             "Negative n_jobs uses nearly/all CPUs without a memory limit. "
@@ -208,6 +250,61 @@ def shutdown_process_workers():
     executor.shutdown(wait=True, kill_workers=False)
 
 
+def _check_worker_memory(process, psutil):
+    rss = process.memory_info().rss
+    available = psutil.virtual_memory().available
+    if rss > WORKER_MEMORY_LIMIT_GIB * 1024**3 or available < SYSTEM_MEMORY_RESERVE_GIB * 1024**3:
+        raise MemoryError(
+            f"SPIN-H safety stop: worker RSS={rss / 1024**3:.2f} GiB, "
+            f"system available={available / 1024**3:.2f} GiB. "
+            "Completed checkpoints are preserved. Close other heavy applications "
+            "and resume with n_jobs=1."
+        )
+
+
+def _execute_isolated_task(function, task, index, checkpoint_path, lock_paths=(), cancel_event=None):
+    """Use a disposable process so a long campaign cannot retain native heaps."""
+    if ProcessPoolExecutor is None:
+        raise ImportError("The full runner requires joblib for process isolation.")
+    if cancel_event is not None and cancel_event.is_set():
+        return index, _CANCELLED_TASK
+    import psutil
+
+    environment = {
+        name: "1" for name in (
+            "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS",
+        )
+    }
+    executor = ProcessPoolExecutor(max_workers=1, env=environment)
+    failed = True
+    try:
+        # The one-worker executor keeps this PID for the subsequent task.
+        process = psutil.Process(executor.submit(os.getpid).result())
+        _check_worker_memory(process, psutil)
+        future = executor.submit(
+            _execute_task, function, task, index, checkpoint_path, lock_paths, True,
+        )
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                future.cancel()
+                return index, _CANCELLED_TASK
+            try:
+                result = future.result(timeout=0.2)
+                failed = False
+                return result
+            except FutureTimeout:
+                if future.done():
+                    result = future.result()
+                    failed = False
+                    return result
+                _check_worker_memory(process, psutil)
+    finally:
+        if failed and cancel_event is not None:
+            cancel_event.set()
+        executor.shutdown(wait=True, kill_workers=failed)
+
+
 def parallel_map(
     function,
     tasks,
@@ -219,6 +316,8 @@ def parallel_map(
     checkpoint_dir=None,
     resume=True,
     max_parallel_calibrations=None,
+    isolate_tasks=False,
+    worker_memory_reservation_gib=WORKER_MEMORY_RESERVATION_GIB,
 ):
     """Map tasks in stable order, optionally restoring atomic task checkpoints."""
     tasks = list(tasks)
@@ -228,8 +327,15 @@ def parallel_map(
         task_keys = list(task_keys)
     if len(task_keys) != len(tasks):
         raise ValueError("task_keys and tasks must have the same length.")
-    if not isinstance(resume, bool):
-        raise ValueError("resume must be boolean.")
+    if not isinstance(resume, bool) or not isinstance(isolate_tasks, bool):
+        raise ValueError("resume and isolate_tasks must be boolean.")
+    if (
+        isinstance(worker_memory_reservation_gib, bool)
+        or not isinstance(worker_memory_reservation_gib, Real)
+        or not math.isfinite(worker_memory_reservation_gib)
+        or worker_memory_reservation_gib <= 0
+    ):
+        raise ValueError("worker_memory_reservation_gib must be positive and finite.")
     if max_parallel_calibrations is not None:
         if (
             isinstance(max_parallel_calibrations, bool)
@@ -262,10 +368,37 @@ def parallel_map(
 
     worker_count = min(effective_worker_count(n_jobs), len(pending))
     print(
-        f"{description}: {worker_count if Parallel is not None else 1} worker(s), "
-        "1 native thread per worker.",
+        f"{description}: {worker_count if Parallel is not None else 1} worker(s).",
         flush=True,
     )
+    if isolate_tasks:
+        # Dispatcher threads never run numerical work. Independent child
+        # processes also keep the interactive kernel's native state untouched.
+        with TemporaryDirectory(prefix="spinh-calibration-slots-") as directory:
+            slots = min(max_parallel_calibrations or worker_count, worker_count)
+            lock_paths = tuple(str(Path(directory) / f"slot-{i}.lock") for i in range(slots))
+            for path in lock_paths:
+                Path(path).touch()
+            if worker_count == 1:
+                for index, task, path in tqdm(pending, desc=description, unit="task"):
+                    _, results[index] = _execute_isolated_task(function, task, index, path, lock_paths)
+            else:
+                cancel_event = threading.Event()
+                jobs = (
+                    delayed(_execute_isolated_task)(function, task, index, path, lock_paths, cancel_event)
+                    for index, task, path in pending
+                )
+                with Parallel(
+                    n_jobs=worker_count, backend="threading", return_as="generator_unordered",
+                    pre_dispatch=worker_count, batch_size=1,
+                ) as parallel:
+                    try:
+                        for index, result in tqdm(parallel(jobs), total=len(pending), desc=description, unit="task"):
+                            if result is not _CANCELLED_TASK:
+                                results[index] = result
+                    finally:
+                        cancel_event.set()
+        return results
     if worker_count == 1 or Parallel is None:
         with native_thread_limit():
             iterator = tqdm(pending, desc=description, unit="task")

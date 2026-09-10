@@ -5,6 +5,7 @@
 # %% Imports
 from __future__ import annotations
 import argparse
+import csv
 import sys
 from numbers import Integral
 from pathlib import Path
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from experiments.exp_spinh.test_utils import (
+    ACCURACY_TARGET_EVENTS,
     CAMPAIGNS,
     EXPERIMENT_2_BETA,
     EXPERIMENT_2_DURATIONS,
@@ -29,10 +31,12 @@ from experiments.exp_spinh.test_utils import (
     MISSPECIFIED_PARTITION_SEED,
     N_REGIONS,
     PARTITION_SEED,
+    PARAMETER_NAMES,
     REFERENCE_MUS,
     RESULTS_ROOT,
+    SCALING_REFERENCE_DURATION,
+    SCALING_REFERENCE_EVENTS,
     SCENARIOS,
-    TRAIN_FRACTION,
     X_BOUNDS,
     Y_BOUNDS,
     branching_metrics,
@@ -41,24 +45,26 @@ from experiments.exp_spinh.test_utils import (
     configure_campaign,
     fit_spinh_method,
     generate_partition,
+    gibbs_parameter_traces,
     intensity_recovery_metrics,
     latent_field,
     make_model,
     merge_adjacent_zones,
     omitted_temporal_mass,
     parameter_recovery_metrics,
-    posterior_parameter_draws,
+    posterior_parameter_means,
     posterior_background_draws,
-    predictive_log_score,
+    posterior_parameter_draws,
     regular_spatial_grid,
     simulate_configuration,
-    subset_catalog,
+    simulation_protocol,
     summarize_records,
     temporal_cutoff,
     validate_scientific_settings,
     write_campaign,
     write_records,
 )
+from package import plot_spinh_parameter_marginals
 from experiments.exp_spinh.runner_utils import (
     checkpoint_directory,
     effective_worker_count,
@@ -76,15 +82,25 @@ from spatial import DomainPartition
 # arguments are used instead.  ``None`` means: keep the selected profile's
 # default value.  Start with ``smoke`` before launching ``full``.
 
-EDITOR_PROFILE = "full"         # validate memory use before selecting "full"
+EDITOR_ACTION = "run"             # "run", "postprocess" or "marginals"
+EDITOR_PROFILE = "full"           # complete production budgets
 EDITOR_EXPERIMENT = "1"           # "1", "2" or "all"
-EDITOR_PANEL = "both"             # "accuracy", "scaling" or "both"
+EDITOR_PANEL = "accuracy"         # accuracy only; scaling is not launched
 EDITOR_METHODS = tuple(METHODS)    # any subset of ("m1", ..., "m5")
-EDITOR_N_JOBS = -1                # simultaneous fits; start with 1, test 2 later
+EDITOR_N_JOBS = -1                 # requested workers; dynamically reduced if RAM is tight
 EDITOR_SCALING_TARGETS = None      # e.g. (500, 1_000); None uses profile defaults
 EDITOR_RESUME = True               # reuse completed task checkpoints
 EDITOR_SAVE_FIGURES = True
 EDITOR_SHOW_FIGURES = False
+
+# Execution safeguards reflect the largest catalogue handled by the selected
+# panel. The separate 5 GiB hard limit remains enforced for every worker.
+ACCURACY_MAX_WORKERS = 6
+ACCURACY_MEMORY_RESERVATION_GIB = 1.5
+SCALING_MAX_WORKERS = 2
+SCALING_MEMORY_RESERVATION_GIB = 5.0
+DEFAULT_MAX_WORKERS = 4
+DEFAULT_MEMORY_RESERVATION_GIB = 3.0
 
 # Experiment 2 uses this deterministic replicate and grid for the promised
 # generating-versus-fitted partition figure.
@@ -99,20 +115,22 @@ FULL_SCALING_METHODS = {
 FULL_SCALING_TARGETS = tuple(FULL_SCALING_METHODS)
 
 EDITOR_CAMPAIGN_OVERRIDES = {
-    "n_replicates": None,
+    "n_replicates": 10,
     "n_scaling_replicates": None,
     "n_partition_replicates": None,
-    "n_chains": None,
+    "n_chains": 3,
     "vi_starts": None,
     "gibbs_iterations": None,
     "gibbs_thin": None,
+    "gibbs_burn_in": None,
+    "gibbs_adaptation_fraction": None,
     "vi_iterations": None,
     "evaluation_space_grid": None,
     "evaluation_time_grid": None,
     "quadrature_space_grid": None,
-    "quadrature_time_grid": None,
     "posterior_draws": None,
-    "max_parallel_calibrations": None,
+    "parameter_draws": None,
+    "max_parallel_calibrations": 1,
     "duration_scale": None,
     "exact_max_events": None,
     "dense_max_events": None,
@@ -131,18 +149,45 @@ ACCURACY_METRICS = (
     "mae_background",
     "mae_triggering",
     "mae_total",
-    "predictive_log_score",
     "parameter_log_error",
     "background_brier",
     "background_accuracy",
     "background_f1",
     "mean_true_state_probability",
-    "exact_parent_accuracy",
     "candidate_recall",
     "runtime_seconds",
-    "branching_update_seconds",
-    "ess_per_second",
 )
+
+_INTERNAL_GIBBS_FIELDS = {
+    "diagnostic_status",
+    "mcmc_diagnostic_method",
+    "proposal_warning",
+    "n_iter_run",
+    "burn_in_fraction",
+    "mala_step",
+    "sigma_mh_etas",
+    "sigma_mh_beta",
+}
+_INTERNAL_GIBBS_PREFIXES = (
+    "rhat_",
+    "ess_",
+    "mcse_",
+    "acceptance_",
+    "proposal_scale_",
+)
+
+
+def records_for_export(records):
+    """Remove sampler-tuning diagnostics from scientific result files."""
+    return [
+        {
+            name: value
+            for name, value in record.items()
+            if name not in _INTERNAL_GIBBS_FIELDS
+            and not name.startswith(_INTERNAL_GIBBS_PREFIXES)
+        }
+        for record in records
+    ]
 
 _CHECKPOINT_SOURCES = (
     Path(__file__),
@@ -155,6 +200,7 @@ _CHECKPOINT_SOURCES = (
 def editor_run_options():
     """Return an isolated copy of the options from the editor settings block."""
     return {
+        "action": EDITOR_ACTION,
         "profile": EDITOR_PROFILE,
         "experiment": EDITOR_EXPERIMENT,
         "panel": EDITOR_PANEL,
@@ -182,7 +228,27 @@ def should_use_editor_settings(arguments=None, in_ipykernel=None):
 
 def run_from_editor():
     """Run with the single user-editable settings block at the top of this file."""
-    return run(**editor_run_options())
+    options = editor_run_options()
+    action = options.pop("action")
+    if action == "run":
+        return run(**options)
+    if action == "postprocess":
+        return postprocess_accuracy_results(
+            profile=options["profile"],
+            save_figures=options["save_figures"],
+            show_figures=options["show_figures"],
+        )
+    if action == "marginals":
+        return recover_accuracy_marginals(
+            profile=options["profile"],
+            methods=options["methods"],
+            n_jobs=options["n_jobs"],
+            resume=options["resume"],
+            save_figures=options["save_figures"],
+            show_figures=options["show_figures"],
+            campaign_overrides=options["campaign_overrides"],
+        )
+    raise ValueError("EDITOR_ACTION must be 'run', 'postprocess' or 'marginals'.")
 
 
 def _validate_execution_settings(n_jobs, scaling_targets):
@@ -199,6 +265,28 @@ def _validate_execution_settings(n_jobs, scaling_targets):
     if not targets:
         raise ValueError("scaling_targets cannot be empty.")
     return tuple(targets)
+
+
+def execution_guard(experiment, panel):
+    """Return worker limits matched to the largest requested simulation task."""
+    includes_scaling = experiment in {"1", "all"} and panel in {"scaling", "both"}
+    if includes_scaling:
+        return {
+            "name": "scaling",
+            "max_workers": SCALING_MAX_WORKERS,
+            "memory_reservation_gib": SCALING_MEMORY_RESERVATION_GIB,
+        }
+    if experiment == "1" and panel == "accuracy":
+        return {
+            "name": f"accuracy-N{ACCURACY_TARGET_EVENTS}",
+            "max_workers": ACCURACY_MAX_WORKERS,
+            "memory_reservation_gib": ACCURACY_MEMORY_RESERVATION_GIB,
+        }
+    return {
+        "name": "standard",
+        "max_workers": DEFAULT_MAX_WORKERS,
+        "memory_reservation_gib": DEFAULT_MEMORY_RESERVATION_GIB,
+    }
 
 
 def scaling_plan(profile, methods, targets=None):
@@ -270,13 +358,14 @@ def _print_run_settings(campaign, experiment, panel, methods, n_jobs, targets, o
         f"VI: {campaign.vi_starts} start(s) x {campaign.vi_iterations} iter."
     )
     print(
-        f"Posterior draws={campaign.posterior_draws}, "
+        f"Intensity draws={campaign.posterior_draws}, "
+        f"parameter draws={campaign.parameter_draws}, "
         f"GP calibration={'on' if campaign.use_calibration else 'off'}, "
         f"workers={effective_worker_count(n_jobs)} (n_jobs={n_jobs})"
     )
     if campaign.use_calibration:
         print(
-            "GP calibration: complete training catalogue, "
+            "GP calibration: complete observed catalogue, "
             f"at most {campaign.max_parallel_calibrations} simultaneous fit(s)"
         )
     if experiment in {"1", "all"} and panel in {"scaling", "both"}:
@@ -296,7 +385,7 @@ def _print_run_summary(results, output):
         raw, summary = results["experiment_1_accuracy"]
         failures.extend(record for record in raw if record.get("status") != "ok")
         print("Experiment 1 - accuracy")
-        print(f"{'Scenario':<12} {'Method':<6} {'N':>6} {'L2 total':>10} {'Score':>10} {'Time (s)':>10}")
+        print(f"{'Scenario':<12} {'Method':<6} {'N':>6} {'L2 total':>10} {'Time (s)':>10}")
         for row in summary:
             completed = [
                 record
@@ -309,7 +398,7 @@ def _print_run_summary(results, output):
             print(
                 f"{row['scenario']:<12} {row['method'].upper():<6} "
                 f"{mean_events:>6} {row['rel_l2_total']:>10.3f} "
-                f"{row['predictive_log_score']:>10.3f} {row['runtime_seconds']:>10.2f}"
+                f"{row['runtime_seconds']:>10.2f}"
             )
     if "experiment_1_scaling" in results:
         raw, summary = results["experiment_1_scaling"]
@@ -317,25 +406,24 @@ def _print_run_summary(results, output):
         print("\nExperiment 1 - scaling")
         print(
             f"{'Target':>8} {'Method':<6} {'Observed':>9} "
-            f"{'Retained pairs':>15} {'Branch (s)':>11} {'Status':<22}"
+            f"{'Retained pairs':>15} {'Time (s)':>11} {'Status':<22}"
         )
         for row in summary:
             print(
                 f"{row['target_n_events']:>8} {row['method'].upper():<6} "
                 f"{row['n_events']:>9.0f} {row['candidate_parent_count']:>15.0f} "
-                f"{row['branching_update_seconds']:>11.3f} {row['status']:<22}"
+                f"{row['runtime_seconds']:>11.3f} {row['status']:<22}"
             )
     if "experiment_2" in results:
         raw, paired, summary, _ = results["experiment_2"]
         failures.extend(record for record in raw if record.get("status") != "ok")
         failures.extend(record for record in paired if record.get("status") != "ok")
         print("\nExperiment 2 - paired partition effects")
-        print(f"{'Case':<6} {'Delta L2 bg':>12} {'Delta L2 trig':>14} {'Delta score':>12}")
+        print(f"{'Case':<6} {'Delta L2 bg':>12} {'Delta L2 trig':>14}")
         for row in summary:
             print(
                 f"{row['scenario']:<6} {row['delta_rel_l2_background']:>12.3f} "
-                f"{row['delta_rel_l2_triggering']:>14.3f} "
-                f"{row['delta_predictive_log_score']:>12.3f}"
+                f"{row['delta_rel_l2_triggering']:>14.3f}"
             )
     if failures:
         print(f"\nWarnings: {len(failures)} run(s) were skipped or failed.")
@@ -347,7 +435,7 @@ def _print_run_summary(results, output):
             detail = record.get("error_message", record.get("status", "unknown"))
             print(f"  {identifier}: {detail}")
     else:
-        print("\nAll requested runs completed successfully.")
+        print("\nAll requested computations completed.")
     print(f"Results written to: {output}")
     print("-" * 78)
 
@@ -388,11 +476,13 @@ def _fit_accuracy_method(
     campaign,
 ):
     reconstruction = None
+    posterior = None
     record = _base_record(1, scenario_name, replicate, method, simulation, cutoff)
     record.update(
         {
-            "n_train": len(training_catalog),
-            "n_test": len(simulation.catalog) - len(training_catalog),
+            "n_fitted": len(training_catalog),
+            "observation_duration": train_end,
+            "simulation_seed": 11_000 + 1000 * list(SCENARIOS).index(scenario_name) + replicate,
             "omitted_temporal_mass": tail_mass,
             "gp_variance": gp_prior.variance,
             "gp_length_scale": gp_prior.length_scale,
@@ -401,7 +491,10 @@ def _fit_accuracy_method(
             "gp_calibration_n_events": calibration_n_events,
         }
     )
-    seed = int(record["seed"] + 1009 * list(METHODS).index(method))
+    # M4/M5 share starts and Monte Carlo draws for their paired comparison.
+    seed_method = "m4" if method == "m5" else method
+    seed = int(record["seed"] + 1009 * list(METHODS).index(seed_method))
+    record["inference_seed"] = seed
     try:
         model = make_model(zones, train_end, etas=INITIAL_ETAS, gp_prior=gp_prior)
         bundle, diagnostics = fit_spinh_method(
@@ -415,7 +508,7 @@ def _fit_accuracy_method(
         record.update(diagnostics)
         if bundle is None:
             record["runtime_seconds"] = float("nan")
-            return record, reconstruction
+            return record, reconstruction, posterior
         record["inference_seconds"] = diagnostics["runtime_seconds"]
         record["runtime_seconds"] = diagnostics["runtime_seconds"] + calibration_seconds
         record.update(
@@ -426,14 +519,30 @@ def _fit_accuracy_method(
                 cutoff,
             )
         )
-        parameter_draws = posterior_parameter_draws(
-            bundle, campaign.posterior_draws, seed=seed + 17
-        )
         record.update(
             parameter_recovery_metrics(
-                parameter_draws, scenario["etas"], scenario["beta"]
+                posterior_parameter_means(bundle), scenario["etas"], scenario["beta"]
             )
         )
+        posterior = {
+            "scenario": scenario_name,
+            "replicate": int(replicate),
+            "method": method,
+            "method_label": METHODS[method]["label"],
+            "samples": posterior_parameter_draws(
+                bundle, campaign.parameter_draws, seed=seed + 23
+            ),
+        }
+        if METHODS[method]["family"] == "gibbs":
+            posterior.update(
+                {
+                    "gibbs_trace": gibbs_parameter_traces(bundle),
+                    "burn_in_fraction": campaign.gibbs_burn_in,
+                    "adaptation_end": bundle.fits[0].raw["proposal_steps"].get(
+                        "adaptation_end"
+                    ),
+                }
+            )
         intensity_result = intensity_recovery_metrics(
             bundle,
             simulation,
@@ -456,13 +565,6 @@ def _fit_accuracy_method(
         else:
             intensity_metrics = intensity_result
         record.update(intensity_metrics)
-        record["predictive_log_score"] = predictive_log_score(
-            bundle,
-            simulation.catalog,
-            train_end,
-            campaign,
-            seed + 43,
-        )
         candidates = candidate_diagnostics(
             training_catalog.t, training_parent_indices, cutoff
         )
@@ -493,7 +595,7 @@ def _fit_accuracy_method(
                 "error_message": str(error),
             }
         )
-    return record, reconstruction
+    return record, reconstruction, posterior
 
 
 def _accuracy_replicate(scenario_name, replicate, methods, campaign):
@@ -511,11 +613,10 @@ def _accuracy_replicate(scenario_name, replicate, methods, campaign):
         seed,
         grid_res=40 if campaign.name == "smoke" else 100,
     )
-    train_end = TRAIN_FRACTION * duration
-    training_mask = simulation.catalog.t <= train_end
-    training_catalog = subset_catalog(simulation.catalog, training_mask)
-    training_parent_indices = simulation.parent_indices[training_mask]
-    cutoff = temporal_cutoff(scenario["etas"])
+    train_end = duration
+    training_catalog = simulation.catalog
+    training_parent_indices = simulation.parent_indices
+    cutoff = temporal_cutoff(scenario["etas"], horizon=duration)
     tail_mass = omitted_temporal_mass(scenario["etas"], cutoff, duration)
     calibration_model = make_model(zones, train_end, etas=INITIAL_ETAS)
     (
@@ -556,6 +657,7 @@ def run_accuracy_panel(
     *,
     checkpoint_dir=None,
     resume=True,
+    worker_memory_reservation_gib=DEFAULT_MEMORY_RESERVATION_GIB,
 ):
     tasks = [
         (scenario, replicate, tuple(methods), campaign)
@@ -572,11 +674,14 @@ def run_accuracy_panel(
         checkpoint_dir=checkpoint_dir,
         resume=resume,
         max_parallel_calibrations=campaign.max_parallel_calibrations,
+        isolate_tasks=campaign.name == "full",
+        worker_memory_reservation_gib=worker_memory_reservation_gib,
     )
     fitted = [result for group in nested for result in group]
-    records = [record for record, _ in fitted]
-    reconstructions = [payload for _, payload in fitted if payload is not None]
-    return records, reconstructions
+    records = [record for record, _, _ in fitted]
+    reconstructions = [payload for _, payload, _ in fitted if payload is not None]
+    posteriors = [payload for _, _, payload in fitted if payload is not None]
+    return records, reconstructions, posteriors
 
 
 def _prepare_scaling_replicate(target_size, replicate, campaign):
@@ -584,7 +689,11 @@ def _prepare_scaling_replicate(target_size, replicate, campaign):
     scenario_name = "easy"
     scenario = SCENARIOS[scenario_name]
     zones, _ = generate_partition(N_REGIONS, seed=PARTITION_SEED)
-    duration = scenario["duration"] * float(target_size) / 500.0
+    duration = (
+        SCALING_REFERENCE_DURATION
+        * float(target_size)
+        / SCALING_REFERENCE_EVENTS
+    )
     seed = 31_000 + 10 * int(target_size) + replicate
     simulation = simulate_configuration(
         zones,
@@ -596,7 +705,7 @@ def _prepare_scaling_replicate(target_size, replicate, campaign):
         seed,
         grid_res=30 if campaign.name == "smoke" else 80,
     )
-    cutoff = temporal_cutoff(scenario["etas"])
+    cutoff = temporal_cutoff(scenario["etas"], horizon=duration)
     calibration_model = make_model(zones, duration, etas=INITIAL_ETAS)
     gp_prior, calibration_seconds, calibration_succeeded, calibration_n_events = (
         calibrate_gp(calibration_model, simulation.catalog, campaign, seed + 71)
@@ -671,7 +780,7 @@ def _scaling_method_task(target_size, replicate, method, campaign, prepared):
             catalog,
             method,
             campaign,
-            seed + 1009 * list(METHODS).index(method),
+            seed + 1009 * list(METHODS).index("m4" if method == "m5" else method),
             parent_time_window=cutoff,
         )
         record.update(diagnostics)
@@ -698,6 +807,7 @@ def run_scaling_panel(
     *,
     checkpoint_dir=None,
     resume=True,
+    worker_memory_reservation_gib=SCALING_MEMORY_RESERVATION_GIB,
 ):
     plan = scaling_plan(campaign.name, methods, targets)
     preparation_tasks = [
@@ -719,6 +829,8 @@ def run_scaling_panel(
         checkpoint_dir=preparation_dir,
         resume=resume,
         max_parallel_calibrations=campaign.max_parallel_calibrations,
+        isolate_tasks=campaign.name == "full",
+        worker_memory_reservation_gib=worker_memory_reservation_gib,
     )
     paired_inputs = dict(zip(preparation_keys, prepared))
     tasks = [
@@ -739,6 +851,8 @@ def run_scaling_panel(
         checkpoint_dir=checkpoint_dir,
         resume=resume,
         max_parallel_calibrations=campaign.max_parallel_calibrations,
+        isolate_tasks=campaign.name == "full",
+        worker_memory_reservation_gib=worker_memory_reservation_gib,
     )
     return records
 
@@ -763,8 +877,6 @@ def summarize_scaling_records(records):
     )
     fit_metrics = (
         "runtime_seconds",
-        "branching_update_seconds",
-        "ess_per_second",
         "final_elbo",
         "n_iter_run",
     )
@@ -959,7 +1071,8 @@ def _partition_fit(
         "method": "m5",
         "method_label": METHODS["m5"]["label"],
         "n_events": len(simulation.catalog),
-        "n_train": len(training_catalog),
+        "n_fitted": len(training_catalog),
+        "observation_duration": train_end,
         "n_fit_regions": len(fit_zones),
         "parent_time_window": cutoff,
         "gp_calibration_seconds": calibration_seconds,
@@ -989,9 +1102,6 @@ def _partition_fit(
             cutoff,
         )
     )
-    record["predictive_log_score"] = predictive_log_score(
-        bundle, simulation.catalog, train_end, campaign, seed + 43
-    )
     surface = None
     if capture_surface:
         surface = _partition_surface_payload(
@@ -1019,11 +1129,10 @@ def _partition_replicate(scenario_name, replicate, campaign):
         seed,
         grid_res=40 if campaign.name == "smoke" else 100,
     )
-    train_end = TRAIN_FRACTION * duration
-    training_mask = simulation.catalog.t <= train_end
-    training_catalog = subset_catalog(simulation.catalog, training_mask)
-    training_parent_indices = simulation.parent_indices[training_mask]
-    cutoff = temporal_cutoff(EXPERIMENT_2_ETAS)
+    train_end = duration
+    training_catalog = simulation.catalog
+    training_parent_indices = simulation.parent_indices
+    cutoff = temporal_cutoff(EXPERIMENT_2_ETAS, horizon=duration)
     calibration_zones = [unary_union(settings["true_zones"])]
     calibration_model = make_model(calibration_zones, train_end, etas=INITIAL_ETAS)
     gp_prior, calibration_seconds, _, calibration_n_events = calibrate_gp(
@@ -1090,14 +1199,16 @@ def _partition_replicate(scenario_name, replicate, campaign):
         if oracle.get("status") == misspecified.get("status") == "ok"
         else "incomplete",
         "n_events": len(simulation.catalog),
+        "diagnostic_status": (
+            "ok" if oracle.get("diagnostic_status") == misspecified.get("diagnostic_status") == "ok"
+            else "check_paired_fits"
+        ),
         "delta_rel_l2_background": misspecified.get("rel_l2_background", np.nan)
         - oracle.get("rel_l2_background", np.nan),
         "delta_rel_l2_triggering": misspecified.get("rel_l2_triggering", np.nan)
         - oracle.get("rel_l2_triggering", np.nan),
         "delta_background_brier": misspecified.get("background_brier", np.nan)
         - oracle.get("background_brier", np.nan),
-        "delta_predictive_log_score": oracle.get("predictive_log_score", np.nan)
-        - misspecified.get("predictive_log_score", np.nan),
         "delta_runtime_seconds": misspecified.get("runtime_seconds", np.nan)
         - oracle.get("runtime_seconds", np.nan),
     }
@@ -1110,6 +1221,7 @@ def run_partition_experiment(
     *,
     checkpoint_dir=None,
     resume=True,
+    worker_memory_reservation_gib=DEFAULT_MEMORY_RESERVATION_GIB,
 ):
     tasks = [
         (scenario, replicate, campaign)
@@ -1126,6 +1238,7 @@ def run_partition_experiment(
         checkpoint_dir=checkpoint_dir,
         resume=resume,
         max_parallel_calibrations=campaign.max_parallel_calibrations,
+        worker_memory_reservation_gib=worker_memory_reservation_gib,
     )
     raw = [record for raw_group, _, _ in results for record in raw_group]
     paired = [record for _, paired_group, _ in results for record in paired_group]
@@ -1206,7 +1319,7 @@ def _reconstruction_surface(payload, intensity_name, estimate):
     suffix = "estimate" if estimate else "true"
     values = np.asarray(payload[f"{intensity_name}_{suffix}"], dtype=float)
     n_space = int(payload["space_grid_size"])
-    if intensity_name == "background":
+    if intensity_name == "background" or payload.get("surfaces_time_averaged", False):
         return values.reshape(n_space, n_space)
     n_time = int(payload["time_grid_size"])
     return values.reshape(n_time, n_space, n_space).mean(axis=0)
@@ -1324,6 +1437,476 @@ def plot_accuracy(summary, output, *, save=True, show=False):
     _save_figure(figure, output / "experiment_1_accuracy.pdf", save, show)
 
 
+def save_accuracy_posteriors(
+    posteriors,
+    output,
+    *,
+    stem="experiment_1_posterior_samples",
+):
+    """Store compact posterior draws with an explicit index."""
+    if not posteriors:
+        return None, []
+    arrays = {}
+    index = []
+    for payload in posteriors:
+        prefix = (
+            f"{payload['scenario']}__rep{int(payload['replicate']):02d}__"
+            f"{payload['method']}"
+        )
+        sizes = []
+        for parameter, values in payload["samples"].items():
+            values = np.asarray(values, dtype=float).reshape(-1)
+            arrays[f"{prefix}__{parameter}"] = values
+            sizes.append(len(values))
+        index.append(
+            {
+                "scenario": payload["scenario"],
+                "replicate": int(payload["replicate"]),
+                "method": payload["method"],
+                "method_label": payload["method_label"],
+                "n_draws": min(sizes) if sizes else 0,
+            }
+        )
+    path = output / f"{stem}.npz"
+    np.savez_compressed(path, **arrays)
+    write_records(output / f"{stem}_index.csv", index)
+    return path, index
+
+
+def _acf(values, max_lag):
+    values = np.asarray(values, dtype=float)
+    values = values - values.mean()
+    denominator = float(np.dot(values, values))
+    if denominator <= 0.0:
+        return np.ones(max_lag + 1)
+    return np.asarray(
+        [
+            np.dot(values[: values.size - lag], values[lag:]) / denominator
+            for lag in range(max_lag + 1)
+        ]
+    )
+
+
+def plot_accuracy_gibbs_diagnostics(
+    posteriors,
+    selection_records,
+    output,
+    *,
+    max_lag=200,
+    save=True,
+    show=False,
+):
+    """Save trace plots and ACFs for representative M1--M3 fits."""
+    selected = {
+        (row["scenario"], int(row["replicate"])) for row in selection_records
+    }
+    payloads = [
+        payload
+        for payload in posteriors
+        if (payload["scenario"], int(payload["replicate"])) in selected
+        and payload.get("gibbs_trace") is not None
+    ]
+    if not payloads:
+        return []
+
+    display_order = ("beta", "A", "alpha", "c", "p", "d", "q", "gamma")
+    labels = {
+        "beta": r"$\beta$",
+        "A": r"$A$",
+        "alpha": r"$\alpha$",
+        "c": r"$c$",
+        "p": r"$p$",
+        "d": r"$d$",
+        "q": r"$q$",
+        "gamma": r"$\gamma$",
+    }
+    columns = [PARAMETER_NAMES.index(name) for name in display_order]
+    colors = ("#2f6f6d", "#b65b43", "#5687a3", "#8a6b9e")
+    saved = []
+    trace_arrays = {}
+    trace_index = []
+    for payload in payloads:
+        scenario = payload["scenario"]
+        method = payload["method"]
+        replicate = int(payload["replicate"])
+        traces = np.asarray(payload["gibbs_trace"], dtype=float)[:, :, columns]
+        burn = int(traces.shape[1] * float(payload["burn_in_fraction"]))
+        adaptation_end = payload.get("adaptation_end")
+        truth = {
+            **SCENARIOS[scenario]["etas"].as_dict(),
+            "beta": SCENARIOS[scenario]["beta"],
+        }
+
+        figure, axes = plt.subplots(
+            4, 2, figsize=(12, 10.5), sharex=True, layout="constrained"
+        )
+        for parameter, axis, column in zip(display_order, axes.flat, range(8)):
+            for chain, color in enumerate(colors[: traces.shape[0]]):
+                axis.plot(
+                    traces[chain, :, column],
+                    color=color,
+                    linewidth=0.55,
+                    alpha=0.8,
+                    label=f"Chain {chain + 1}",
+                )
+            axis.axhline(
+                truth[parameter], color="black", linestyle="--", linewidth=1.0,
+                label="Generating value",
+            )
+            if adaptation_end is not None:
+                axis.axvline(
+                    int(adaptation_end), color="#777777", linestyle=":", linewidth=1.0
+                )
+            axis.axvline(burn, color="#b23a48", linewidth=1.0)
+            axis.set_title(labels[parameter])
+            axis.grid(alpha=0.2)
+        axes.flat[0].legend(frameon=False, ncol=2, fontsize=8)
+        for axis in axes[-1]:
+            axis.set_xlabel("Iteration")
+        figure.suptitle(
+            f"{payload['method_label']} - {scenario} scenario, replicate {replicate}"
+        )
+        trace_path = output / f"experiment_1_gibbs_traces_{scenario}_{method}.pdf"
+        _save_figure(figure, trace_path, save, show)
+
+        n_post = traces.shape[1] - burn
+        lag = min(int(max_lag), n_post - 1)
+        if lag >= 1:
+            figure, axes = plt.subplots(
+                4, 2, figsize=(12, 10.5), sharex=True, layout="constrained"
+            )
+            lags = np.arange(lag + 1)
+            for parameter, axis, column in zip(display_order, axes.flat, range(8)):
+                for chain, color in enumerate(colors[: traces.shape[0]]):
+                    axis.plot(
+                        lags,
+                        _acf(traces[chain, burn:, column], lag),
+                        color=color,
+                        linewidth=1.0,
+                        alpha=0.9,
+                        label=f"Chain {chain + 1}",
+                    )
+                axis.axhline(0.0, color="black", linewidth=0.7)
+                axis.set_ylim(-0.2, 1.0)
+                axis.set_title(labels[parameter])
+                axis.grid(alpha=0.2)
+            axes.flat[0].legend(frameon=False, fontsize=8)
+            for axis in axes[-1]:
+                axis.set_xlabel("Lag (iterations)")
+            figure.suptitle(
+                f"ACF: {payload['method_label']} - {scenario} scenario, "
+                f"replicate {replicate}"
+            )
+            acf_path = output / f"experiment_1_gibbs_acf_{scenario}_{method}.pdf"
+            _save_figure(figure, acf_path, save, show)
+            saved.extend([trace_path, acf_path])
+
+        key = f"{scenario}__rep{replicate:02d}__{method}"
+        trace_arrays[key] = traces
+        trace_index.append(
+            {
+                "scenario": scenario,
+                "replicate": replicate,
+                "method": method,
+                "method_label": payload["method_label"],
+                "n_chains": traces.shape[0],
+                "n_iterations": traces.shape[1],
+                "burn_in_iteration": burn,
+                "adaptation_end": adaptation_end,
+                "parameter_order": ",".join(display_order),
+            }
+        )
+    if save:
+        np.savez_compressed(output / "experiment_1_gibbs_traces.npz", **trace_arrays)
+        write_records(output / "experiment_1_gibbs_trace_index.csv", trace_index)
+    return saved
+
+
+def plot_accuracy_parameter_marginals(
+    posteriors,
+    selection_records,
+    output,
+    *,
+    save=True,
+    show=False,
+):
+    """Compare M1--M5 marginals for each representative catalogue."""
+    for selected in selection_records:
+        scenario = selected["scenario"]
+        replicate = int(selected["replicate"])
+        available = {
+            payload["method"]: payload
+            for payload in posteriors
+            if payload["scenario"] == scenario
+            and int(payload["replicate"]) == replicate
+        }
+        if not available:
+            continue
+        reference = available.pop("m1", None)
+        compared = {
+            payload["method_label"]: payload["samples"]
+            for payload in available.values()
+        }
+        if not compared and reference is None:
+            continue
+        if reference is None:
+            first_method = next(iter(available))
+            reference = available.pop(first_method)
+            compared.pop(reference["method_label"], None)
+        result = plot_spinh_parameter_marginals(
+            compared or {reference["method_label"]: reference["samples"]},
+            reference_posterior=(reference["samples"] if compared else None),
+            reference_label=(reference["method_label"] if compared else "Reference"),
+            true_parameters=SCENARIOS[scenario]["etas"],
+            true_beta=SCENARIOS[scenario]["beta"],
+            parameters=("beta", "A", "alpha", "c", "p", "d", "q", "gamma"),
+            n_samples=max(
+                len(values)
+                for payload in posteriors
+                if payload["scenario"] == scenario
+                and int(payload["replicate"]) == replicate
+                for values in payload["samples"].values()
+            ),
+            rng_seed=91_000 + replicate,
+            title=f"{scenario.title()} scenario, replicate {replicate}",
+            savefigure=save,
+            title_savefig=f"experiment_1_parameter_marginals_{scenario}",
+            output_dir=output,
+            show=show,
+        )
+        if not show:
+            plt.close(result["figure"])
+
+
+def _parse_csv_value(value):
+    if value == "":
+        return ""
+    if value in {"True", "False"}:
+        return value == "True"
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return (
+        int(number)
+        if number.is_integer() and not any(c in value.lower() for c in (".", "e"))
+        else number
+    )
+
+
+def _read_records(path):
+    with Path(path).open(newline="", encoding="utf-8") as stream:
+        return [
+            {name: _parse_csv_value(value) for name, value in row.items()}
+            for row in csv.DictReader(stream)
+        ]
+
+
+def postprocess_accuracy_results(
+    profile="full",
+    *,
+    save_figures=True,
+    show_figures=False,
+):
+    """Rebuild Experiment 1 tables and diagnostics without fitting a model."""
+    output = RESULTS_ROOT / profile
+    raw_path = output / "experiment_1_accuracy_raw.csv"
+    if not raw_path.is_file():
+        raise FileNotFoundError(f"Missing accuracy results: {raw_path}")
+    records = _read_records(raw_path)
+    for record in records:
+        record.pop("exact_parent_accuracy", None)
+    summary = summarize_records(
+        records, ("scenario", "method", "method_label"), ACCURACY_METRICS
+    )
+    summary.sort(
+        key=lambda row: (
+            list(SCENARIOS).index(row["scenario"]),
+            list(METHODS).index(row["method"]),
+        )
+    )
+    write_records(raw_path, records_for_export(records))
+    write_records(output / "experiment_1_accuracy_table.csv", summary)
+    write_experiment_1_latex(output, summary, [])
+    plot_accuracy(
+        summary,
+        output,
+        save=save_figures,
+        show=_resolve_figure_display(show_figures),
+    )
+    print(f"Experiment 1 outputs rebuilt from {raw_path}")
+    return records, summary
+
+
+def _posterior_recovery_replicate(
+    scenario_name,
+    replicate,
+    methods,
+    campaign,
+):
+    """Refit one catalogue while retaining only posterior draws and diagnostics."""
+    scenario = SCENARIOS[scenario_name]
+    zones, _ = generate_partition(N_REGIONS, seed=PARTITION_SEED)
+    duration = scenario["duration"] * campaign.duration_scale
+    simulation_seed = 11_000 + 1000 * list(SCENARIOS).index(scenario_name) + replicate
+    simulation = simulate_configuration(
+        zones,
+        scenario["mus"],
+        duration,
+        scenario["field_scale"],
+        scenario["etas"],
+        scenario["beta"],
+        simulation_seed,
+        grid_res=40 if campaign.name == "smoke" else 100,
+    )
+    cutoff = temporal_cutoff(scenario["etas"], horizon=duration)
+    calibration_model = make_model(zones, duration, etas=INITIAL_ETAS)
+    gp_prior, calibration_seconds, calibration_succeeded, calibration_n_events = calibrate_gp(
+        calibration_model, simulation.catalog, campaign, simulation_seed + 71
+    )
+    recovered = []
+    for method in methods:
+        record = _base_record(
+            1, scenario_name, replicate, method, simulation, cutoff
+        )
+        seed_method = "m4" if method == "m5" else method
+        seed = int(record["seed"] + 1009 * list(METHODS).index(seed_method))
+        record.update(
+            {
+                "simulation_seed": simulation_seed,
+                "inference_seed": seed,
+                "gp_calibration_seconds": calibration_seconds,
+                "gp_calibration_succeeded": calibration_succeeded,
+                "gp_calibration_n_events": calibration_n_events,
+            }
+        )
+        try:
+            model = make_model(zones, duration, etas=INITIAL_ETAS, gp_prior=gp_prior)
+            bundle, diagnostics = fit_spinh_method(
+                model,
+                simulation.catalog,
+                method,
+                campaign,
+                seed,
+                parent_time_window=cutoff,
+            )
+            record.update(diagnostics)
+            if bundle is None:
+                recovered.append((record, None))
+                continue
+            payload = {
+                "scenario": scenario_name,
+                "replicate": int(replicate),
+                "method": method,
+                "method_label": METHODS[method]["label"],
+                "samples": posterior_parameter_draws(
+                    bundle, campaign.parameter_draws, seed=seed + 23
+                ),
+            }
+            if METHODS[method]["family"] == "gibbs":
+                payload.update(
+                    {
+                        "gibbs_trace": gibbs_parameter_traces(bundle),
+                        "burn_in_fraction": campaign.gibbs_burn_in,
+                        "adaptation_end": bundle.fits[0].raw[
+                            "proposal_steps"
+                        ].get("adaptation_end"),
+                    }
+                )
+            recovered.append((record, payload))
+        except Exception as error:
+            record.update(
+                {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error_message": str(error),
+                }
+            )
+            recovered.append((record, None))
+    return recovered
+
+
+def recover_accuracy_marginals(
+    profile="full",
+    methods=tuple(METHODS),
+    *,
+    n_jobs=None,
+    resume=True,
+    save_figures=True,
+    show_figures=False,
+    campaign_overrides=None,
+):
+    """Refit representative catalogues and save marginals, traces and ACFs."""
+    validate_scientific_settings()
+    methods = tuple(methods)
+    unknown = set(methods) - set(METHODS)
+    if not methods or unknown:
+        raise ValueError(f"At least one valid method is required; unknown={sorted(unknown)}.")
+    campaign = configure_campaign(profile, **(campaign_overrides or {}))
+    guard = execution_guard("1", "accuracy")
+    n_jobs = resolve_n_jobs(
+        profile,
+        n_jobs,
+        max_full_workers=guard["max_workers"],
+        worker_memory_reservation_gib=guard["memory_reservation_gib"],
+    )
+    output = RESULTS_ROOT / campaign.name
+    selection_path = output / "experiment_1_reconstruction_selection.csv"
+    if not selection_path.is_file():
+        raise FileNotFoundError(
+            "Representative replicates are unavailable; run Experiment 1 accuracy first."
+        )
+    selection = _read_records(selection_path)
+    tasks = [
+        (row["scenario"], int(row["replicate"]), methods, campaign)
+        for row in selection
+    ]
+    task_keys = [(scenario, replicate) for scenario, replicate, *_ in tasks]
+    checkpoints = checkpoint_directory(
+        output,
+        "simulation_accuracy_marginals",
+        campaign,
+        settings={"methods": methods, "replicates": task_keys},
+        source_paths=_CHECKPOINT_SOURCES,
+    )
+    nested = parallel_map(
+        _posterior_recovery_replicate,
+        tasks,
+        n_jobs,
+        "Experiment 1 posterior marginals",
+        task_keys=task_keys,
+        checkpoint_dir=checkpoints,
+        resume=resume,
+        max_parallel_calibrations=campaign.max_parallel_calibrations,
+        isolate_tasks=campaign.name == "full",
+        worker_memory_reservation_gib=guard["memory_reservation_gib"],
+    )
+    recovered = [item for group in nested for item in group]
+    diagnostics = [record for record, _ in recovered]
+    posteriors = [payload for _, payload in recovered if payload is not None]
+    write_records(
+        output / "experiment_1_marginal_recovery_raw.csv",
+        records_for_export(diagnostics),
+    )
+    save_accuracy_posteriors(posteriors, output)
+    plot_accuracy_parameter_marginals(
+        posteriors,
+        selection,
+        output,
+        save=save_figures,
+        show=_resolve_figure_display(show_figures),
+    )
+    plot_accuracy_gibbs_diagnostics(
+        posteriors,
+        selection,
+        output,
+        save=save_figures,
+        show=_resolve_figure_display(show_figures),
+    )
+    print(f"Posterior marginals written to: {output}")
+    return diagnostics, posteriors
+
+
 def plot_scaling(summary, output, *, save=True, show=False):
     if not summary:
         return
@@ -1387,10 +1970,9 @@ def plot_partition(summary, output, *, save=True, show=False):
         "delta_rel_l2_background",
         "delta_rel_l2_triggering",
         "delta_background_brier",
-        "delta_predictive_log_score",
     )
-    titles = ("Background error", "Triggering error", "Background Brier", "Predictive score loss")
-    figure, axes = plt.subplots(2, 2, figsize=(11, 8), layout="constrained")
+    titles = ("Background error", "Triggering error", "Background Brier")
+    figure, axes = plt.subplots(1, 3, figsize=(12, 4), layout="constrained")
     for axis, metric, title in zip(axes.ravel(), metrics, titles):
         axis.bar([row["scenario"] for row in summary], [row[metric] for row in summary], color="#39706f")
         axis.axhline(0.0, color="black", linewidth=0.8)
@@ -1507,10 +2089,6 @@ def _latex_metric(row, metric, digits=3):
     value = float(row.get(metric, np.nan))
     if not np.isfinite(value):
         return "--"
-    lower = float(row.get(f"{metric}_ci_low", np.nan))
-    upper = float(row.get(f"{metric}_ci_high", np.nan))
-    if np.isfinite(lower) and np.isfinite(upper):
-        return f"{value:.{digits}f} [{lower:.{digits}f}, {upper:.{digits}f}]"
     return f"{value:.{digits}f}"
 
 
@@ -1540,7 +2118,6 @@ def write_experiment_1_latex(output, accuracy_summary, scaling_maxima):
                 _latex_metric(row, "rel_l2_triggering"),
                 _latex_metric(row, "rel_l2_total"),
                 _latex_metric(row, "mae_background"),
-                _latex_metric(row, "predictive_log_score"),
             ]
         )
         parameter_rows.append(
@@ -1563,7 +2140,6 @@ def write_experiment_1_latex(output, accuracy_summary, scaling_maxima):
                 r"$e_{L_2}(\lambda_{\mathrm{trig}})$",
                 r"$e_{L_2}(\lambda)$",
                 r"$\operatorname{MAE}(\mu)$",
-                r"$S_{\mathrm{test}}$",
             ),
             intensity_rows,
         )
@@ -1612,7 +2188,6 @@ def write_experiment_2_latex(output, summary):
             _latex_metric(row, "delta_rel_l2_background"),
             _latex_metric(row, "delta_rel_l2_triggering"),
             _latex_metric(row, "delta_background_brier"),
-            _latex_metric(row, "delta_predictive_log_score"),
             _latex_metric(row, "delta_runtime_seconds", 2),
         ]
         for row in summary
@@ -1624,7 +2199,6 @@ def write_experiment_2_latex(output, summary):
             r"$\Delta e_{L_2}(\mu)$",
             r"$\Delta e_{L_2}(\lambda_{\mathrm{trig}})$",
             r"$\Delta \mathrm{BS}_{\mathrm{bg}}$",
-            r"$\Delta S_{\mathrm{test}}$",
             r"$\Delta$ Time (s)",
         ),
         rows,
@@ -1653,7 +2227,13 @@ def run(
         raise ValueError("experiment must be '1', '2' or 'all'.")
     if panel not in {"accuracy", "scaling", "both"}:
         raise ValueError("panel must be 'accuracy', 'scaling' or 'both'.")
-    n_jobs = resolve_n_jobs(profile, n_jobs)
+    guard = execution_guard(experiment, panel)
+    n_jobs = resolve_n_jobs(
+        profile,
+        n_jobs,
+        max_full_workers=guard["max_workers"],
+        worker_memory_reservation_gib=guard["memory_reservation_gib"],
+    )
     scaling_targets = _validate_execution_settings(n_jobs, scaling_targets)
     if not all(isinstance(value, bool) for value in (resume, save_figures, show_figures)):
         raise ValueError("resume, save_figures and show_figures must be boolean.")
@@ -1686,12 +2266,14 @@ def run(
             "panel": panel,
             "n_jobs": int(n_jobs),
             "effective_workers": effective_worker_count(n_jobs),
+            "memory_policy": guard,
             "resume": resume,
             "scaling_targets": scaling_targets,
             "scaling_methods_by_target": selected_scaling_plan,
             "partition_figure_replicate": PARTITION_FIGURE_REPLICATE,
             "partition_figure_grid_size": PARTITION_FIGURE_GRID_SIZE,
             "experiment_2_durations": EXPERIMENT_2_DURATIONS,
+            "scientific_protocol": simulation_protocol(),
         },
     )
     results = {}
@@ -1707,12 +2289,13 @@ def run(
                 settings={"methods": methods},
                 source_paths=_CHECKPOINT_SOURCES,
             )
-            accuracy, reconstructions = run_accuracy_panel(
+            accuracy, reconstructions, posteriors = run_accuracy_panel(
                 campaign,
                 methods,
                 n_jobs=n_jobs,
                 checkpoint_dir=accuracy_checkpoints,
                 resume=resume,
+                worker_memory_reservation_gib=guard["memory_reservation_gib"],
             )
             accuracy_summary = summarize_records(
                 accuracy, ("scenario", "method", "method_label"), ACCURACY_METRICS
@@ -1723,8 +2306,12 @@ def run(
                     list(METHODS).index(row["method"]),
                 )
             )
-            write_records(output / "experiment_1_accuracy_raw.csv", accuracy)
+            write_records(
+                output / "experiment_1_accuracy_raw.csv",
+                records_for_export(accuracy),
+            )
             write_records(output / "experiment_1_accuracy_table.csv", accuracy_summary)
+            save_accuracy_posteriors(posteriors, output)
             selected, selection_records = select_representative_reconstructions(
                 accuracy, reconstructions
             )
@@ -1735,6 +2322,20 @@ def run(
             plot_accuracy(accuracy_summary, output, save=save_figures, show=display_figures)
             plot_accuracy_reconstruction(
                 selected,
+                output,
+                save=save_figures,
+                show=display_figures,
+            )
+            plot_accuracy_parameter_marginals(
+                posteriors,
+                selection_records,
+                output,
+                save=save_figures,
+                show=display_figures,
+            )
+            plot_accuracy_gibbs_diagnostics(
+                posteriors,
+                selection_records,
                 output,
                 save=save_figures,
                 show=display_figures,
@@ -1755,6 +2356,7 @@ def run(
                 targets=tuple(selected_scaling_plan),
                 checkpoint_dir=scaling_checkpoints,
                 resume=resume,
+                worker_memory_reservation_gib=guard["memory_reservation_gib"],
             )
             scaling_summary = summarize_scaling_records(scaling)
             scaling_maxima = summarize_scaling_maxima(scaling)
@@ -1784,6 +2386,7 @@ def run(
             n_jobs=n_jobs,
             checkpoint_dir=partition_checkpoints,
             resume=resume,
+            worker_memory_reservation_gib=guard["memory_reservation_gib"],
         )
         paired_summary = summarize_records(
             paired,
@@ -1792,7 +2395,6 @@ def run(
                 "delta_rel_l2_background",
                 "delta_rel_l2_triggering",
                 "delta_background_brier",
-                "delta_predictive_log_score",
                 "delta_runtime_seconds",
             ),
         )
@@ -1829,6 +2431,15 @@ def parse_args(argv=None):
     )
     selection = parser.add_argument_group("experiment selection")
     selection.add_argument(
+        "--action",
+        choices=("run", "postprocess", "marginals"),
+        default="run",
+        help=(
+            "Run experiments, rebuild existing outputs, or recover representative "
+            "marginals and Gibbs trace/ACF diagnostics."
+        ),
+    )
+    selection.add_argument(
         "--profile",
         choices=CAMPAIGNS,
         default="smoke",
@@ -1857,7 +2468,7 @@ def parse_args(argv=None):
         "--n-jobs",
         type=int,
         default=None,
-        help="Simultaneous jobs (default: 1). Test 2 before requesting more; RAM is shared.",
+        help="Requested simultaneous jobs (default: 1); full runs are capped by available RAM.",
     )
     selection.add_argument(
         "--scaling-targets",
@@ -1875,12 +2486,14 @@ def parse_args(argv=None):
     budget.add_argument("--vi-starts", type=int, default=None)
     budget.add_argument("--gibbs-iterations", type=int, default=None)
     budget.add_argument("--gibbs-thin", type=int, default=None)
+    budget.add_argument("--gibbs-burn-in", type=float, default=None)
+    budget.add_argument("--gibbs-adaptation-fraction", type=float, default=None)
     budget.add_argument("--vi-iterations", type=int, default=None)
     budget.add_argument("--evaluation-space-grid", type=int, default=None)
     budget.add_argument("--evaluation-time-grid", type=int, default=None)
     budget.add_argument("--quadrature-space-grid", type=int, default=None)
-    budget.add_argument("--quadrature-time-grid", type=int, default=None)
     budget.add_argument("--posterior-draws", type=int, default=None)
+    budget.add_argument("--parameter-draws", type=int, default=None)
     budget.add_argument("--max-parallel-calibrations", type=int, default=None)
     budget.add_argument("--duration-scale", type=float, default=None)
     budget.add_argument("--exact-max-events", type=int, default=None)
@@ -1919,12 +2532,14 @@ def _overrides_from_args(args):
         "vi_starts": args.vi_starts,
         "gibbs_iterations": args.gibbs_iterations,
         "gibbs_thin": args.gibbs_thin,
+        "gibbs_burn_in": args.gibbs_burn_in,
+        "gibbs_adaptation_fraction": args.gibbs_adaptation_fraction,
         "vi_iterations": args.vi_iterations,
         "evaluation_space_grid": args.evaluation_space_grid,
         "evaluation_time_grid": args.evaluation_time_grid,
         "quadrature_space_grid": args.quadrature_space_grid,
-        "quadrature_time_grid": args.quadrature_time_grid,
         "posterior_draws": args.posterior_draws,
+        "parameter_draws": args.parameter_draws,
         "max_parallel_calibrations": args.max_parallel_calibrations,
         "duration_scale": args.duration_scale,
         "exact_max_events": args.exact_max_events,
@@ -1935,6 +2550,22 @@ def _overrides_from_args(args):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.action == "postprocess":
+        return postprocess_accuracy_results(
+            profile=args.profile,
+            save_figures=not args.no_figures,
+            show_figures=args.show_figures,
+        )
+    if args.action == "marginals":
+        return recover_accuracy_marginals(
+            profile=args.profile,
+            methods=args.methods,
+            n_jobs=args.n_jobs,
+            resume=not args.no_resume,
+            save_figures=not args.no_figures,
+            show_figures=args.show_figures,
+            campaign_overrides=_overrides_from_args(args),
+        )
     return run(
         profile=args.profile,
         experiment=args.experiment,

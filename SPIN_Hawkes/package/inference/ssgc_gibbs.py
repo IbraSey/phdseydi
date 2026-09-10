@@ -823,8 +823,9 @@ class SSGC_GibbsSampler:
             Number of observed background events per zone.
         M_j : ndarray, shape (J,)
             Number of latent thinned events per zone.
-        step : float
-            MALA step size h > 0.
+        step : float or ndarray, shape (J,)
+            Positive MALA step, or fixed coordinate-wise steps. A vector uses
+            diagonal preconditioning in both the drift and proposal density.
  
         Returns
         -------
@@ -834,6 +835,9 @@ class SSGC_GibbsSampler:
             True if the proposal was accepted.
         """
         eps_arr = np.array(eps)
+        step = np.asarray(step, dtype=float)
+        if step.shape not in {(), (self.J,)} or not np.all(np.isfinite(step)) or np.any(step <= 0):
+            raise ValueError("MALA step must be positive and scalar or of shape (J,).")
 
         # Reject numerical overflow in a proposal, never an invalid current state.
         grad_cur  = self._grad_log_posterior_eps(eps_arr, N_j, M_j)
@@ -854,10 +858,13 @@ class SSGC_GibbsSampler:
         diff_bwd = eps_arr - eps_star - 0.5 * step**2 * grad_star 
 
         with np.errstate(over="ignore", invalid="ignore"):
-            log_q_ratio = (
-                - 0.5 / step**2 * np.dot(diff_bwd, diff_bwd)
-                + 0.5 / step**2 * np.dot(diff_fwd, diff_fwd)
-            )
+            if step.ndim == 0:
+                log_q_ratio = (
+                    - 0.5 / step**2 * np.dot(diff_bwd, diff_bwd)
+                    + 0.5 / step**2 * np.dot(diff_fwd, diff_fwd)
+                )
+            else:
+                log_q_ratio = .5 * np.sum((diff_fwd / step)**2 - (diff_bwd / step)**2)
             log_ratio = (log_p_star - log_p_cur) + log_q_ratio
         if not np.isfinite(log_ratio):
             return eps_arr, False

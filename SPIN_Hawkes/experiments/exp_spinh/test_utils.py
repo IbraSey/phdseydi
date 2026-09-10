@@ -2,8 +2,8 @@
 
 The runners keep simulation, inference and evaluation choices explicit.  The
 two public campaign profiles are deliberately different: ``smoke`` validates
-the complete workflow in minutes, while ``full`` encodes the numerical design
-described in the draft and is intended for a compute server.
+the complete workflow in minutes, while ``full`` encodes the current numerical
+protocol and requires a substantially larger computational budget.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from numbers import Integral, Real
 from pathlib import Path
 
 import numpy as np
-from scipy.special import logsumexp
 from shapely.ops import unary_union
 
 from experiments.exp_spinh.runner_utils import calibration_slot
@@ -53,13 +52,24 @@ X_BOUNDS = (0.0, 2.0)
 Y_BOUNDS = (0.0, 2.0)
 MAGNITUDE_MIN = 2.0
 MAGNITUDE_MAX = 6.0
-TRAIN_FRACTION = 0.8
 TRUNCATION_RELATIVE_DENSITY = 1e-3
+TRUNCATION_MAX_TAIL_MASS = 0.02
 N_REGIONS = 6
 PARTITION_SEED = 15
 MISSPECIFIED_PARTITION_REGIONS = 5
 MISSPECIFIED_PARTITION_SEED = 47
 PARAMETER_NAMES = ("A", "alpha", "c", "p", "d", "q", "gamma", "beta")
+
+# Accuracy durations were selected from 50 generation-only pilot catalogues per
+# scenario, using seeds starting at 120_000 (easy) and 130_000 (difficult).
+# The selected horizons generated 399.0 and 402.5 events on average.
+ACCURACY_TARGET_EVENTS = 400
+ACCURACY_DURATION_CALIBRATION_REPLICATES = 50
+ACCURACY_DURATION_CALIBRATION_SEED = 120_000
+
+# Keep the scaling design independent from the shorter accuracy catalogues.
+SCALING_REFERENCE_EVENTS = 500
+SCALING_REFERENCE_DURATION = 66.0
 
 # Common initialization and priors used by every compared inference method.
 INITIAL_ETAS = ETASParameters(
@@ -78,21 +88,25 @@ MALA_CURVATURE_SCALE = 1.8
 MH_ETAS_REFERENCE_STEP = 0.35
 MH_ETAS_REFERENCE_EVENTS = 50
 MH_BETA_SCALE = 2.4
+VI_INITIAL_LOG_SD = 0.35
+# Same finite-window spatial integration as Gibbs, independent of the GP grid.
+ETAS_SPATIAL_QUADRATURE = 40
+# Broad shared priors on A, alpha, c, p-1, d, q-1, gamma; not refitted per scenario.
 THETA_PRIORS = {
-    "a_A": 5.0,
-    "b_A": 10.0,
-    "a_alpha": 8.0,
-    "b_alpha": 10.0,
+    "a_A": 2.0,
+    "b_A": 5.0,
+    "a_alpha": 2.0,
+    "b_alpha": 2.0 / 0.6,
     "a_c": 2.0,
-    "b_c": 100.0,
-    "a_p": 4.0,
-    "b_p": 10.0,
+    "b_c": 50.0,
+    "a_p": 2.0,
+    "b_p": 5.0,
     "a_d": 2.0,
-    "b_d": 40.0,
-    "a_q": 9.0,
-    "b_q": 10.0,
-    "a_gamma": 5.0,
-    "b_gamma": 10.0,
+    "b_d": 20.0,
+    "a_q": 2.0,
+    "b_q": 3.0,
+    "a_gamma": 1.0,
+    "b_gamma": 1.0 / 0.3,
 }
 INITIAL_GAMMA_FACTORS = {
     "A": (10.0 * INITIAL_ETAS.A, 10.0),
@@ -126,13 +140,13 @@ METHODS = {
         "truncated": True,
     },
     "m4": {
-        "label": "M4 HSGP MF-VB",
+        "label": "M4 HSGP MF-VI",
         "family": "vi",
         "gp_backend": "sparse",
         "truncated": False,
     },
     "m5": {
-        "label": "M5 Truncated HSGP MF-VB",
+        "label": "M5 Truncated HSGP MF-VI",
         "family": "vi",
         "gp_backend": "sparse",
         "truncated": True,
@@ -142,7 +156,7 @@ METHODS = {
 # Experiment 1 generating configurations.
 SCENARIOS = {
     "easy": {
-        "duration": 66.0,
+        "duration": 51.0,
         "field_scale": 0.90,
         "mus": (8.0, 1.0, 2.0, 8.0, 7.0, 2.0),
         "etas": ETASParameters(
@@ -157,19 +171,19 @@ SCENARIOS = {
         "beta": 2.30,
     },
     "difficult": {
-        "duration": 53.0,
+        "duration": 32.0,
         "field_scale": 0.45,
         "mus": (5.0, 4.0, 4.5, 5.0, 4.0, 4.5),
         "etas": ETASParameters(
-            A=0.35,
-            alpha=0.35,
+            A=0.50,
+            alpha=0.60,
             c=0.08,
-            p=1.12,
-            d=0.16,
-            q=1.25,
-            gamma=0.05,
+            p=1.30,
+            d=0.10,
+            q=1.55,
+            gamma=0.30,
         ),
-        "beta": 2.15,
+        "beta": 2.30,
     },
 }
 
@@ -214,12 +228,14 @@ class CampaignConfig:
     vi_starts: int
     gibbs_iterations: int
     gibbs_thin: int
+    gibbs_burn_in: float
+    gibbs_adaptation_fraction: float
     vi_iterations: int
     evaluation_space_grid: int
     evaluation_time_grid: int
     quadrature_space_grid: int
-    quadrature_time_grid: int
     posterior_draws: int
+    parameter_draws: int
     max_parallel_calibrations: int
     duration_scale: float
     exact_max_events: int
@@ -239,8 +255,8 @@ class CampaignConfig:
             "evaluation_space_grid": 2,
             "evaluation_time_grid": 2,
             "quadrature_space_grid": 2,
-            "quadrature_time_grid": 2,
             "posterior_draws": 1,
+            "parameter_draws": 2,
             "max_parallel_calibrations": 1,
             "exact_max_events": 1,
             "dense_max_events": 1,
@@ -251,7 +267,11 @@ class CampaignConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}.")
-        for name in ("duration_scale",):
+        for name in (
+            "duration_scale",
+            "gibbs_burn_in",
+            "gibbs_adaptation_fraction",
+        ):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
@@ -260,6 +280,12 @@ class CampaignConfig:
                 or value <= 0.0
             ):
                 raise ValueError(f"{name} must be finite and positive.")
+        if not 0.0 < self.gibbs_burn_in < 1.0:
+            raise ValueError("gibbs_burn_in must be in (0, 1).")
+        if not 0.0 < self.gibbs_adaptation_fraction <= self.gibbs_burn_in:
+            raise ValueError(
+                "gibbs_adaptation_fraction must be in (0, gibbs_burn_in]."
+            )
         if not isinstance(self.use_calibration, bool):
             raise ValueError("use_calibration must be boolean.")
 
@@ -274,12 +300,14 @@ CAMPAIGNS = {
         vi_starts=1,
         gibbs_iterations=50,
         gibbs_thin=2,
+        gibbs_burn_in=0.5,
+        gibbs_adaptation_fraction=0.4,
         vi_iterations=10,
         evaluation_space_grid=5,
         evaluation_time_grid=3,
         quadrature_space_grid=4,
-        quadrature_time_grid=3,
         posterior_draws=4,
+        parameter_draws=50,
         max_parallel_calibrations=1,
         duration_scale=0.08,
         exact_max_events=150,
@@ -288,20 +316,22 @@ CAMPAIGNS = {
     ),
     "full": CampaignConfig(
         name="full",
-        n_replicates=5,
+        n_replicates=10,
         n_scaling_replicates=5,
-        n_partition_replicates=5,
-        n_chains=4,
-        vi_starts=5,
-        gibbs_iterations=3000,
+        n_partition_replicates=3,
+        n_chains=3,
+        vi_starts=3,
+        gibbs_iterations=6000,
         gibbs_thin=5,
+        gibbs_burn_in=0.5,
+        gibbs_adaptation_fraction=0.5,
         vi_iterations=500,
-        evaluation_space_grid=15,
-        evaluation_time_grid=10,
+        evaluation_space_grid=25,
+        evaluation_time_grid=4096,
         quadrature_space_grid=12,
-        quadrature_time_grid=10,
         posterior_draws=100,
-        max_parallel_calibrations=2,
+        parameter_draws=1000,
+        max_parallel_calibrations=1,
         duration_scale=1.0,
         exact_max_events=1200,
         dense_max_events=12_000,
@@ -312,11 +342,18 @@ CAMPAIGNS = {
 
 def validate_scientific_settings():
     """Validate all user-editable protocol constants before costly work starts."""
+    if (
+        isinstance(ETAS_SPATIAL_QUADRATURE, bool)
+        or not isinstance(ETAS_SPATIAL_QUADRATURE, Integral)
+        or ETAS_SPATIAL_QUADRATURE < 2
+    ):
+        raise ValueError("ETAS_SPATIAL_QUADRATURE must be an integer >= 2.")
     for name, value in (
         ("MALA_CURVATURE_SCALE", MALA_CURVATURE_SCALE),
         ("MH_ETAS_REFERENCE_STEP", MH_ETAS_REFERENCE_STEP),
         ("MH_ETAS_REFERENCE_EVENTS", MH_ETAS_REFERENCE_EVENTS),
         ("MH_BETA_SCALE", MH_BETA_SCALE),
+        ("VI_INITIAL_LOG_SD", VI_INITIAL_LOG_SD),
     ):
         if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive.")
@@ -327,8 +364,8 @@ def validate_scientific_settings():
         raise ValueError("Magnitude bounds must be finite.")
     if MAGNITUDE_MIN >= MAGNITUDE_MAX:
         raise ValueError("MAGNITUDE_MIN must be smaller than MAGNITUDE_MAX.")
-    if not 0.0 < TRAIN_FRACTION < 1.0:
-        raise ValueError("TRAIN_FRACTION must lie strictly between zero and one.")
+    if not 0.0 < TRUNCATION_MAX_TAIL_MASS < 1.0:
+        raise ValueError("TRUNCATION_MAX_TAIL_MASS must lie strictly between zero and one.")
     if not 0.0 < TRUNCATION_RELATIVE_DENSITY < 1.0:
         raise ValueError("TRUNCATION_RELATIVE_DENSITY must lie in (0, 1).")
     if isinstance(N_REGIONS, bool) or not isinstance(N_REGIONS, Integral) or N_REGIONS < 1:
@@ -520,17 +557,22 @@ def simulate_configuration(
     )
 
 
-def subset_catalog(catalog, mask):
-    mask = np.asarray(mask, dtype=bool)
-    magnitudes = None if catalog.magnitudes is None else catalog.magnitudes[mask]
-    return EventCatalog(catalog.t[mask], catalog.x[mask], catalog.y[mask], magnitudes)
-
-
-def temporal_cutoff(parameters, relative_density=TRUNCATION_RELATIVE_DENSITY):
+def temporal_cutoff(parameters, relative_density=TRUNCATION_RELATIVE_DENSITY, *, horizon=None):
+    """Kernel-height cutoff, widened to control omitted mass on a fixed horizon."""
     relative_density = float(relative_density)
     if not 0.0 < relative_density < 1.0:
         raise ValueError("relative_density must lie in (0, 1).")
-    return float(parameters.c * (relative_density ** (-1.0 / parameters.p) - 1.0))
+    cutoff = float(parameters.c * (relative_density ** (-1.0 / parameters.p) - 1.0))
+    if horizon is not None:
+        horizon = float(horizon)
+        if not np.isfinite(horizon) or horizon <= 0:
+            raise ValueError("horizon must be finite and positive.")
+        c, p = parameters.c, parameters.p
+        horizon_tail = (c / (c + horizon)) ** (p - 1)
+        allowed_tail = horizon_tail + TRUNCATION_MAX_TAIL_MASS * (1 - horizon_tail)
+        mass_cutoff = c * (allowed_tail ** (-1 / (p - 1)) - 1)
+        cutoff = min(horizon, max(cutoff, mass_cutoff))
+    return cutoff
 
 
 def omitted_temporal_mass(parameters, cutoff, horizon):
@@ -582,44 +624,42 @@ def relative_l2_and_mae(estimate, truth):
     return float(rel_l2), float(np.mean(np.abs(estimate - truth)))
 
 
+def mcmc_diagnostics(chains):
+    """ArviZ rank R-hat, bulk/tail ESS and mean MCSE, one value per coordinate."""
+    import arviz as az
+
+    chains = np.asarray(chains, dtype=float)
+    if chains.ndim != 3 or min(chains.shape) < 1:
+        raise ValueError("Expected non-empty (chain, draw, parameter) arrays.")
+    result = {name: np.full(chains.shape[2], np.nan) for name in ("rhat", "ess_bulk", "ess_tail", "mcse_mean")}
+    for k in range(chains.shape[2]):
+        values = chains[:, :, k]
+        if not np.isfinite(values).all() or np.any(np.ptp(values, axis=1) == 0):
+            result["rhat"][k] = np.inf
+            result["ess_bulk"][k] = result["ess_tail"][k] = 0.
+        elif values.shape[1] >= 4:
+            if len(values) >= 2:
+                result["rhat"][k] = float(az.rhat(values, method="rank"))
+            result["ess_bulk"][k] = float(az.ess(values, method="bulk"))
+            result["ess_tail"][k] = float(az.ess(values, method="tail"))
+            result["mcse_mean"][k] = float(az.mcse(values, method="mean"))
+    return result
+
+
 def split_rhat(chains):
+    """Maximum rank-normalized split R-hat, including the folded diagnostic."""
     chains = np.asarray(chains, dtype=float)
     if chains.ndim != 3 or chains.shape[0] < 2 or chains.shape[1] < 4:
         return float("nan")
-    half = chains.shape[1] // 2
-    split = np.concatenate([chains[:, :half], chains[:, -half:]], axis=0)
-    within = np.mean(np.var(split, axis=1, ddof=1), axis=0)
-    between = half * np.var(np.mean(split, axis=1), axis=0, ddof=1)
-    variance = (half - 1.0) * within / half + between / half
-    ratios = np.divide(variance, within, out=np.ones_like(variance), where=within > 0)
-    return float(np.max(np.sqrt(np.maximum(ratios, 0.0))))
+    return float(np.max(mcmc_diagnostics(chains)["rhat"]))
 
 
 def effective_sample_size(chains):
+    """Minimum bulk ESS, accounting for both within- and between-chain variation."""
     chains = np.asarray(chains, dtype=float)
     if chains.ndim != 3 or chains.shape[1] < 3:
         return float("nan")
-    n_chains, n_draws, n_parameters = chains.shape
-    results = []
-    for parameter in range(n_parameters):
-        values = chains[:, :, parameter]
-        centered = values - values.mean(axis=1, keepdims=True)
-        variance = np.mean(np.sum(centered**2, axis=1) / max(n_draws - 1, 1))
-        if variance <= 0.0:
-            results.append(float(n_chains * n_draws))
-            continue
-        correlation_sum = 0.0
-        for lag in range(1, n_draws):
-            covariance = np.mean(
-                np.sum(centered[:, :-lag] * centered[:, lag:], axis=1)
-                / (n_draws - lag)
-            )
-            correlation = covariance / variance
-            if correlation <= 0.0:
-                break
-            correlation_sum += correlation
-        results.append(n_chains * n_draws / (1.0 + 2.0 * correlation_sum))
-    return float(np.min(results))
+    return float(np.min(mcmc_diagnostics(chains)["ess_bulk"]))
 
 
 @dataclass
@@ -629,15 +669,35 @@ class FitBundle:
     fits: tuple
     runtime_seconds: float
     diagnostics: dict
+    burn_in: float = 0.5
 
 
 def _gibbs_parameter_chains(fits, burn_in=0.5):
     chains = []
     for fit in fits:
-        theta = np.asarray(fit.etas_chain, dtype=float)
-        beta = np.asarray(fit.beta_chain, dtype=float).reshape(-1, 1)
+        theta = np.asarray(
+            getattr(fit, "etas_diagnostic_chain", fit.etas_chain), dtype=float
+        )
+        beta = np.asarray(
+            getattr(fit, "beta_diagnostic_chain", fit.beta_chain), dtype=float
+        ).reshape(-1, 1)
         burn = int(theta.shape[0] * burn_in)
         chains.append(np.column_stack([theta[burn:], beta[burn:]]))
+    minimum = min(chain.shape[0] for chain in chains)
+    return np.stack([chain[-minimum:] for chain in chains], axis=0)
+
+
+def gibbs_parameter_traces(bundle):
+    """Return complete unthinned scalar traces with shape (chain, draw, parameter)."""
+    if METHODS[bundle.method]["family"] != "gibbs":
+        raise TypeError("Complete Gibbs traces are unavailable for VI fits.")
+    chains = []
+    for fit in bundle.fits:
+        theta = np.asarray(fit.etas_diagnostic_chain, dtype=float)
+        beta = np.asarray(fit.beta_diagnostic_chain, dtype=float).reshape(-1, 1)
+        if theta.shape[0] != beta.shape[0]:
+            raise ValueError("ETAS and beta diagnostic traces must be aligned.")
+        chains.append(np.column_stack([theta, beta]))
     minimum = min(chain.shape[0] for chain in chains)
     return np.stack([chain[-minimum:] for chain in chains], axis=0)
 
@@ -665,6 +725,77 @@ def proposal_steps(model, catalog):
     }
 
 
+def initial_gamma_factors_for_start(start, seed):
+    """Keep the reference start, then perturb means without changing rate bounds."""
+    factors = dict(INITIAL_GAMMA_FACTORS)
+    if start == 0:
+        return factors
+    rng = np.random.default_rng(seed)
+    for name, (shape, rate) in factors.items():
+        if name != "beta":
+            factors[name] = (
+                shape * float(np.exp(rng.normal(0, VI_INITIAL_LOG_SD))),
+                rate,
+            )
+    return factors
+
+
+def _fit_spinh_vi(model, catalog, method, settings, campaign, seed, cutoff, started):
+    """Run the MF-VI starts used by M4 and M5 and retain the best ELBO."""
+    candidates = []
+    for start in range(campaign.vi_starts):
+        start_seed = int(seed + 1009 * start)
+        config = SPINHVIConfig(
+            n_iter=campaign.vi_iterations,
+            tolerance=1e-5,
+            verbose=False,
+            random_seed=start_seed,
+            gp_backend=settings["gp_backend"],
+            use_calibration=False,
+            quadrature_nx=campaign.quadrature_space_grid,
+            quadrature_ny=campaign.quadrature_space_grid,
+            eps_newton_steps=8,
+            spatial_compensator_grid=ETAS_SPATIAL_QUADRATURE,
+            etas_update_start=min(5, max(0, campaign.vi_iterations - 1)),
+            etas_update_every=5,
+            max_optimizer_iter=10,
+            gamma_quadrature_nodes=4,
+            theta_priors=THETA_PRIORS,
+            initial_gamma_factors=initial_gamma_factors_for_start(start, start_seed),
+            parent_time_window=cutoff,
+        )
+        fit = model.vi(catalog, config=config)
+        final_elbo = float(fit.elbo_trace[-1]) if fit.elbo_trace else -np.inf
+        candidates.append((final_elbo, fit))
+    runtime = time.perf_counter() - started
+    best_start, (final_elbo, fit) = max(
+        enumerate(candidates),
+        key=lambda item: item[1][0] if np.isfinite(item[1][0]) else -np.inf,
+    )
+    diagnostics = {
+        "status": "ok",
+        "runtime_seconds": float(runtime),
+        "rhat_max": float("nan"),
+        "ess_min": float("nan"),
+        "n_iter_run": int(fit.diagnostics["n_iter_run"]),
+        "final_elbo": float(final_elbo),
+        "vi_starts_run": campaign.vi_starts,
+        "vi_best_start": int(best_start),
+        "vi_start_elbos": [float(elbo) for elbo, _ in candidates],
+        "converged": bool(fit.diagnostics["converged"]),
+        "etas_variational_family": "mean_field_gamma",
+        "diagnostic_status": (
+            "ok" if fit.diagnostics["converged"] else "not_converged"
+        ),
+    }
+    truncation = fit.diagnostics.get("branching_truncation")
+    if truncation:
+        diagnostics.update(truncation)
+    return FitBundle(
+        method, model, (fit,), runtime, diagnostics, campaign.gibbs_burn_in
+    ), diagnostics
+
+
 def fit_spinh_method(
     model,
     catalog,
@@ -679,181 +810,168 @@ def fit_spinh_method(
     if method not in METHODS:
         raise ValueError(f"Unknown method {method!r}.")
     settings = METHODS[method]
-    if method == "m1" and len(catalog) > campaign.exact_max_events:
+    if settings["gp_backend"] == "exact" and len(catalog) > campaign.exact_max_events:
         return None, {"status": "skipped_exact_size"}
     if not settings["truncated"] and len(catalog) > campaign.dense_max_events:
         return None, {"status": "skipped_dense_size"}
     cutoff = float(parent_time_window) if settings["truncated"] else None
     started = time.perf_counter()
-    if settings["family"] == "gibbs":
-        steps = proposal_steps(model, catalog)
-        if mala_step is not None:
-            steps["mala_step"] = float(mala_step)
-        fits = []
-        for chain in range(campaign.n_chains):
-            sparse_gp = None
-            if settings["gp_backend"] == "sparse":
-                sparse_gp = SparseGP.from_bounds(
-                    model.x_bounds,
-                    model.y_bounds,
-                    model.gp_prior.variance,
-                    model.gp_prior.length_scale,
-                )
-            config = SPINHGibbsConfig(
-                n_iter=campaign.gibbs_iterations,
-                thin=campaign.gibbs_thin,
-                **steps,
-                verbose=False,
-                use_calibration=False,
-                beta_init=INITIAL_BETA,
-                theta_priors=THETA_PRIORS,
-                adaptation_start=min(200, max(1, campaign.gibbs_iterations // 4)),
-                proposal_jitter=1e-6,
-                parent_time_window=cutoff,
+    if settings["family"] == "vi":
+        return _fit_spinh_vi(
+            model, catalog, method, settings, campaign, seed, cutoff, started
+        )
+    steps = proposal_steps(model, catalog)
+    if mala_step is not None:
+        steps["mala_step"] = float(mala_step)
+    fits = []
+    for chain in range(campaign.n_chains):
+        sparse_gp = None
+        if settings["gp_backend"] == "sparse":
+            sparse_gp = SparseGP.from_bounds(
+                model.x_bounds,
+                model.y_bounds,
+                model.gp_prior.variance,
+                model.gp_prior.length_scale,
             )
-            fits.append(
-                model.gibbs(
-                    catalog,
-                    config=config,
-                    gp_backend=settings["gp_backend"],
-                    sparse_gp=sparse_gp,
-                    rng_seed=int(seed + 1009 * chain),
-                )
-            )
-        runtime = time.perf_counter() - started
-        parameter_chains = _gibbs_parameter_chains(fits)
-        ess = effective_sample_size(parameter_chains)
-        diagnostics = {
-            "status": "ok",
-            "runtime_seconds": float(runtime),
-            "branching_update_seconds": float(
-                sum(fit.raw.get("branching_update_seconds", 0.0) for fit in fits)
-            ),
-            "rhat_max": split_rhat(parameter_chains),
-            "ess_min": ess,
-            "ess_per_second": ess / max(runtime, 1e-12),
-            "n_iter_run": campaign.gibbs_iterations,
-            "final_elbo": float("nan"),
-            "vi_starts_run": 0,
+        adaptation_start = min(200, max(0, campaign.gibbs_iterations // 4))
+        adaptation_end = min(campaign.gibbs_iterations, max(
+            adaptation_start + 1,
+            int(campaign.gibbs_iterations * campaign.gibbs_adaptation_fraction),
+        ))
+        config = SPINHGibbsConfig(
+            n_iter=campaign.gibbs_iterations,
+            thin=campaign.gibbs_thin,
             **steps,
-        }
-        for block in fits[0].raw["acceptance_history"]:
-            histories = [fit.raw["acceptance_history"][block] for fit in fits]
-            for phase, start, stop in (
-                ("initial", 0, config.adaptation_start + 1),
-                ("retained", campaign.gibbs_iterations // 2, campaign.gibbs_iterations),
-            ):
-                diagnostics[f"acceptance_{block}_{phase}"] = float(np.mean(
-                    np.concatenate([history[start:stop] for history in histories])
-                ))
-        if campaign.gibbs_iterations >= 200:
-            problematic = []
-            for block in fits[0].raw["acceptance_history"]:
-                rate = diagnostics[f"acceptance_{block}_retained"]
-                if rate < 0.05 or (block == "eps" and rate > 0.98):
-                    problematic.append(f"{block}={rate:.1%}")
-            if problematic:
-                message = f"{method.upper()} proposal acceptance requires inspection: " + ", ".join(problematic)
-                diagnostics["proposal_warning"] = message
-                warnings.warn(message, RuntimeWarning, stacklevel=2)
-        truncation = fits[0].raw.get("branching_truncation")
-        if truncation:
-            diagnostics.update(truncation)
-        return FitBundle(method, model, tuple(fits), runtime, diagnostics), diagnostics
-
-    candidates = []
-    total_branching_seconds = 0.0
-    for start in range(campaign.vi_starts):
-        start_seed = int(seed + 1009 * start)
-        config = SPINHVIConfig(
-            n_iter=campaign.vi_iterations,
-            tolerance=1e-5,
             verbose=False,
-            random_seed=start_seed,
-            gp_backend="sparse",
             use_calibration=False,
-            quadrature_nx=campaign.quadrature_space_grid,
-            quadrature_ny=campaign.quadrature_space_grid,
-            eps_newton_steps=8,
-            spatial_compensator_grid=campaign.quadrature_space_grid,
-            etas_update_start=min(5, max(0, campaign.vi_iterations - 1)),
-            etas_update_every=5,
-            max_optimizer_iter=10,
-            gamma_quadrature_nodes=4,
+            beta_init=INITIAL_BETA,
             theta_priors=THETA_PRIORS,
-            initial_gamma_factors=INITIAL_GAMMA_FACTORS,
+            adaptation_start=adaptation_start,
+            etas_adaptation_end=adaptation_end,
+            proposal_jitter=1e-6,
+            spatial_compensator_grid=ETAS_SPATIAL_QUADRATURE,
             parent_time_window=cutoff,
         )
-        fit = model.vi(catalog, config=config)
-        final_elbo = float(fit.elbo_trace[-1]) if fit.elbo_trace else -np.inf
-        candidates.append((final_elbo, fit))
-        total_branching_seconds += fit.diagnostics.get("branching_update_seconds", 0.0)
+        fits.append(
+            model.gibbs(
+                catalog,
+                config=config,
+                gp_backend=settings["gp_backend"],
+                sparse_gp=sparse_gp,
+                rng_seed=int(seed + 1009 * chain),
+            )
+        )
     runtime = time.perf_counter() - started
-    final_elbo, fit = max(
-        candidates,
-        key=lambda item: item[0] if np.isfinite(item[0]) else -np.inf,
+    parameter_chains = _gibbs_parameter_chains(
+        fits, burn_in=campaign.gibbs_burn_in
     )
+    parameter_diagnostics = mcmc_diagnostics(parameter_chains)
+    ess = float(np.min(parameter_diagnostics["ess_bulk"]))
+    background_chains = np.stack([
+        np.column_stack([
+            fit.eps_diagnostic_chain,
+            fit.raw.get(
+                "background_fraction_trace",
+                (fit.branching_chain == 0).mean(axis=1),
+            ),
+        ])[int(fit.eps_diagnostic_chain.shape[0] * campaign.gibbs_burn_in):]
+        for fit in fits
+    ])
+    background_diagnostics = mcmc_diagnostics(background_chains)
     diagnostics = {
         "status": "ok",
         "runtime_seconds": float(runtime),
-        "branching_update_seconds": float(total_branching_seconds),
-        "rhat_max": float("nan"),
-        "ess_min": float("nan"),
-        "ess_per_second": float("nan"),
-        "n_iter_run": int(fit.diagnostics["n_iter_run"]),
-        "final_elbo": float(final_elbo),
-        "vi_starts_run": campaign.vi_starts,
-        "converged": bool(fit.diagnostics["converged"]),
+        "rhat_max": float(np.max(parameter_diagnostics["rhat"])),
+        "ess_min": ess,
+        "ess_tail_min": float(np.min(parameter_diagnostics["ess_tail"])),
+        "rhat_background_max": float(np.max(background_diagnostics["rhat"])),
+        "ess_background_min": float(np.min(background_diagnostics["ess_bulk"])),
+        "ess_background_tail_min": float(np.min(background_diagnostics["ess_tail"])),
+        "mcmc_diagnostic_method": "arviz_rank_bulk_tail",
+        "n_iter_run": campaign.gibbs_iterations,
+        "burn_in_fraction": campaign.gibbs_burn_in,
+        **steps,
     }
-    truncation = fit.diagnostics.get("branching_truncation")
+    if len(fits) < 2:
+        diagnostics["diagnostic_status"] = "insufficient_chains"
+    else:
+        rhats = [diagnostics["rhat_max"], diagnostics["rhat_background_max"]]
+        effective_sizes = [ess, diagnostics["ess_tail_min"], diagnostics["ess_background_min"], diagnostics["ess_background_tail_min"]]
+        diagnostics["diagnostic_status"] = (
+            "ok" if np.isfinite(rhats).all() and max(rhats) <= 1.01
+            and np.isfinite(effective_sizes).all() and min(effective_sizes) >= 100 * len(fits)
+            else "check_mixing"
+        )
+    for k, name in enumerate(PARAMETER_NAMES):
+        for statistic, values in parameter_diagnostics.items():
+            diagnostics[f"{statistic}_{name}"] = float(values[k])
+    for block in fits[0].raw["acceptance_history"]:
+        histories = [fit.raw["acceptance_history"][block] for fit in fits]
+        for phase, start, stop in (
+            ("initial", 0, config.adaptation_start + 1),
+            (
+                "retained",
+                int(campaign.gibbs_iterations * campaign.gibbs_burn_in),
+                campaign.gibbs_iterations,
+            ),
+        ):
+            diagnostics[f"acceptance_{block}_{phase}"] = float(np.mean(
+                np.concatenate([history[start:stop] for history in histories])
+            ))
+    if campaign.gibbs_iterations >= 200:
+        problematic = []
+        for block in fits[0].raw["acceptance_history"]:
+            rate = diagnostics[f"acceptance_{block}_retained"]
+            if rate < 0.05 or (block == "eps" and rate > 0.98):
+                problematic.append(f"{block}={rate:.1%}")
+        if problematic:
+            message = f"{method.upper()} proposal acceptance requires inspection: " + ", ".join(problematic)
+            diagnostics["proposal_warning"] = message
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+    truncation = fits[0].raw.get("branching_truncation")
     if truncation:
         diagnostics.update(truncation)
-    return FitBundle(method, model, (fit,), runtime, diagnostics), diagnostics
+    for block, adaptation in fits[0].raw.get("etas_adaptation", {}).items():
+        diagnostics[f"proposal_scale_{block}"] = adaptation["scale"]
+    return FitBundle(
+        method, model, tuple(fits), runtime, diagnostics, campaign.gibbs_burn_in
+    ), diagnostics
 
 
 def _vi_parameter_draws(fit, n_draws, seed):
-    rng = np.random.default_rng(seed)
-    state = fit.state.etas
-    result = {}
-    shifted = {"p": "p_minus_1", "q": "q_minus_1"}
-    for name in PARAMETER_NAMES[:-1]:
-        if name in state.fixed_etas:
-            values = np.full(n_draws, state.fixed_etas[name])
-        else:
-            factor_name = shifted.get(name, name)
-            factor = state.gamma_factors[factor_name]
-            values = rng.gamma(factor.shape, 1.0 / factor.rate, size=n_draws)
-            if name in shifted:
-                values += 1.0
-        result[name] = values
-    if state.beta_gamma is None:
-        result["beta"] = np.full(n_draws, state.beta_mean)
-    else:
-        result["beta"] = rng.gamma(
-            state.beta_gamma.shape,
-            1.0 / state.beta_gamma.rate,
-            size=n_draws,
-        )
-    return result
+    return fit.posterior_parameter_samples(n_samples=n_draws, rng_seed=seed)
 
 
-def posterior_parameter_draws(bundle, n_draws, seed=0, burn_in=0.5):
+def posterior_parameter_draws(bundle, n_draws, seed=0, burn_in=None):
     n_draws = int(n_draws)
     if METHODS[bundle.method]["family"] == "vi":
         return _vi_parameter_draws(bundle.fits[0], n_draws, seed)
+    burn_in = getattr(bundle, "burn_in", 0.5) if burn_in is None else burn_in
     chains = _gibbs_parameter_chains(bundle.fits, burn_in=burn_in)
     flattened = chains.reshape(-1, chains.shape[-1])
+    n_draws = min(n_draws, len(flattened))
     positions = np.linspace(0, len(flattened) - 1, n_draws).round().astype(int)
     selected = flattened[positions]
     return {name: selected[:, index] for index, name in enumerate(PARAMETER_NAMES)}
 
 
-def posterior_background_draws(bundle, xy, n_draws, seed=0, burn_in=0.5):
+def posterior_parameter_means(bundle, burn_in=None):
+    """Avoid subsampling noise when a parameter's posterior mean is available."""
+    if METHODS[bundle.method]["family"] == "vi":
+        fit = bundle.fits[0]
+        return {**fit.etas_mean().as_dict(), "beta": float(fit.state.etas.beta_mean)}
+    burn_in = getattr(bundle, "burn_in", 0.5) if burn_in is None else burn_in
+    means = _gibbs_parameter_chains(bundle.fits, burn_in=burn_in).mean(axis=(0, 1))
+    return {name: float(means[index]) for index, name in enumerate(PARAMETER_NAMES)}
+
+
+def posterior_background_draws(bundle, xy, n_draws, seed=0, burn_in=None):
     xy = np.asarray(xy, dtype=float)
     if METHODS[bundle.method]["family"] == "vi":
         return bundle.fits[0].background_intensity_samples(
             xy[:, 0], xy[:, 1], n_samples=n_draws, rng_seed=seed
         )
+    burn_in = getattr(bundle, "burn_in", 0.5) if burn_in is None else burn_in
     per_chain = int(math.ceil(n_draws / len(bundle.fits)))
     samples = [
         fit.background_intensity_samples(
@@ -864,24 +982,32 @@ def posterior_background_draws(bundle, xy, n_draws, seed=0, burn_in=0.5):
     return np.concatenate(samples, axis=1)[:, :n_draws]
 
 
-def posterior_intensity_draws(bundle, times, xy, history, n_draws, seed=0):
-    times = np.asarray(times, dtype=float).reshape(-1)
-    xy = np.asarray(xy, dtype=float)
-    unique_xy, inverse = np.unique(xy, axis=0, return_inverse=True)
-    unique_background = posterior_background_draws(
-        bundle, unique_xy, n_draws, seed=seed
-    )
-    background = unique_background[inverse]
-    parameter_draws = posterior_parameter_draws(bundle, n_draws, seed=seed + 17)
-    triggering = np.empty_like(background)
-    for draw in range(n_draws):
-        parameters = ETASParameters(
-            **{name: parameter_draws[name][draw] for name in PARAMETER_NAMES[:-1]}
+def triggering_on_grid(model, time_nodes, spatial_xy, history, parameters):
+    """Evaluate the exact separable ETAS kernel without a (time*space)-by-N array."""
+    time_nodes = np.asarray(time_nodes, dtype=float).reshape(-1)
+    spatial_xy = np.asarray(spatial_xy, dtype=float)
+    if spatial_xy.ndim != 2 or spatial_xy.shape[1] != 2:
+        raise ValueError("spatial_xy must have shape (n_points, 2).")
+    if not np.all(np.isfinite(time_nodes)) or not np.all(np.isfinite(spatial_xy)):
+        raise ValueError("Evaluation times and coordinates must be finite.")
+    if len(history) and parameters.marked and history.magnitudes is None:
+        raise ValueError("Marked triggering intensity requires history magnitudes.")
+    result = np.zeros((time_nodes.size, len(spatial_xy)))
+    kernel = model.etas_kernel
+    for start in range(0, len(history), 2048):
+        stop = min(start + 2048, len(history))
+        magnitudes = (
+            history.magnitudes[start:stop] if history.magnitudes is not None
+            else np.full(stop - start, model.magnitude_min)
         )
-        triggering[:, draw] = bundle.model.triggering_intensity(
-            times, xy[:, 0], xy[:, 1], history, parameters
-        )
-    return background, triggering, background + triggering, parameter_draws
+        dt = time_nodes[:, None] - history.t[None, start:stop]
+        r2 = (spatial_xy[:, 0, None] - history.x[None, start:stop]) ** 2
+        r2 += (spatial_xy[:, 1, None] - history.y[None, start:stop]) ** 2
+        temporal = kernel.temporal.evaluate(dt, parameters)
+        spatial = kernel.spatial.evaluate(r2, magnitudes[None, :], parameters, model.magnitude_min)
+        productivity = kernel.productivity.evaluate(magnitudes, parameters, model.magnitude_min)
+        result += temporal @ (spatial * productivity).T
+    return result.reshape(-1)
 
 
 def parameter_recovery_metrics(parameter_draws, true_etas, true_beta):
@@ -938,10 +1064,6 @@ def branching_metrics(bundle, true_parent_indices, event_times, cutoff):
         labels = np.concatenate(chains, axis=0)
         p_background = np.mean(labels == 0, axis=0)
         true_probability = np.mean(labels == true_labels[None, :], axis=0)
-        mode = np.empty(labels.shape[1], dtype=int)
-        for event in range(labels.shape[1]):
-            values, counts = np.unique(labels[:, event], return_counts=True)
-            mode[event] = values[np.argmax(counts)]
     else:
         probabilities = bundle.fits[0].state.branching.probabilities
         p_background = bundle.fits[0].state.branching.p_background
@@ -951,13 +1073,10 @@ def branching_metrics(bundle, true_parent_indices, event_times, cutoff):
                 [probabilities[event, label] for event, label in enumerate(true_labels)],
                 dtype=float,
             )
-            mode = np.asarray(probabilities.argmax(axis=1)).reshape(-1)
         else:
             true_probability = probabilities[np.arange(len(true_labels)), true_labels]
-            mode = np.argmax(probabilities, axis=1)
     predicted_background = p_background >= 0.5
     triggered = ~true_background
-    parent_accuracy = float(np.mean(mode[triggered] == true_labels[triggered])) if np.any(triggered) else float("nan")
     if METHODS[bundle.method]["truncated"]:
         retained = np.ones(len(true_labels), dtype=bool)
         child = np.flatnonzero(triggered)
@@ -973,7 +1092,6 @@ def branching_metrics(bundle, true_parent_indices, event_times, cutoff):
         "background_accuracy": float(np.mean(predicted_background == true_background)),
         "background_f1": _binary_f1(true_background, predicted_background),
         "mean_true_state_probability": float(np.mean(true_probability)),
-        "exact_parent_accuracy": parent_accuracy,
         "candidate_recall": candidate_recall,
         "estimated_background_fraction": float(np.mean(p_background)),
     }
@@ -997,36 +1115,6 @@ def candidate_diagnostics(event_times, parent_indices, cutoff):
     }
 
 
-def predictive_log_score(bundle, full_catalog, train_end, campaign, seed):
-    test_mask = full_catalog.t > float(train_end)
-    if not np.any(test_mask):
-        return float("nan")
-    test_catalog = subset_catalog(full_catalog, test_mask)
-    q_times, q_xy, q_weights = regular_spacetime_grid(
-        campaign.quadrature_space_grid,
-        campaign.quadrature_time_grid,
-        (train_end, bundle.model.duration / TRAIN_FRACTION),
-        bundle.model.x_bounds,
-        bundle.model.y_bounds,
-    )
-    evaluation_times = np.concatenate([test_catalog.t, q_times])
-    evaluation_xy = np.vstack([test_catalog.xy, q_xy])
-    _, _, total, _ = posterior_intensity_draws(
-        bundle,
-        evaluation_times,
-        evaluation_xy,
-        full_catalog,
-        campaign.posterior_draws,
-        seed=seed,
-    )
-    n_test = len(test_catalog)
-    log_likelihood = (
-        np.sum(np.log(np.maximum(total[:n_test], np.finfo(float).tiny)), axis=0)
-        - q_weights @ total[n_test:]
-    )
-    return float((logsumexp(log_likelihood) - np.log(len(log_likelihood))) / n_test)
-
-
 def intensity_recovery_metrics(
     bundle,
     simulation,
@@ -1039,10 +1127,8 @@ def intensity_recovery_metrics(
     return_payload=False,
 ):
     spatial_xy, _ = regular_spatial_grid(campaign.evaluation_space_grid)
-    st_times, st_xy, _ = regular_spacetime_grid(
-        campaign.evaluation_space_grid,
-        campaign.evaluation_time_grid,
-        (0.0, simulation.background_simulation.duration),
+    time_nodes = (np.arange(campaign.evaluation_time_grid) + 0.5) * (
+        simulation.background_simulation.duration / campaign.evaluation_time_grid
     )
     background_draws = posterior_background_draws(
         bundle, spatial_xy, campaign.posterior_draws, seed=seed
@@ -1050,40 +1136,27 @@ def intensity_recovery_metrics(
     parameter_draws = posterior_parameter_draws(
         bundle, campaign.posterior_draws, seed=seed + 17
     )
-    triggering_draws = np.empty((len(st_times), campaign.posterior_draws))
+    triggering_estimate = np.zeros(len(time_nodes) * len(spatial_xy))
     for draw in range(campaign.posterior_draws):
         parameters = ETASParameters(
             **{name: parameter_draws[name][draw] for name in PARAMETER_NAMES[:-1]}
         )
-        triggering_draws[:, draw] = bundle.model.triggering_intensity(
-            st_times,
-            st_xy[:, 0],
-            st_xy[:, 1],
-            simulation.catalog,
-            parameters,
+        triggering_estimate += triggering_on_grid(
+            bundle.model, time_nodes, spatial_xy, simulation.catalog, parameters,
         )
+    triggering_estimate /= campaign.posterior_draws
     background_partition = simulation.background_simulation.domains
     spatial_domains = background_partition.locate(spatial_xy[:, 0], spatial_xy[:, 1])
-    st_domains = background_partition.locate(st_xy[:, 0], st_xy[:, 1])
     true_eps = np.log(np.asarray(true_mus, dtype=float))
     background_true = np.exp(true_eps[spatial_domains]) / (
         1.0 + np.exp(-latent_field(spatial_xy[:, 0], spatial_xy[:, 1], field_scale))
     )
-    background_true_st = np.exp(true_eps[st_domains]) / (
-        1.0 + np.exp(-latent_field(st_xy[:, 0], st_xy[:, 1], field_scale))
-    )
-    triggering_true = bundle.model.triggering_intensity(
-        st_times,
-        st_xy[:, 0],
-        st_xy[:, 1],
-        simulation.catalog,
-        true_etas,
+    background_true_st = np.tile(background_true, len(time_nodes))
+    triggering_true = triggering_on_grid(
+        bundle.model, time_nodes, spatial_xy, simulation.catalog, true_etas,
     )
     background_estimate = background_draws.mean(axis=1)
-    triggering_estimate = triggering_draws.mean(axis=1)
-    total_estimate = background_draws.mean(axis=1)[
-        np.tile(np.arange(len(spatial_xy)), campaign.evaluation_time_grid)
-    ] + triggering_estimate
+    total_estimate = np.tile(background_estimate, len(time_nodes)) + triggering_estimate
     total_true = background_true_st + triggering_true
     metrics = {}
     for name, estimate, truth in (
@@ -1094,20 +1167,22 @@ def intensity_recovery_metrics(
         rel_l2, mae = relative_l2_and_mae(estimate, truth)
         metrics[f"rel_l2_{name}"] = rel_l2
         metrics[f"mae_{name}"] = mae
+        metrics[f"truth_rms_{name}"] = float(np.sqrt(np.mean(truth ** 2)))
+        metrics[f"rmse_{name}"] = float(np.sqrt(np.mean((estimate - truth) ** 2)))
+    metrics["triggering_mean_ratio"] = float(np.mean(triggering_estimate) / max(np.mean(triggering_true), 1e-15))
     if not return_payload:
         return metrics
     payload = {
         "space_grid_size": int(campaign.evaluation_space_grid),
         "time_grid_size": int(campaign.evaluation_time_grid),
         "spatial_xy": spatial_xy,
-        "spacetime_times": st_times,
-        "spacetime_xy": st_xy,
+        "surfaces_time_averaged": True,
         "background_true": background_true,
         "background_estimate": background_estimate,
-        "triggering_true": triggering_true,
-        "triggering_estimate": triggering_estimate,
-        "total_true": total_true,
-        "total_estimate": total_estimate,
+        "triggering_true": triggering_true.reshape(len(time_nodes), -1).mean(axis=0),
+        "triggering_estimate": triggering_estimate.reshape(len(time_nodes), -1).mean(axis=0),
+        "total_true": total_true.reshape(len(time_nodes), -1).mean(axis=0),
+        "total_estimate": total_estimate.reshape(len(time_nodes), -1).mean(axis=0),
     }
     return metrics, payload
 
@@ -1165,6 +1240,35 @@ def write_campaign(path, campaign, extra=None):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def simulation_protocol():
+    """Snapshot the scientific settings as well as the computational budget."""
+    return {
+        "fit_scope": "complete_catalogue",
+        "predictive_score": False,
+        "accuracy_target_events": ACCURACY_TARGET_EVENTS,
+        "accuracy_duration_calibration": {
+            "replicates_per_scenario": ACCURACY_DURATION_CALIBRATION_REPLICATES,
+            "base_seed": ACCURACY_DURATION_CALIBRATION_SEED,
+        },
+        "scenarios": {
+            name: {**settings, "etas": settings["etas"].as_dict()}
+            for name, settings in SCENARIOS.items()
+        },
+        "theta_priors": dict(THETA_PRIORS),
+        "initial_etas": INITIAL_ETAS.as_dict(),
+        "initial_beta": INITIAL_BETA,
+        "vi_initial_log_sd": VI_INITIAL_LOG_SD,
+        "x_bounds": X_BOUNDS,
+        "y_bounds": Y_BOUNDS,
+        "magnitude_bounds": (MAGNITUDE_MIN, MAGNITUDE_MAX),
+        "partition_seed": PARTITION_SEED,
+        "n_regions": N_REGIONS,
+        "truncation_relative_density": TRUNCATION_RELATIVE_DENSITY,
+        "truncation_max_tail_mass": TRUNCATION_MAX_TAIL_MASS,
+        "etas_spatial_quadrature": ETAS_SPATIAL_QUADRATURE,
+    }
+
+
 def _serializable(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -1220,11 +1324,10 @@ def summarize_records(records, group_fields, metrics):
         row = dict(zip(group_fields, key))
         row["n_completed"] = len(group)
         for metric in metrics:
-            mean, lower, upper = mean_confidence_interval(
-                [record.get(metric, np.nan) for record in group]
+            values = np.asarray(
+                [record.get(metric, np.nan) for record in group], dtype=float
             )
-            row[metric] = mean
-            row[f"{metric}_ci_low"] = lower
-            row[f"{metric}_ci_high"] = upper
+            values = values[np.isfinite(values)]
+            row[metric] = float(np.mean(values)) if values.size else float("nan")
         summaries.append(row)
     return summaries
