@@ -44,10 +44,19 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         Initial random-walk standard deviation for ``log(beta)``.
     t0_etas : int, optional
         Number of warm-up iterations before adaptive Metropolis covariance is used.
+    adaptation_end : int or None, optional
+        Iteration at which ETAS proposal adaptation is frozen. ``None`` keeps
+        adapting for the complete run.
+    target_acceptance : float, optional
+        Acceptance probability targeted by the diminishing scalar adaptation.
+    adaptation_decay : float, optional
+        Exponent of the Robbins--Monro adaptation gain, in ``(0.5, 1]``.
     eps_mh_etas : float, optional
         Diagonal regularization of adaptive proposal covariances.
     rng_seed : int or None, optional
-        OpenTURNS random seed forwarded to the parent sampler."""
+        OpenTURNS random seed forwarded to the parent sampler.
+    spatial_compensator_grid : int, optional
+        Number of spatial compensator quadrature points per axis."""
 
     # ── Clipping bounds (log scale) pour stabilité numérique ──
     _LOG_BOUNDS = {
@@ -71,12 +80,21 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         m=None,
         beta_init=2.3, beta_priors=None,
         sigma_MH_etas=0.1, sigma_MH_beta=0.1,
-        t0_etas=50, eps_mh_etas=1e-6,
+        t0_etas=50, adaptation_end=None, target_acceptance=0.234,
+        adaptation_decay=0.6, eps_mh_etas=1e-6,
         rng_seed=None,
+        spatial_compensator_grid=40,
     ):
         """Initialize the SPIN-Hawkes sampler; see the class docstring for parameters."""
         if not isinstance(model, SPINHModel):
             raise TypeError("model must be a SPINHModel instance.")
+        if (
+            isinstance(spatial_compensator_grid, bool)
+            or not isinstance(spatial_compensator_grid, (int, np.integer))
+            or spatial_compensator_grid < 2
+        ):
+            raise ValueError("spatial_compensator_grid must be an integer >= 2.")
+        self.spatial_compensator_grid = int(spatial_compensator_grid)
         super().__init__(
             model=model,
             m=m,
@@ -89,8 +107,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         )
         self.use_etas = True
         self.t0_etas = t0_etas
+        self.adaptation_end = adaptation_end
+        self.target_acceptance = float(target_acceptance)
+        self.adaptation_decay = float(adaptation_decay)
         self.eps_mh_etas = eps_mh_etas
         self.sigma_MH_etas = sigma_MH_etas
+        self._etas_adaptation = {}
 
         self.theta_phi = model.etas_parameters.as_dict()
         self.fixed_etas = {}
@@ -161,37 +183,51 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         """Current free ETAS block on the proposal log scale."""
         return np.array([self._etas_to_log(name, self.theta_phi[name]) for name in names])
 
-    def _proposal_log_block(self, names, history, it):
+    def _proposal_log_block(self, block, names, history, it):
         """Draw an adaptive Metropolis proposal for the free ETAS coordinates."""
         dim = len(names)
         log_cur = self._current_etas_log_block(names)
-        history.append(log_cur.copy())
+        state = self._etas_adaptation.setdefault(
+            block,
+            {
+                "log_scale": 0.0,
+                "last_covariance": None,
+                "frozen_covariance": None,
+            },
+        )
+        adaptation_finished = (
+            self.adaptation_end is not None and it >= self.adaptation_end
+        )
+        if not adaptation_finished:
+            history.append(log_cur.copy())
 
-        sd = 2.38 ** 2 / dim
-        if it > self.t0_etas and len(history) > self.t0_etas:
-            h = np.asarray(history, dtype=float)
-            if dim == 1:
-                std = np.sqrt(sd * np.var(h[:, 0], ddof=1) + self.eps_mh_etas)
-                step = np.array([std * float(ot.Normal().getRealization()[0])])
-            else:
-                cov = sd * np.cov(h.T) + self.eps_mh_etas * np.eye(dim)
-                step = np.array(
-                    ot.Normal(
-                        ot.Point(dim, 0.0),
-                        ot.CovarianceMatrix(cov.tolist()),
-                    ).getRealization()
-                )
+        post_initial = history[self.t0_etas :]
+        if adaptation_finished and state["frozen_covariance"] is not None:
+            cov = state["frozen_covariance"]
+        elif it > self.t0_etas and len(post_initial) >= 2:
+            h = np.asarray(post_initial, dtype=float).reshape(-1, dim)
+            empirical = np.atleast_2d(np.cov(h.T, ddof=1))
+            base = (2.38 ** 2 / dim) * empirical
+            cov = np.exp(2.0 * state["log_scale"]) * base
+            cov = cov + self.eps_mh_etas * np.eye(dim)
+            cov = 0.5 * (cov + cov.T)
+            if adaptation_finished:
+                state["frozen_covariance"] = cov.copy()
         else:
-            if dim == 1:
-                step = np.array([self.sigma_MH_etas * float(ot.Normal().getRealization()[0])])
-            else:
-                cov = self.sigma_MH_etas ** 2 * np.eye(dim)
-                step = np.array(
-                    ot.Normal(
-                        ot.Point(dim, 0.0),
-                        ot.CovarianceMatrix(cov.tolist()),
-                    ).getRealization()
-                )
+            cov = self.sigma_MH_etas ** 2 * np.eye(dim)
+
+        state["last_covariance"] = cov.copy()
+        if dim == 1:
+            step = np.array([
+                np.sqrt(cov[0, 0]) * float(ot.Normal().getRealization()[0])
+            ])
+        else:
+            step = np.array(
+                ot.Normal(
+                    ot.Point(dim, 0.0),
+                    ot.CovarianceMatrix(cov),
+                ).getRealization()
+            )
 
         log_star = log_cur + step
         for name, value in zip(names, log_star):
@@ -199,6 +235,21 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             if not (lower <= value <= upper):
                 return log_cur, None
         return log_cur, log_star
+
+    def _adapt_etas_scale(self, block, accepted, it):
+        """Tune one scalar proposal multiplier during warm-up only."""
+        if it <= self.t0_etas:
+            return
+        if self.adaptation_end is not None and it >= self.adaptation_end:
+            return
+        state = self._etas_adaptation[block]
+        gain = (it - self.t0_etas + 10.0) ** (-self.adaptation_decay)
+        state["log_scale"] += gain * (
+            float(bool(accepted)) - self.target_acceptance
+        )
+        state["log_scale"] = float(
+            np.clip(state["log_scale"], np.log(0.05), np.log(5.0))
+        )
 
     def _candidate_etas(self, names, log_star):
         """Return theta_phi with proposed values inserted for a free block."""
@@ -266,7 +317,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "candidate_distance_memory_bytes": int(candidate_r2.nbytes),
         }
 
-    def _spatial_truncation_factors(self, x, y, d=None, q=None, gamma=None, n_grid=40):
+    def _spatial_truncation_factors(self, x, y, d=None, q=None, gamma=None, n_grid=None):
         """Approximate spatial ETAS mass retained inside the observation window.
         
         For each potential parent ``j``, this computes
@@ -284,7 +335,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         gamma : float or None, optional
             Candidate magnitude-scale coefficient.
         n_grid : int, optional
-            Number of quadrature coordinates per axis.
+            Number of quadrature coordinates per axis; None uses the configured grid.
         
         Returns
         -------
@@ -308,7 +359,27 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             np.asarray([float(value) for value in y]),
             magnitudes,
             parameters,
-            n_grid=n_grid,
+            n_grid=self.spatial_compensator_grid if n_grid is None else n_grid,
+        )
+
+    def _conditional_gp_draw(self, observed_xy, observed_f, observed_kernel, target_xy):
+        """Draw unobserved GP values conditional on the complete augmented draw."""
+        if target_xy.getSize() == 0:
+            return np.empty(0)
+        _, cross, target_kernel = self.compute_kernel(observed_xy, target_xy)
+        alpha = observed_kernel.solveLinearSystem(observed_f)
+        mean = np.asarray(cross * alpha, dtype=float).reshape(-1)
+        solved_cross = observed_kernel.solveLinearSystem(ot.Matrix(np.asarray(cross).T))
+        covariance = np.asarray(target_kernel) - np.asarray(cross * solved_cross)
+        covariance = .5 * (covariance + covariance.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        scale = max(1., float(np.max(np.abs(eigenvalues))))
+        if float(np.min(eigenvalues)) < -1e-8 * scale:
+            raise FloatingPointError("GP conditional covariance is not positive semidefinite.")
+        covariance = (eigenvectors * np.maximum(eigenvalues, self.jitter)) @ eigenvectors.T
+        return np.asarray(
+            ot.Normal(ot.Point(mean), ot.CovarianceMatrix(covariance)).getRealization(),
+            dtype=float,
         )
 
     # ─────────────────────────────────────────────────────────
@@ -346,7 +417,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             t_arr = np.array([float(t[i]) for i in range(N)], dtype=float)
             x_arr = np.array([float(x[i]) for i in range(N)], dtype=float)
             y_arr = np.array([float(y[i]) for i in range(N)], dtype=float)
-            XY = ot.Sample(np.column_stack([x_arr, y_arr]).tolist())
+            XY = ot.Sample(np.column_stack([x_arr, y_arr]))
         mu_t = self.compute_mu_tilde(XY, eps=eps_arr)
         sig = expit(np.asarray(f_data, dtype=float))
         mu = mu_t * sig
@@ -478,33 +549,84 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             log_pr += (tp["a_alpha"] - 1) * np.log(alpha) - tp["b_alpha"] * alpha
         return log_lik + log_pr
 
-    def update_A_alpha(self, t, x, y, Z, history, it):
-        """Update the free coordinates of ``(A, alpha)`` with adaptive MH."""
-        block_names = ["A", "alpha"] if self.use_magnitudes else ["A"]
-        free_names = self._free_etas_names(block_names)
-        if not free_names:
-            return False
+    def _productivity_statistics(self, t, x, y, Z):
+        """Return sufficient statistics shared by the ``A`` and ``alpha`` updates."""
+        Z_arr = np.asarray([int(float(Z[i])) for i in range(len(Z))], dtype=int)
+        parent_idx = Z_arr[Z_arr > 0] - 1
+        offspring_counts = np.bincount(parent_idx, minlength=len(Z_arr)).astype(float)
+        T_j = self._compute_T_j(t)
+        S_j = self._spatial_truncation_factors(x, y)
+        return offspring_counts, T_j * S_j
 
-        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+    def update_A(self, t, x, y, Z, statistics=None):
+        """Draw ``A`` from its exact Gamma full conditional."""
+        if statistics is None:
+            statistics = self._productivity_statistics(t, x, y, Z)
+        offspring_counts, retained_mass = statistics
+        if "A" in self.fixed_etas:
+            return statistics
+        if self.use_magnitudes:
+            exposure = np.sum(
+                np.exp(self.theta_phi["alpha"] * (self.m - self.m_c))
+                * retained_mass
+            )
+        else:
+            exposure = np.sum(retained_mass)
+        shape = self.theta_phi_priors["a_A"] + float(offspring_counts.sum())
+        rate = self.theta_phi_priors["b_A"] + float(exposure)
+        self.theta_phi["A"] = float(self.rng.gamma(shape, 1.0 / rate))
+        return statistics
+
+    def _log_posterior_alpha(self, alpha, offspring_counts, retained_mass):
+        """Evaluate the conditional log-posterior of ``alpha`` with fixed ``A``."""
+        if alpha <= 0.0:
+            return -np.inf
+        dm = self.m - self.m_c
+        log_likelihood = alpha * np.sum(offspring_counts * dm)
+        log_likelihood -= self.theta_phi["A"] * np.sum(
+            np.exp(alpha * dm) * retained_mass
+        )
+        prior = self.theta_phi_priors
+        return (
+            log_likelihood
+            + (prior["a_alpha"] - 1.0) * np.log(alpha)
+            - prior["b_alpha"] * alpha
+        )
+
+    def update_A_alpha(self, t, x, y, Z, history, it):
+        """Draw ``A`` exactly, then update ``alpha`` with adaptive MH."""
+        statistics = self.update_A(t, x, y, Z)
+        free_names = self._free_etas_names(["alpha"]) if self.use_magnitudes else []
+        if not free_names:
+            return None
+
+        log_cur, log_star = self._proposal_log_block(
+            "A_alpha", free_names, history, it
+        )
         if log_star is None:
+            self._adapt_etas_scale("A_alpha", False, it)
             return False
 
         candidate = self._candidate_etas(free_names, log_star)
-        A_cur = self.theta_phi["A"]
-        alpha_cur = self.theta_phi.get("alpha", 0.0)
-        A_s = candidate["A"]
-        alpha_s = candidate.get("alpha", 0.0)
-
-        lp_cur = self._log_posterior_A_alpha(A_cur, alpha_cur, t, x, y, Z)
-        lp_star = self._log_posterior_A_alpha(A_s, alpha_s, t, x, y, Z)
+        offspring_counts, retained_mass = statistics
+        lp_cur = self._log_posterior_alpha(
+            self.theta_phi["alpha"], offspring_counts, retained_mass
+        )
+        lp_star = self._log_posterior_alpha(
+            candidate["alpha"], offspring_counts, retained_mass
+        )
         if not np.isfinite(lp_star):
+            self._adapt_etas_scale("A_alpha", False, it)
             return False
         log_jacobian = np.sum(log_star - log_cur)
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+        accepted = np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(
+            0.0, (lp_star - lp_cur) + log_jacobian
+        )
+        if accepted:
             for name in free_names:
                 self.theta_phi[name] = candidate[name]
-            return True
-        return False
+        self._adapt_etas_scale("A_alpha", accepted, it)
+        return bool(accepted)
 
     # ─────────────────────────────────────────────────────────
     #  Block {c, p}
@@ -579,8 +701,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         if not free_names:
             return False
 
-        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+        log_cur, log_star = self._proposal_log_block(
+            "c_p", free_names, history, it
+        )
         if log_star is None:
+            self._adapt_etas_scale("c_p", False, it)
             return False
 
         candidate = self._candidate_etas(free_names, log_star)
@@ -591,13 +716,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             candidate["c"], candidate["p"], t, x, y, Z
         )
         if not np.isfinite(lp_star):
+            self._adapt_etas_scale("c_p", False, it)
             return False
         log_jacobian = np.sum(log_star - log_cur)
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+        accepted = np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(
+            0.0, (lp_star - lp_cur) + log_jacobian
+        )
+        if accepted:
             for name in free_names:
                 self.theta_phi[name] = candidate[name]
-            return True
-        return False
+        self._adapt_etas_scale("c_p", accepted, it)
+        return bool(accepted)
 
     # ─────────────────────────────────────────────────────────
     #  Block {d, q, γ}  or  {d, q}
@@ -680,8 +809,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         if not free_names:
             return False
 
-        log_cur, log_star = self._proposal_log_block(free_names, history, it)
+        log_cur, log_star = self._proposal_log_block(
+            "d_q_gamma", free_names, history, it
+        )
         if log_star is None:
+            self._adapt_etas_scale("d_q_gamma", False, it)
             return False
 
         candidate = self._candidate_etas(free_names, log_star)
@@ -694,13 +826,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             candidate.get("gamma", 0.0), t, x, y, Z
         )
         if not np.isfinite(lp_star):
+            self._adapt_etas_scale("d_q_gamma", False, it)
             return False
         log_jacobian = np.sum(log_star - log_cur)
-        if np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(0.0, (lp_star - lp_cur) + log_jacobian):
+        accepted = np.log(float(ot.Uniform(0.0, 1.0).getRealization()[0])) < min(
+            0.0, (lp_star - lp_cur) + log_jacobian
+        )
+        if accepted:
             for name in free_names:
                 self.theta_phi[name] = candidate[name]
-            return True
-        return False
+        self._adapt_etas_scale("d_q_gamma", accepted, it)
+        return bool(accepted)
 
     #  run
     # ─────────────────────────────────────────────────────────
@@ -804,7 +940,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         self._t_obs_arr = np.asarray([float(v) for v in t], dtype=float)
         self._x_obs_arr = np.asarray([float(v) for v in x], dtype=float)
         self._y_obs_arr = np.asarray([float(v) for v in y], dtype=float)
-        self._XY_obs = ot.Sample(np.column_stack([self._x_obs_arr, self._y_obs_arr]).tolist())
+        self._XY_obs = ot.Sample(np.column_stack([self._x_obs_arr, self._y_obs_arr]))
         self._compute_event_domain_indices(self._x_obs_arr, self._y_obs_arr)
         self._prepare_parent_candidates(parent_time_window)
         self._etas_dm = (self.m - self.m_c) if self.m is not None else np.zeros(N)
@@ -924,7 +1060,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             GX, GY     = np.meshgrid(np.linspace(xmin, xmax, grid_nx),
                                       np.linspace(ymin, ymax, grid_ny))
             grid_x, grid_y = GX.ravel(), GY.ravel()
-            Xg          = ot.Sample(np.column_stack([grid_x, grid_y]).tolist())
+            Xg          = ot.Sample(np.column_stack([grid_x, grid_y]))
             M_grid      = len(grid_x)
             domain_area = (xmax - xmin) * (ymax - ymin)
             mu_star_grid = mu_star_func(grid_x, grid_y)
@@ -936,12 +1072,16 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         # ── Chaînes ──────────────────────────────────────────────────────────
         ns       = (n_iter + thin - 1) // thin
         eps_ch   = np.zeros((ns, self.J))
+        eps_trace = np.zeros((n_iter, self.J))
+        background_fraction_trace = np.zeros(n_iter)
         nPi_ch   = np.zeros(ns, dtype=int)
         f_ch     = np.zeros((ns, N))
         nu_ch    = np.zeros((ns, 2))
         Z_ch     = np.zeros((ns, N))
         tp_ch    = np.zeros((ns, n_tp))
         beta_ch  = np.zeros(ns) if self.use_magnitudes else None
+        tp_trace = np.zeros((n_iter, n_tp))
+        beta_trace = np.zeros(n_iter) if self.use_magnitudes else None
         gp_coeffs_ch = (
             np.zeros((ns, int(sparse_gp.m))) if gp_backend == "sparse" else None
         )
@@ -950,6 +1090,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         ae, an, ab = 0, 0, 0
         acc        = {"A_alpha": 0, "c_p": 0, "d_q_gamma": 0}
+        acceptance_history = {"eps": np.zeros(n_iter, dtype=bool)}
+        for block, free_names in free_etas_blocks.items():
+            if free_names:
+                acceptance_history[block] = np.zeros(n_iter, dtype=bool)
+        if sample_beta:
+            acceptance_history["beta"] = np.zeros(n_iter, dtype=bool)
         hnu, hAa, hcp, hdqg, hb = [], [], [], [], []
 
         if verbose:
@@ -1016,15 +1162,9 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         fa[i] = float(f_D0[k])
 
                     idx_trig = [i for i in range(N) if float(Z[i]) != 0.0]
-                    if idx_trig and idx0:
-                        XY_bg  = ot.Sample([[float(x[i]), float(y[i])] for i in idx0])
-                        XY_tr  = ot.Sample([[float(x[i]), float(y[i])] for i in idx_trig])
-                        K_bg   = self.compute_kernel(XY_bg)
-                        for ii in range(len(idx0)):
-                            K_bg[ii, ii] += self.jitter
-                        _, K_tr_bg, _ = self.compute_kernel(XY_bg, XY_tr)
-                        alpha_bg = K_bg.solveLinearSystem(f_D0)
-                        f_pred = np.array(K_tr_bg * alpha_bg).flatten()
+                    if idx_trig:
+                        XY_tr = ot.Sample(np.column_stack([self._x_obs_arr[idx_trig], self._y_obs_arr[idx_trig]]))
+                        f_pred = self._conditional_gp_draw(D_f, f_Df, K_ff, XY_tr)
                         for k, i in enumerate(idx_trig):
                             fa[i] = float(f_pred[k])
 
@@ -1033,6 +1173,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 # ── Step 4 : ε | f, π_S  (MALA) ────────────────────────────
                 N_j, M_j = self._count_events_per_zone(x, y, Z, Pi_S)
                 ea, ok   = self.update_eps(eps, N_j, M_j, step=mala_step)
+                acceptance_history["eps"][it] = ok
                 eps      = ot.Point(ea.tolist()); ae += int(ok)
 
                 # ── Step 5 : ν | f  (AM, optional) ─────────────────────────
@@ -1048,15 +1189,34 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                 # ── Step 7 : θ_φ | Z, t, x, y  (AM) ────────────────────────
                 if free_etas_blocks["A_alpha"]:
-                    acc["A_alpha"] += int(self.update_A_alpha(t, x, y, Z, hAa, it))
+                    ok = self.update_A_alpha(t, x, y, Z, hAa, it)
+                    acceptance_history["A_alpha"][it] = ok
+                    acc["A_alpha"] += int(ok)
                 if free_etas_blocks["c_p"]:
-                    acc["c_p"] += int(self.update_c_p(t, x, y, Z, hcp, it))
+                    ok = self.update_c_p(t, x, y, Z, hcp, it)
+                    acceptance_history["c_p"][it] = ok
+                    acc["c_p"] += int(ok)
                 if free_etas_blocks["d_q_gamma"]:
-                    acc["d_q_gamma"] += int(self.update_d_q_gamma(t, x, y, Z, hdqg, it))
+                    ok = self.update_d_q_gamma(t, x, y, Z, hdqg, it)
+                    acceptance_history["d_q_gamma"][it] = ok
+                    acc["d_q_gamma"] += int(ok)
 
                 # ── Step 8 : β | m  (AM, optional) ─────────────────────────
                 if sample_beta:
-                    ab += int(self.update_beta(hb, it))
+                    ok = self.update_beta(hb, it)
+                    acceptance_history["beta"][it] = ok
+                    ab += int(ok)
+
+                # Full scalar traces are inexpensive and preserve the information
+                # needed by trace and ACF diagnostics independently of heavy-state
+                # thinning.
+                tp_trace[it] = [self.theta_phi[k] for k in tp_names]
+                eps_trace[it] = ea
+                background_fraction_trace[it] = float(
+                    np.mean(np.asarray(Z, dtype=float) == 0.0)
+                )
+                if beta_trace is not None:
+                    beta_trace[it] = self.beta
 
                 # ── Verbose ───────────────────────────────────────────────────
                 if verbose and (it % verbose_every == 0 or it == n_iter - 1):
@@ -1094,17 +1254,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         grid_design = np.asarray(sparse_gp.regressorOT(Xg), dtype=float)
                         fg = grid_design @ np.asarray(gp_coeffs, dtype=float)
                     else:
-                        XY_bg_g = ot.Sample(np.column_stack([self._x_obs_arr[idx_bg], self._y_obs_arr[idx_bg]]).tolist())
+                        XY_bg_g = ot.Sample(np.column_stack([self._x_obs_arr[idx_bg], self._y_obs_arr[idx_bg]]))
                         f_bg_pt = ot.Point([float(f_data[i]) for i in idx_bg])
                         Kd, Kg, Kgg = self.compute_kernel(XY_bg_g, Xg)
                         Kr = ot.CovarianceMatrix(Kd)
                         for ii in range(len(idx_bg)): Kr[ii, ii] += self.jitter
                         alpha = Kr.solveLinearSystem(f_bg_pt)
                         mg   = np.array(Kg * alpha).flatten()
-                        solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T.tolist()))
+                        solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T))
                         S    = np.array(Kgg) - np.array(Kg * solved_cross)
                         S    = .5*(S+S.T) + self.jitter*np.eye(M_grid)
-                        S_cov = ot.CovarianceMatrix(S.tolist())
+                        S_cov = ot.CovarianceMatrix(S)
                         fg   = np.array(ot.Normal(ot.Point(mg.tolist()), S_cov).getRealization())
                     mt   = self.compute_mu_tilde(Xg, eps=ea)
                     Emu[it] = (domain_area/M_grid) * np.sum(
@@ -1153,13 +1313,28 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         return {
             "eps": eps_ch[:si], "nPi": nPi_ch[:si], "f_data": f_ch[:si],
+            "eps_trace": eps_trace,
+            "background_fraction_trace": background_fraction_trace,
             "nu": nu_ch[:si], "Z": Z_ch[:si],
             "theta_phi": tp_ch[:si], "theta_phi_names": tp_names,
             "beta": beta_ch[:si] if beta_ch is not None else None,
+            "theta_phi_trace": tp_trace,
+            "beta_trace": beta_trace,
             "E_mu": Emu,
             "acceptance_eps":   ae/n_iter,
             "acceptance_nu":    an/n_iter if learn_nu else None,
             "acceptance_beta":  ab/n_iter if sample_beta else None,
+            "acceptance_history": acceptance_history,
+            "proposal_steps": {
+                "mala_step": float(mala_step),
+                "sigma_mh_etas": float(self.sigma_MH_etas),
+                "sigma_mh_beta": float(self.sigma_MH_beta),
+                "adaptation_start": int(self.t0_etas),
+                "adaptation_end": (
+                    None if self.adaptation_end is None else int(self.adaptation_end)
+                ),
+                "target_acceptance": float(self.target_acceptance),
+            },
             "acceptance_etas": {
                 k: (v / n_iter if free_etas_blocks[k] else None)
                 for k, v in acc.items()
@@ -1187,5 +1362,17 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 "d_q_gamma": np.array(hdqg) if hdqg else None,
                 "beta":      np.array(hb)  if hb  else None,
                 "nu":        np.array(hnu) if hnu else None,
+            },
+            "etas_adaptation": {
+                block: {
+                    "scale": float(np.exp(state["log_scale"])),
+                    "covariance": (
+                        None
+                        if state["last_covariance"] is None
+                        else np.asarray(state["last_covariance"], dtype=float)
+                    ),
+                    "frozen": state["frozen_covariance"] is not None,
+                }
+                for block, state in self._etas_adaptation.items()
             },
         }

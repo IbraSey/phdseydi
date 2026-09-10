@@ -17,6 +17,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm.auto import tqdm
 
 try:
     from joblib import Parallel, delayed
@@ -33,12 +34,9 @@ sys.path.insert(0, str(EXPERIMENT_DIR))
 
 
 from package import (
-    GPParameters,
     SPINHGibbsConfig,
-    SPINHModel,
     generate_voronoi_cells,
     save_figure,
-    simulate_hawkes_process,
 )
 
 from experiment_5 import (
@@ -47,8 +45,6 @@ from experiment_5 import (
     DOMAIN_SEED,
     INITIAL_BETA,
     INITIAL_ETAS,
-    MAGNITUDE_MAX,
-    MAGNITUDE_MIN,
     N_DOMAINS,
     PARAMETER_BLOCKS,
     PARAMETER_NAMES,
@@ -56,10 +52,11 @@ from experiment_5 import (
     THETA_PRIORS,
     X_BOUNDS,
     Y_BOUNDS,
-    latent_field,
+    make_model as make_base_model,
     regular_grid,
     relative_error,
     rmse,
+    simulate_scenario,
     true_latent_state,
 )
 
@@ -74,7 +71,8 @@ THIN = 3
 BURN_IN = 0.5
 SIGMA_MH_ETAS = 0.05
 SIGMA_MH_BETA = 0.1
-USE_SPARSE_GP = True
+GP_BACKEND = "sparse"
+USE_CALIBRATION = True
 VERBOSE = False
 VERBOSE_EVERY = 250
 LAMBDA_GRID_SIZE = 35
@@ -109,19 +107,30 @@ RESULTS_DIR = PACKAGE_ROOT / "figures" / "experiments" / "exp_spinh"
 
 def make_model(polygons, scenario, mode):
     etas_parameters = scenario["etas"] if mode["true_theta"] else INITIAL_ETAS
-    return SPINHModel.from_polygons(
-        polygons=polygons,
-        duration=scenario["duration"],
-        x_bounds=X_BOUNDS,
-        y_bounds=Y_BOUNDS,
-        gp_prior=GPParameters(variance=5.0, length_scale=0.2),
-        eps_prior_variance=1.0,
-        eps_prior_length_scale=0.01,
-        nu_prior_rate=0.5,
-        jitter=1e-5,
-        etas_parameters=etas_parameters,
-        magnitude_min=MAGNITUDE_MIN,
-        magnitude_max=MAGNITUDE_MAX,
+    return make_base_model(
+        polygons, scenario, etas_parameters=etas_parameters
+    )
+
+
+def make_gibbs_config(scenario, simulation, mode):
+    fixed_theta = mode["true_theta"]
+    return SPINHGibbsConfig(
+        n_iter=N_ITER,
+        thin=THIN,
+        mala_step=scenario["mala_step"],
+        verbose=VERBOSE,
+        verbose_every=VERBOSE_EVERY,
+        use_calibration=USE_CALIBRATION,
+        beta_init=INITIAL_BETA,
+        fixed_beta=scenario["beta"] if fixed_theta else None,
+        theta_priors=THETA_PRIORS,
+        sample_z=mode["sample_z"],
+        known_z=simulation.branching_labels if mode["known_z"] else None,
+        fixed_etas=scenario["etas"].as_dict() if fixed_theta else {},
+        sigma_mh_etas=SIGMA_MH_ETAS,
+        sigma_mh_beta=SIGMA_MH_BETA,
+        adaptation_start=200,
+        proposal_jitter=1e-6,
     )
 
 
@@ -177,27 +186,8 @@ def run_mode(polygons, scenario, simulation, realization, mode):
     mala_step = scenario["mala_step"]
     fit = model.gibbs(
         catalog,
-        config=SPINHGibbsConfig(
-            n_iter=N_ITER,
-            thin=THIN,
-            mala_step=mala_step,
-            verbose=VERBOSE,
-            verbose_every=VERBOSE_EVERY,
-            use_calibration=True,
-            beta_init=INITIAL_BETA,
-            fixed_beta=scenario["beta"] if mode["true_theta"] else None,
-            theta_priors=THETA_PRIORS,
-            sample_z=mode["sample_z"],
-            known_z=simulation.branching_labels if mode["known_z"] else None,
-            fixed_etas=(
-                scenario["etas"].as_dict() if mode["true_theta"] else {}
-            ),
-            sigma_mh_etas=SIGMA_MH_ETAS,
-            sigma_mh_beta=SIGMA_MH_BETA,
-            adaptation_start=200,
-            proposal_jitter=1e-6,
-        ),
-        gp_backend="sparse" if USE_SPARSE_GP else "exact",
+        config=make_gibbs_config(scenario, simulation, mode),
+        gp_backend=GP_BACKEND,
         rng_seed=seed,
     )
     summary = fit.summary(burn_in=BURN_IN)
@@ -234,24 +224,7 @@ def run_mode(polygons, scenario, simulation, realization, mode):
 
 def simulate_catalog(polygons, scenario, realization):
     seed = BASE_SEED + 1000 * int(scenario["difficulty"]) + realization
-    field = lambda x, y: latent_field(x, y, scenario["field_scale"])
-    return simulate_with_seed(polygons, scenario, field, seed)
-
-
-def simulate_with_seed(polygons, scenario, field, seed):
-    return simulate_hawkes_process(
-        X_bounds=X_BOUNDS,
-        Y_bounds=Y_BOUNDS,
-        T=scenario["duration"],
-        polygons=polygons,
-        mus=scenario["mus"],
-        f=field,
-        etas_parameters=scenario["etas"],
-        beta=scenario["beta"],
-        magnitude_min=MAGNITUDE_MIN,
-        magnitude_max=MAGNITUDE_MAX,
-        rng_seed=seed,
-    )
+    return simulate_scenario(polygons, scenario, seed)
 
 
 def fieldnames():
@@ -314,7 +287,12 @@ def print_summary(records):
 def plot_oracle_summary(records):
     scenario_labels = [scenario["name"].replace("_", "\n") for scenario in SCENARIOS]
     mode_labels = [mode["name"].replace("_", "\n") for mode in MODES]
-    fig, axes = plt.subplots(len(SCENARIOS), 2, figsize=(12.0, 4.2 * len(SCENARIOS)))
+    fig, axes = plt.subplots(
+        len(SCENARIOS),
+        2,
+        figsize=(12.0, 4.4 * len(SCENARIOS)),
+        layout="constrained",
+    )
     axes = np.atleast_2d(axes)
     for row_index, scenario in enumerate(SCENARIOS):
         scenario_rows = [row for row in records if row["scenario"] == scenario["name"]]
@@ -354,7 +332,6 @@ def plot_oracle_summary(records):
         ax.set_title(f"theta recovery | {scenario_labels[row_index]}")
         ax.grid(axis="y", alpha=0.3)
         ax.legend()
-    fig.tight_layout()
     save_figure(fig, "package/experiment_6/oracle_branching_parameters")
     plt.show()
     return fig
@@ -382,15 +359,29 @@ def run_all_realizations(polygons):
     if N_JOBS == 1:
         nested_records = [
             run_realization_modes(polygons, scenario, realization)
-            for scenario, realization in tasks
+            for scenario, realization in tqdm(
+                tasks,
+                desc="Experiment 6 realizations",
+                unit="run",
+                dynamic_ncols=True,
+            )
         ]
     else:
         if Parallel is None:
             raise ImportError("joblib is required when N_JOBS != 1.")
         print(f"Running {len(tasks)} independent realizations with N_JOBS={N_JOBS}")
-        nested_records = Parallel(n_jobs=N_JOBS)(
+        completed = Parallel(n_jobs=N_JOBS, return_as="generator")(
             delayed(run_realization_modes)(polygons, scenario, realization)
             for scenario, realization in tasks
+        )
+        nested_records = list(
+            tqdm(
+                completed,
+                total=len(tasks),
+                desc="Experiment 6 realizations",
+                unit="run",
+                dynamic_ncols=True,
+            )
         )
     return [record for records in nested_records for record in records]
 
@@ -399,7 +390,8 @@ def main():
     print("Experiment 6 — SPIN-H oracle Z/theta recovery")
     print(
         f"scenarios={len(SCENARIOS)}, modes={len(MODES)}, "
-        f"realizations={N_REALIZATIONS}, n_iter={N_ITER}, sparse={USE_SPARSE_GP}, "
+        f"realizations={N_REALIZATIONS}, n_iter={N_ITER}, "
+        f"gp_backend={GP_BACKEND}, "
         f"n_jobs={N_JOBS}"
     )
     print({scenario["name"]: scenario["mala_step"] for scenario in SCENARIOS})

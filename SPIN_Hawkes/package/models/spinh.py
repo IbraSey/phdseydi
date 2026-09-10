@@ -62,7 +62,11 @@ class SPINHModel(SSGCModel):
             sigma_MH_etas=config.sigma_mh_etas,
             sigma_MH_beta=config.sigma_mh_beta,
             t0_etas=config.adaptation_start,
+            adaptation_end=config.etas_adaptation_end,
+            target_acceptance=config.etas_target_acceptance,
+            adaptation_decay=config.etas_adaptation_decay,
             eps_mh_etas=config.proposal_jitter,
+            spatial_compensator_grid=config.spatial_compensator_grid,
             rng_seed=rng_seed,
         )
         return self._run_gibbs(

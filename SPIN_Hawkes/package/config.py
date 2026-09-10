@@ -192,10 +192,15 @@ class SPINHGibbsConfig(GibbsConfig):
     sample_z: bool = True
     known_z: object = None
     sigma_mh_etas: float = 0.1
+    etas_adaptation_end: int | None = None
+    etas_target_acceptance: float = 0.234
+    etas_adaptation_decay: float = 0.6
     parent_time_window: float | None = None
+    spatial_compensator_grid: int = 40
 
     def __post_init__(self):
         super().__post_init__()
+        _require_integer("spatial_compensator_grid", self.spatial_compensator_grid, minimum=2)
         if not isinstance(self.fixed_etas, dict):
             raise TypeError("fixed_etas must be a dictionary.")
         unknown_fixed = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
@@ -210,6 +215,26 @@ class SPINHGibbsConfig(GibbsConfig):
             minimum=0.0,
             strict=True,
         )
+        if self.etas_adaptation_end is not None:
+            _require_integer(
+                "etas_adaptation_end", self.etas_adaptation_end, minimum=1
+            )
+            if self.etas_adaptation_end <= self.adaptation_start:
+                raise ValueError(
+                    "etas_adaptation_end must be greater than adaptation_start."
+                )
+            if self.etas_adaptation_end > self.n_iter:
+                raise ValueError("etas_adaptation_end cannot exceed n_iter.")
+        target = _require_real(
+            "etas_target_acceptance", self.etas_target_acceptance
+        )
+        if not 0.0 < target < 1.0:
+            raise ValueError("etas_target_acceptance must be in (0, 1).")
+        decay = _require_real(
+            "etas_adaptation_decay", self.etas_adaptation_decay
+        )
+        if not 0.5 < decay <= 1.0:
+            raise ValueError("etas_adaptation_decay must be in (0.5, 1].")
         if self.parent_time_window is not None:
             _require_real(
                 "parent_time_window",
@@ -388,6 +413,8 @@ class SPINHVIConfig(SSGCVIConfig):
                 self.etas_quadrature_nodes,
                 minimum=2,
             )
+        if not isinstance(self.fixed_etas, dict):
+            raise TypeError("fixed_etas must be a dictionary.")
         _require_integer(
             "spatial_compensator_grid",
             self.spatial_compensator_grid,
@@ -401,8 +428,6 @@ class SPINHVIConfig(SSGCVIConfig):
                 strict=True,
             )
 
-        if not isinstance(self.fixed_etas, dict):
-            raise TypeError("fixed_etas must be a dictionary.")
         unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
         if unknown:
             raise ValueError(f"Unknown fixed ETAS parameters: {sorted(unknown)}")

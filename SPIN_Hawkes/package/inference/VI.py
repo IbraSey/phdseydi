@@ -278,6 +278,7 @@ class SPINHVI:
         self.gp_backend = str(self.config.gp_backend).lower()
         self.sparse_gp = self._make_sparse_gp() if self.gp_backend == "sparse" else None
         self._spatial_compensator_geometry = None
+        self._spatial_compensator_cache = None
         self.priors = (
             self._default_theta_priors() | dict(self.config.theta_priors)
             if self.use_etas
@@ -747,6 +748,30 @@ class SPINHVI:
         if self.config.spatial_compensator_grid <= 0:
             return np.ones(len(self.catalog), dtype=float)
         n_grid = self.config.spatial_compensator_grid
+        factor_keys = []
+        for parameter_name, factor_name in (
+            ("d", "d"),
+            ("q", "q_minus_1"),
+            ("gamma", "gamma"),
+        ):
+            if parameter_name == "gamma" and not self.model.etas_parameters.marked:
+                factor_keys.append((parameter_name, "absent"))
+            elif parameter_name in self.config.fixed_etas:
+                factor_keys.append(
+                    (parameter_name, "fixed", float(self.config.fixed_etas[parameter_name]))
+                )
+            else:
+                factor = self.state.etas.gamma_factors[factor_name]
+                factor_keys.append(
+                    (parameter_name, "gamma", float(factor.shape), float(factor.rate))
+                )
+        cache_key = (int(n_grid), tuple(factor_keys))
+        if (
+            self._spatial_compensator_cache is not None
+            and self._spatial_compensator_cache[0] == cache_key
+        ):
+            return self._spatial_compensator_cache[1].copy()
+
         cached = self._spatial_compensator_geometry
         if cached is None or cached[0] != n_grid:
             xmin, xmax = self.model.x_bounds
@@ -812,7 +837,9 @@ class SPINHVI:
                     * density.sum(axis=1)
                 )
         # Midpoint quadrature can overshoot the normalized spatial mass.
-        return np.minimum(expectation, 1.0)
+        result = np.minimum(expectation, 1.0)
+        self._spatial_compensator_cache = (cache_key, result.copy())
+        return result
 
     def _triggering_compensator_without_A(self) -> float:
         magnitudes = self._magnitudes()
