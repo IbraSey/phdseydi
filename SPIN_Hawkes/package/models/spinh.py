@@ -6,6 +6,7 @@ import numpy as np
 
 from package.config import ETASParameters, SPINHGibbsConfig, SPINHVIConfig
 from data.catalog import EventCatalog
+from spatial import SpatialQuadrature
 from .kernels import ETASKernel
 from .ssgc import SSGCModel
 
@@ -38,6 +39,7 @@ class SPINHModel(SSGCModel):
         sparse_gp=None,
         rng_seed=None,
         reference_intensity=None,
+        spatial_quadrature=None,
     ):
         """Estimate this SPIN-H model with its Gibbs sampler.
 
@@ -67,6 +69,8 @@ class SPINHModel(SSGCModel):
             adaptation_decay=config.etas_adaptation_decay,
             eps_mh_etas=config.proposal_jitter,
             spatial_compensator_grid=config.spatial_compensator_grid,
+            collapse_productivity=config.collapse_productivity,
+            spatial_quadrature=spatial_quadrature,
             rng_seed=rng_seed,
         )
         return self._run_gibbs(
@@ -83,7 +87,14 @@ class SPINHModel(SSGCModel):
             parent_time_window=config.parent_time_window,
         )
 
-    def vi(self, catalog, config=None, rng_seed=None):
+    def vi(
+        self,
+        catalog,
+        config=None,
+        rng_seed=None,
+        quadrature=None,
+        spatial_compensator_quadrature=None,
+    ):
         """Estimate this SPIN-H model with simple hybrid CAVI/VI.
 
         The model remains unchanged. The returned VIResults object contains
@@ -109,7 +120,13 @@ class SPINHModel(SSGCModel):
                 verbose=config.verbose,
             )
             inference_model = replace(self, gp_prior=calibrated_prior)
-        engine = SPINHVI(inference_model, catalog, config=config)
+        engine = SPINHVI(
+            inference_model,
+            catalog,
+            config=config,
+            quadrature=quadrature,
+            spatial_compensator_quadrature=spatial_compensator_quadrature,
+        )
         return engine.fit()
 
     def parent_time_window_from_kernel(
@@ -197,6 +214,7 @@ class SPINHModel(SSGCModel):
         self,
         parent_times,
         parameters: ETASParameters | None = None,
+        max_lag: float | None = None,
     ) -> np.ndarray:
         parameters = self.etas_parameters if parameters is None else parameters
         if not isinstance(parameters, ETASParameters):
@@ -205,7 +223,10 @@ class SPINHModel(SSGCModel):
         if not np.all(np.isfinite(parent_times)):
             raise ValueError("parent_times must contain only finite values.")
         return self.etas_kernel.temporal.integral_until(
-            parent_times, self.duration, parameters
+            parent_times,
+            self.duration,
+            parameters,
+            max_lag=max_lag,
         )
 
     def spatial_compensator(
@@ -216,6 +237,7 @@ class SPINHModel(SSGCModel):
         parameters: ETASParameters | None = None,
         n_grid: int = 40,
         observation_domain=None,
+        quadrature: SpatialQuadrature | None = None,
     ) -> np.ndarray:
         parameters = self.etas_parameters if parameters is None else parameters
         if not isinstance(parameters, ETASParameters):
@@ -239,6 +261,12 @@ class SPINHModel(SSGCModel):
             raise ValueError(
                 "Parent coordinates and magnitudes must contain only finite values."
             )
+        if quadrature is not None:
+            if not isinstance(quadrature, SpatialQuadrature):
+                raise TypeError("quadrature must be a SpatialQuadrature instance.")
+            self.domains.validate_points(
+                quadrature.points[:, 0], quadrature.points[:, 1]
+            )
         return self.etas_kernel.spatial.retained_mass(
             parent_x,
             parent_y,
@@ -253,6 +281,7 @@ class SPINHModel(SSGCModel):
                 if observation_domain is None
                 else observation_domain
             ),
+            quadrature=quadrature,
         )
 
     def triggering_compensator(
@@ -260,6 +289,7 @@ class SPINHModel(SSGCModel):
         catalog: EventCatalog,
         parameters: ETASParameters | None = None,
         n_grid: int = 40,
+        quadrature: SpatialQuadrature | None = None,
     ) -> float:
         parameters = self.etas_parameters if parameters is None else parameters
         if not isinstance(parameters, ETASParameters):
@@ -283,6 +313,7 @@ class SPINHModel(SSGCModel):
                     magnitudes,
                     parameters,
                     n_grid=n_grid,
+                    quadrature=quadrature,
                 )
             )
         )

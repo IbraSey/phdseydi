@@ -1,0 +1,20 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# macOS metadata
+.DS_Store
+
+# Restartable experiment checkpoints
+.checkpoints/
+
+# Local environments, build products and newly generated results
+.venv/
+build/
+dist/
+*.egg-info/
+/results/

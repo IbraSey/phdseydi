@@ -29,6 +29,11 @@ from tqdm.auto import tqdm
 
 from package.config import ETASParameters, SPINHVIConfig, SSGCVIConfig
 from data.catalog import EventCatalog
+from spatial import (
+    SpatialQuadrature,
+    midpoint_quadrature,
+    partition_midpoint_quadrature,
+)
 from ..models.ssgc import SSGCModel
 from ..models.spinh import SPINHModel
 from .backends import SparseGP
@@ -259,7 +264,14 @@ class SPINHVIState:
 class SPINHVI:
     """Shared generalized CAVI engine for SSGC and SPIN-H."""
 
-    def __init__(self, model, catalog, config=None):
+    def __init__(
+        self,
+        model,
+        catalog,
+        config=None,
+        quadrature=None,
+        spatial_compensator_quadrature=None,
+    ):
         if not isinstance(model, SSGCModel):
             raise TypeError("model must be an SSGCModel or SPINHModel instance.")
         if not isinstance(catalog, EventCatalog):
@@ -274,6 +286,14 @@ class SPINHVI:
             config_is_valid = False
         if not config_is_valid:
             raise TypeError(f"config must be a {config_type.__name__} instance.")
+        for name, rule in (
+            ("quadrature", quadrature),
+            ("spatial_compensator_quadrature", spatial_compensator_quadrature),
+        ):
+            if rule is not None and not isinstance(rule, SpatialQuadrature):
+                raise TypeError(f"{name} must be a SpatialQuadrature instance.")
+        self.quadrature = quadrature
+        self.spatial_compensator_quadrature = spatial_compensator_quadrature
         self.domain_index = model.validate_catalog(catalog)
         self.gp_backend = str(self.config.gp_backend).lower()
         self.sparse_gp = self._make_sparse_gp() if self.gp_backend == "sparse" else None
@@ -378,39 +398,29 @@ class SPINHVI:
         return phi_x * phi_y * self.sparse_gp.sqrt_Delta[None, :]
 
     def _make_quadrature_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        nx = self.config.quadrature_nx
-        ny = self.config.quadrature_ny
-        x_edges = np.linspace(self.model.x_bounds[0], self.model.x_bounds[1], nx + 1)
-        y_edges = np.linspace(self.model.y_bounds[0], self.model.y_bounds[1], ny + 1)
-        x_mid = 0.5 * (x_edges[:-1] + x_edges[1:])
-        y_mid = 0.5 * (y_edges[:-1] + y_edges[1:])
-        X, Y = np.meshgrid(x_mid, y_mid)
-        grid_xy = np.column_stack([X.ravel(), Y.ravel()])
-        domain_index = self.model.domains.locate(grid_xy[:, 0], grid_xy[:, 1])
-        inside = domain_index >= 0
-        grid_xy = grid_xy[inside]
-        domain_index = domain_index[inside]
-        points_per_domain = np.bincount(
-            domain_index,
-            minlength=self.model.n_domains,
-        )
-        missing_domains = np.flatnonzero(points_per_domain == 0)
-        if missing_domains.size:
-            representative_points = []
-            for domain in missing_domains:
-                point = self.model.domains.polygons[domain].representative_point()
-                representative_points.append((float(point.x), float(point.y)))
-            grid_xy = np.vstack([grid_xy, representative_points])
-            domain_index = np.concatenate([domain_index, missing_domains])
-            points_per_domain = np.bincount(
-                domain_index,
-                minlength=self.model.n_domains,
+        rule = self.quadrature
+        if rule is None:
+            rule = partition_midpoint_quadrature(
+                self.model.domains,
+                self.model.x_bounds,
+                self.model.y_bounds,
+                self.config.quadrature_nx,
+                self.config.quadrature_ny,
             )
-        domain_areas = np.asarray(self.model.domains.areas, dtype=float)
-        quadrature_weights = (
-            domain_areas[domain_index] / points_per_domain[domain_index]
-        )
-        return grid_xy, domain_index, quadrature_weights
+        grid_xy = rule.points
+        domain_index = self.model.domains.locate(grid_xy[:, 0], grid_xy[:, 1])
+        if np.any(domain_index < 0):
+            raise ValueError("Every background quadrature node must lie in a domain.")
+        represented = np.bincount(
+            domain_index, minlength=self.model.n_domains
+        ) > 0
+        if not np.all(represented):
+            missing = np.flatnonzero(~represented)
+            raise ValueError(
+                "The background quadrature must represent every domain; missing "
+                f"indices: {missing.tolist()}."
+            )
+        return grid_xy, domain_index, rule.weights
 
     def _magnitudes(self) -> np.ndarray:
         if self.catalog.magnitudes is None:
@@ -627,6 +637,11 @@ class SPINHVI:
 
     def _expected_temporal_compensator(self) -> np.ndarray:
         remaining = np.maximum(self.model.duration - self.catalog.t, 0.0)
+        if self.config.parent_time_window is not None:
+            remaining = np.minimum(
+                remaining,
+                self.config.parent_time_window,
+            )
         c_nodes, c_weights = self._gamma_quadrature("c")
         p_nodes, p_weights = self._gamma_quadrature("p_minus_1")
         expectation = np.zeros_like(remaining, dtype=float)
@@ -745,9 +760,11 @@ class SPINHVI:
         return out
     
     def _expected_spatial_compensator(self) -> np.ndarray:
-        if self.config.spatial_compensator_grid <= 0:
+        if (
+            self.spatial_compensator_quadrature is None
+            and self.config.spatial_compensator_grid <= 0
+        ):
             return np.ones(len(self.catalog), dtype=float)
-        n_grid = self.config.spatial_compensator_grid
         factor_keys = []
         for parameter_name, factor_name in (
             ("d", "d"),
@@ -765,7 +782,12 @@ class SPINHVI:
                 factor_keys.append(
                     (parameter_name, "gamma", float(factor.shape), float(factor.rate))
                 )
-        cache_key = (int(n_grid), tuple(factor_keys))
+        quadrature_key = (
+            ("custom", self.spatial_compensator_quadrature.fingerprint())
+            if self.spatial_compensator_quadrature is not None
+            else ("midpoint", int(self.config.spatial_compensator_grid))
+        )
+        cache_key = (quadrature_key, tuple(factor_keys))
         if (
             self._spatial_compensator_cache is not None
             and self._spatial_compensator_cache[0] == cache_key
@@ -773,26 +795,26 @@ class SPINHVI:
             return self._spatial_compensator_cache[1].copy()
 
         cached = self._spatial_compensator_geometry
-        if cached is None or cached[0] != n_grid:
-            xmin, xmax = self.model.x_bounds
-            ymin, ymax = self.model.y_bounds
-            dx = (xmax - xmin) / n_grid
-            dy = (ymax - ymin) / n_grid
-            grid_x, grid_y = np.meshgrid(
-                xmin + (np.arange(n_grid) + 0.5) * dx,
-                ymin + (np.arange(n_grid) + 0.5) * dy,
+        if cached is None or cached[0] != quadrature_key:
+            rule = self.spatial_compensator_quadrature
+            if rule is None:
+                rule = midpoint_quadrature(
+                    self.model.x_bounds,
+                    self.model.y_bounds,
+                    self.config.spatial_compensator_grid,
+                    observation_domain=self.model.domains.observation_geometry,
+                )
+            self.model.domains.validate_points(
+                rule.points[:, 0], rule.points[:, 1]
             )
-            grid_xy = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-            inside = self.model.domains.locate(grid_xy[:, 0], grid_xy[:, 1]) >= 0
-            grid_xy = grid_xy[inside]
             distance_squared = (
-                (self.catalog.x[:, None] - grid_xy[None, :, 0]) ** 2
-                + (self.catalog.y[:, None] - grid_xy[None, :, 1]) ** 2
+                (self.catalog.x[:, None] - rule.points[None, :, 0]) ** 2
+                + (self.catalog.y[:, None] - rule.points[None, :, 1]) ** 2
             )
-            cached = (n_grid, distance_squared, float(dx * dy))
+            cached = (quadrature_key, distance_squared, rule.weights)
             self._spatial_compensator_geometry = cached
 
-        _, distance_squared, cell_area = cached
+        _, distance_squared, quadrature_weights = cached
         dm = self._magnitudes() - self.model.magnitude_min
         d_nodes, d_weights = self._gamma_quadrature("d")
         if self.model.etas_parameters.marked:
@@ -833,8 +855,7 @@ class SPINHVI:
                 expectation += (
                     d_weight
                     * gamma_weight
-                    * cell_area
-                    * density.sum(axis=1)
+                    * (density @ quadrature_weights)
                 )
         # Midpoint quadrature can overshoot the normalized spatial mass.
         result = np.minimum(expectation, 1.0)
@@ -1469,7 +1490,15 @@ class SPINHVI:
         n_domains = self.model.n_domains
         counts = np.bincount(self.domain_index, minlength=n_domains).astype(float)
         exposure = self.model.duration * np.asarray(self.model.domains.areas, dtype=float)
-        eps_mean = np.log(2.0 * (counts + 0.5) / np.maximum(exposure, self.config.jitter))
+        initial_background_fraction = (
+            self.config.initial_background_fraction if self.use_etas else 1.0
+        )
+        eps_mean = np.log(
+            2.0
+            * initial_background_fraction
+            * (counts + 0.5)
+            / np.maximum(exposure, self.config.jitter)
+        )
         eps_cov = self.model.epsilon_prior_covariance()
         f_mean = np.zeros(n_events, dtype=float)
         f_var = np.full(n_events, self.model.gp_prior.variance, dtype=float)
@@ -1699,6 +1728,9 @@ class SPINHVI:
         if self.parent_candidate_graph is not None:
             diagnostics["branching_truncation"] = {
                 **self.parent_candidate_graph.diagnostics(),
+                "temporal_compensator_max_lag": float(
+                    self.parent_candidate_graph.max_lag
+                ),
                 "branching_probability_memory_bytes": (
                     self.state.branching.memory_bytes
                 ),

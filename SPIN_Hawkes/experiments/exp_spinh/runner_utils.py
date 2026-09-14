@@ -40,8 +40,38 @@ _CANCELLED_TASK = object()
 # allowance, while the larger hard limit catches an unexpectedly large worker.
 MAX_FULL_WORKERS = 4
 WORKER_MEMORY_RESERVATION_GIB = 3.0
-WORKER_MEMORY_LIMIT_GIB = 5.0
-SYSTEM_MEMORY_RESERVE_GIB = 3.0
+WORKER_MEMORY_LIMIT_GIB = 8.0
+SYSTEM_MEMORY_RESERVE_GIB = 2.0
+
+# Internal scheduling policies for the simulated-data panels. These are
+# operational safeguards rather than user-facing experiment parameters.
+_SIMULATION_ACCURACY_MAX_WORKERS = 6
+_SIMULATION_ACCURACY_MEMORY_GIB = 1.5
+_SIMULATION_PARTITION_MAX_WORKERS = 6
+_SIMULATION_PARTITION_MEMORY_GIB = 2.0
+_SIMULATION_DEFAULT_MAX_WORKERS = 4
+_SIMULATION_DEFAULT_MEMORY_GIB = 3.0
+
+
+def simulation_execution_guard(experiment, accuracy_target_events=400):
+    """Return the internal worker policy for a simulated-data experiment."""
+    if experiment == "1":
+        return {
+            "name": f"accuracy-N{int(accuracy_target_events)}",
+            "max_workers": _SIMULATION_ACCURACY_MAX_WORKERS,
+            "memory_reservation_gib": _SIMULATION_ACCURACY_MEMORY_GIB,
+        }
+    if experiment in {"2", "all"}:
+        return {
+            "name": "partition-N1000",
+            "max_workers": _SIMULATION_PARTITION_MAX_WORKERS,
+            "memory_reservation_gib": _SIMULATION_PARTITION_MEMORY_GIB,
+        }
+    return {
+        "name": "standard",
+        "max_workers": _SIMULATION_DEFAULT_MAX_WORKERS,
+        "memory_reservation_gib": _SIMULATION_DEFAULT_MEMORY_GIB,
+    }
 
 
 def _set_calibration_semaphore(semaphore):
@@ -253,13 +283,43 @@ def shutdown_process_workers():
 def _check_worker_memory(process, psutil):
     rss = process.memory_info().rss
     available = psutil.virtual_memory().available
-    if rss > WORKER_MEMORY_LIMIT_GIB * 1024**3 or available < SYSTEM_MEMORY_RESERVE_GIB * 1024**3:
-        raise MemoryError(
-            f"SPIN-H safety stop: worker RSS={rss / 1024**3:.2f} GiB, "
-            f"system available={available / 1024**3:.2f} GiB. "
-            "Completed checkpoints are preserved. Close other heavy applications "
-            "and resume with n_jobs=1."
-        )
+    worker_limit = WORKER_MEMORY_LIMIT_GIB * 1024**3
+    system_reserve = SYSTEM_MEMORY_RESERVE_GIB * 1024**3
+    if available < system_reserve:
+        reason = "available system memory fell below the reserved minimum"
+    elif rss > worker_limit:
+        reason = "one isolated worker exceeded its hard limit"
+    else:
+        return
+    raise MemoryError(
+        f"SPIN-H safety stop: {reason}; "
+        f"worker RSS={rss / 1024**3:.2f} GiB, "
+        f"system available={available / 1024**3:.2f} GiB. "
+        "Completed checkpoints are preserved; rerun with resume enabled."
+    )
+
+
+def _terminate_isolated_worker(process, psutil, timeout=5.0):
+    """Stop a known worker PID without asking loky to scan the process tree."""
+    if process is None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=timeout)
+        return
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired:
+        pass
+    except (OSError, psutil.Error):
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=timeout)
+    except psutil.NoSuchProcess:
+        return
+    except (OSError, psutil.Error):
+        return
 
 
 def _execute_isolated_task(function, task, index, checkpoint_path, lock_paths=(), cancel_event=None):
@@ -277,6 +337,7 @@ def _execute_isolated_task(function, task, index, checkpoint_path, lock_paths=()
         )
     }
     executor = ProcessPoolExecutor(max_workers=1, env=environment)
+    process = None
     failed = True
     try:
         # The one-worker executor keeps this PID for the subsequent task.
@@ -302,7 +363,9 @@ def _execute_isolated_task(function, task, index, checkpoint_path, lock_paths=()
     finally:
         if failed and cancel_event is not None:
             cancel_event.set()
-        executor.shutdown(wait=True, kill_workers=failed)
+        if failed:
+            _terminate_isolated_worker(process, psutil)
+        executor.shutdown(wait=True, kill_workers=False)
 
 
 def parallel_map(
