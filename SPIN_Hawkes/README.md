@@ -140,72 +140,6 @@ The dense parent support can be replaced by the temporal graph
 (j, i) is retained when 0 < t[i] - t[j] <= parent_time_window.
 ```
 
-For simulated catalogs, choose `parent_time_window` from the temporal or
-spatio-temporal ETAS-kernel diagnostic. A relative kernel height can optionally
-be converted into a time lag using the known simulation parameters:
-
-```python
-from package import SPINHGibbsConfig, SPINHVIConfig
-
-relative_height = 1e-3
-parent_time_window = spinh_model.parent_time_window_from_kernel(relative_height)
-
-vi_fit = spinh_model.vi(
-    catalog,
-    config=SPINHVIConfig(
-        parent_time_window=parent_time_window,
-        gp_backend="sparse",
-    ),
-)
-kernel_diagnostic = vi_fit.plot_etas_kernel_dispersion(
-    parent_time_window=parent_time_window,
-)
-
-gibbs_fit = spinh_model.gibbs(
-    catalog,
-    config=SPINHGibbsConfig(
-        n_iter=8000,
-        thin=5,
-        adaptation_start=200,
-        etas_adaptation_end=2000,
-        parent_time_window=parent_time_window,
-    ),
-    gp_backend="sparse",
-)
-
-gibbs_fit.plot_traces(burn_in=0.25)
-gibbs_fit.plot_acf(burn_in=0.25, max_lag=200, etas_only=True)
-```
-
-The sampler keeps complete scalar traces even when large latent states are
-thinned. The default `mala_step=None` selects a catalogue-dependent step from
-the initial zonal curvature; an explicit value overrides this choice.
-Productivity `A` is sampled exactly from its Gamma full conditional.
-When `A` and `alpha` are both free, the default partially collapsed update
-integrates out `A` during the Metropolis step for `alpha`, then redraws `A`
-exactly. The remaining ETAS blocks use adaptive Metropolis proposals whose
-adaptation can be frozen before retained draws.
-
-The plotted cutoff reports both the relative kernel height and the omitted
-temporal mass. The same finite support is used in the eventwise triggering sum
-and in the temporal compensator, so the approximate likelihood is internally
-consistent. With truncation enabled, VI stores `q(Z)` as a CSR matrix and Gibbs
-caches only candidate-pair lags and distances. `None`, the default, retains the
-original dense support. Candidate counts, retained fractions and memory use are
-available in `fit.diagnostics["branching_truncation"]` for VI and
-`fit.raw["branching_truncation"]` for Gibbs.
-
-Run the reproducible truncation-complexity benchmark with:
-
-```bash
-python -m experiments.benchmark_branching_truncation \
-  --sizes 500,1000,2000,4000 \
-  --event-rate 20 \
-  --time-window 0.5 \
-  --output results/branching_truncation_benchmark.csv
-```
-
-
 ---
 
 ## SSGC experiments
@@ -252,7 +186,7 @@ saved simulation outputs without inference.
 If you use this repository, please cite the associated manuscript:
 
 ```bibtex
-@article{seydi:package:2026,
+@article{SeydiSpinh2026,
     title = {XXX}, 
     author = {Ibrahim Seydi and Sophie Donnet and Merlin Keller and Joseph Muré and Julien Stoehr},
     year = {2026},
