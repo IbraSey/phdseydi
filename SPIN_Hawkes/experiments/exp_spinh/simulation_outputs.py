@@ -6,6 +6,8 @@ from pathlib import Path
 import csv
 
 from shapely import from_wkt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -76,6 +78,9 @@ _LEGACY_GIBBS_DIAGNOSTIC_FILES = (
     "experiment_1_marginal_recovery_gibbs_diagnostics_summary.csv",
 )
 
+MAX_SAVED_REPLICATE_FIGURES = 5
+RECONSTRUCTION_DISPLAY_GRID_SIZE = 40
+
 
 def _save_figure(
     figure,
@@ -99,25 +104,78 @@ def _save_figure(
 
 def render_accuracy_outputs(
     records, summary, backgrounds, posteriors, selection, output,
-    *, save=True, show=False,
+    *, save=True, show=False, replicate_boxplots=False,
 ):
     """Render a run from its stored data; this function performs no inference."""
     if not save and not show:
         return
     chosen = {(row["scenario"], int(row["replicate"])) for row in selection}
-    backgrounds = [
+    representative_backgrounds = [
         payload for payload in backgrounds
         if (payload["scenario"], int(payload["replicate"])) in chosen
     ]
     truths = generating_parameters(records)
+    figure_selection = select_replicates_for_figures(records)
     plot_accuracy(summary, output, save=save, show=show)
-    plot_accuracy_reconstruction(backgrounds, output, save=save, show=show)
+    plot_accuracy_reconstruction(
+        representative_backgrounds, output, save=save, show=show,
+    )
     plot_accuracy_parameter_marginals(
         posteriors, selection, output, save=save, show=show, truths=truths,
+    )
+    for selected in figure_selection:
+        scenario = selected["scenario"]
+        replicate = int(selected["replicate"])
+        replicate_backgrounds = [
+            payload for payload in backgrounds
+            if payload["scenario"] == scenario
+            and int(payload["replicate"]) == replicate
+        ]
+        plot_accuracy_reconstruction(
+            replicate_backgrounds,
+            output,
+            save=save,
+            show=show,
+            filename=(
+                f"experiment_1_reconstruction_{scenario}_rep{replicate:02d}.pdf"
+            ),
+        )
+    plot_accuracy_parameter_marginals(
+        posteriors,
+        figure_selection,
+        output,
+        save=save,
+        show=show,
+        truths=truths,
+        include_replicate=True,
     )
     plot_accuracy_gibbs_diagnostics(
         posteriors, selection, output, save=save, show=show, truths=truths,
     )
+    if replicate_boxplots:
+        plot_accuracy_replicate_boxplots(
+            records, output, save=save, show=show,
+        )
+
+
+def select_replicates_for_figures(records, limit=MAX_SAVED_REPLICATE_FIGURES):
+    """Select every available replicate up to a deterministic per-scenario cap."""
+    if isinstance(limit, bool) or not isinstance(limit, (int, np.integer)) or limit < 1:
+        raise ValueError("limit must be a positive integer.")
+    selected = []
+    for scenario in SCENARIOS:
+        replicates = sorted({
+            int(row["replicate"])
+            for row in records
+            if row.get("scenario") == scenario
+            and row.get("status") == "ok"
+            and row.get("replicate") not in (None, "")
+        })
+        selected.extend(
+            {"scenario": scenario, "replicate": replicate}
+            for replicate in replicates[:limit]
+        )
+    return selected
 
 
 def select_representative_reconstructions(records, reconstructions):
@@ -185,8 +243,42 @@ def _background_surface(payload, estimate):
     return values.reshape(n_space, n_space)
 
 
-def plot_accuracy_reconstruction(reconstructions, output, *, save=True, show=False):
-    """Compare all posterior-mean backgrounds on representative catalogues."""
+def _refine_regular_surface(x_values, y_values, surface, n_side):
+    """Interpolate a regular cell-centred surface for smoother display only."""
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+    surface = np.asarray(surface, dtype=float)
+    target = max(int(n_side), len(x_values), len(y_values))
+    if target == len(x_values) == len(y_values):
+        return x_values, y_values, surface
+
+    dx = x_values[1] - x_values[0]
+    dy = y_values[1] - y_values[0]
+    x_bounds = (x_values[0] - dx / 2, x_values[-1] + dx / 2)
+    y_bounds = (y_values[0] - dy / 2, y_values[-1] + dy / 2)
+    refined_x = np.linspace(*x_bounds, target, endpoint=False)
+    refined_y = np.linspace(*y_bounds, target, endpoint=False)
+    refined_x += (x_bounds[1] - x_bounds[0]) / (2 * target)
+    refined_y += (y_bounds[1] - y_bounds[0]) / (2 * target)
+    along_x = np.vstack([
+        np.interp(refined_x, x_values, row) for row in surface
+    ])
+    refined = np.vstack([
+        np.interp(refined_y, y_values, along_x[:, column])
+        for column in range(along_x.shape[1])
+    ]).T
+    return refined_x, refined_y, refined
+
+
+def plot_accuracy_reconstruction(
+    reconstructions,
+    output,
+    *,
+    save=True,
+    show=False,
+    filename="experiment_1_reconstruction.pdf",
+):
+    """Compare truth and posterior-mean backgrounds in 3-by-2 catalogue blocks."""
     if not reconstructions:
         return
     payloads = {
@@ -219,17 +311,20 @@ def plot_accuracy_reconstruction(reconstructions, output, *, save=True, show=Fal
     if upper <= 0.0:
         upper = 1.0
 
+    n_panels = 1 + len(methods)
+    n_rows = int(np.ceil(n_panels / 2))
     figure, axes = plt.subplots(
-        len(scenarios),
-        1 + len(methods),
-        figsize=(2.75 * (1 + len(methods)), 2.9 * len(scenarios)),
+        n_rows,
+        2 * len(scenarios),
+        figsize=(5.7 * len(scenarios), 2.75 * n_rows + 0.55),
         squeeze=False,
         sharex=True,
         sharey=True,
         layout="constrained",
     )
     image = None
-    for row, scenario in enumerate(scenarios):
+    active_axes = []
+    for scenario_index, scenario in enumerate(scenarios):
         scenario_payloads = {
             method: payloads[(scenario, method)]
             for method in methods
@@ -253,42 +348,65 @@ def plot_accuracy_reconstruction(reconstructions, output, *, save=True, show=Fal
         dx, dy = x_values[1] - x_values[0], y_values[1] - y_values[0]
         x_bounds = (x_values[0] - dx / 2, x_values[-1] + dx / 2)
         y_bounds = (y_values[0] - dy / 2, y_values[-1] + dy / 2)
-        for column, (title, panel_payload, estimate) in enumerate(panel_payloads):
+        for panel_index, (title, panel_payload, estimate) in enumerate(panel_payloads):
+            row = panel_index // 2
+            column = 2 * scenario_index + panel_index % 2
             axis = axes[row, column]
             if panel_payload is None:
                 axis.text(0.5, 0.5, "Unavailable", ha="center", va="center")
                 axis.set_axis_off()
                 continue
-            image = axis.pcolormesh(
+            refined_x, refined_y, refined_surface = _refine_regular_surface(
                 x_values,
                 y_values,
                 _background_surface(panel_payload, estimate),
-                cmap="viridis",
+                RECONSTRUCTION_DISPLAY_GRID_SIZE,
+            )
+            image = axis.pcolormesh(
+                refined_x,
+                refined_y,
+                refined_surface,
+                cmap="magma",
                 vmin=0.0,
                 vmax=upper,
                 shading="auto",
                 rasterized=True,
             )
+            active_axes.append(axis)
             _plot_partition_boundaries(axis, zones, color="white", linewidth=0.55)
             axis.set(xlim=x_bounds, ylim=y_bounds, aspect="equal")
-            if row == 0:
-                axis.set_title(title)
-            if row == len(scenarios) - 1:
+            axis.set_title(
+                f"{scenario.title()}\n{title}"
+                if len(scenarios) > 1 and row == 0
+                else title
+            )
+            if row == n_rows - 1:
                 axis.set_xlabel("x")
-        axes[row, 0].set_ylabel(
-            f"{scenario.title()} (rep. {payload['replicate']})\ny"
+            if panel_index % 2 == 0:
+                axis.set_ylabel("y")
+        for panel_index in range(n_panels, 2 * n_rows):
+            row = panel_index // 2
+            column = 2 * scenario_index + panel_index % 2
+            axes[row, column].set_axis_off()
+    if len(scenarios) == 1:
+        reference = next(iter(payloads.values()))
+        figure.suptitle(
+            f"{scenarios[0].title()} scenario, replicate "
+            f"{int(reference['replicate'])}"
         )
+    else:
+        figure.suptitle("Representative background reconstructions")
     if image is not None:
         figure.colorbar(
             image,
-            ax=axes.ravel().tolist(),
+            ax=active_axes,
             label="Background intensity",
             shrink=0.78,
             pad=0.015,
         )
     _save_figure(
         figure,
-        output / "experiment_1_reconstruction.pdf",
+        output / filename,
         save,
         show,
         contains_rasterized_artists=True,
@@ -376,6 +494,168 @@ def plot_accuracy(summary, output, *, save=True, show=False):
         frameon=False,
     )
     _save_figure(figure, output / "experiment_1_accuracy.pdf", save, show)
+
+
+_REPLICATE_BOXPLOT_METRICS = (
+    ("rel_l2_background", r"Background $e_{L_2}$", "Relative L2 error", False),
+    ("mae_background", "Background MAE", "Mean absolute error", False),
+    ("etas_parameter_log_error", "Mean ETAS log-error", "Absolute log error", False),
+    ("background_brier", "Background Brier score", "Score", False),
+    ("background_f1", "Background F1 score", "Score", False),
+    ("mean_true_state_probability", "True-state probability", "Probability", False),
+    ("candidate_recall", "Candidate recall", "Recall", False),
+    ("runtime_seconds", "Wall-clock time", "Seconds", True),
+)
+
+
+def _grouped_metric_boxplot(axis, records, metric, title, ylabel, log_scale):
+    methods = [
+        method for method in METHODS
+        if any(row.get("method") == method for row in records)
+    ]
+    scenarios = [
+        scenario for scenario in SCENARIOS
+        if any(row.get("scenario") == scenario for row in records)
+    ]
+    colors = {"easy": "#0072B2", "difficult": "#D55E00"}
+    centers = np.arange(len(methods), dtype=float)
+    offsets = np.linspace(-0.22, 0.22, len(scenarios)) if len(scenarios) > 1 else [0.0]
+    width = min(0.32, 0.7 / max(len(scenarios), 1))
+    for scenario, offset in zip(scenarios, offsets):
+        values, positions = [], []
+        for center, method in zip(centers, methods):
+            sample = np.asarray([
+                row.get(metric, np.nan)
+                for row in records
+                if row.get("status") == "ok"
+                and row.get("scenario") == scenario
+                and row.get("method") == method
+            ], dtype=float)
+            sample = sample[np.isfinite(sample)]
+            if sample.size:
+                values.append(sample)
+                positions.append(center + offset)
+        if not values:
+            continue
+        artists = axis.boxplot(
+            values,
+            positions=positions,
+            widths=width,
+            patch_artist=True,
+            whis=1.5,
+            manage_ticks=False,
+            boxprops={"linewidth": 0.9},
+            whiskerprops={"linewidth": 0.8},
+            capprops={"linewidth": 0.8},
+            medianprops={"color": "#1A1A1A", "linewidth": 1.4},
+            flierprops={
+                "marker": "o", "markersize": 2.5, "alpha": 0.45,
+                "markerfacecolor": colors.get(scenario, "#777777"),
+                "markeredgecolor": "none",
+            },
+        )
+        for box in artists["boxes"]:
+            box.set_facecolor(colors.get(scenario, "#777777"))
+            box.set_alpha(0.72)
+    axis.set_title(title)
+    axis.set_xticks(centers, [method.upper() for method in methods])
+    axis.set_ylabel(ylabel)
+    axis.grid(axis="y", alpha=0.25)
+    if log_scale:
+        axis.set_yscale("log")
+
+
+def _plot_replicate_boxplot_grid(
+    records, panels, output_path, *, save, show, truth_parameters=None,
+):
+    figure, axes = plt.subplots(2, 4, figsize=(14.5, 7.0), layout="constrained")
+    colors = {"easy": "#0072B2", "difficult": "#D55E00"}
+    for index, (axis, panel) in enumerate(zip(axes.flat, panels)):
+        _grouped_metric_boxplot(axis, records, *panel)
+        if truth_parameters is not None:
+            parameter = truth_parameters[index]
+            for scenario in SCENARIOS:
+                truths = {
+                    float(row[f"true_{parameter}"])
+                    for row in records
+                    if row.get("scenario") == scenario
+                    and row.get(f"true_{parameter}") not in (None, "")
+                }
+                if len(truths) == 1:
+                    axis.axhline(
+                        truths.pop(), color=colors.get(scenario, "#777777"),
+                        linestyle=":", linewidth=1.2,
+                    )
+    scenarios = [
+        scenario for scenario in SCENARIOS
+        if any(row.get("scenario") == scenario for row in records)
+    ]
+    handles = [
+        Patch(facecolor=colors.get(scenario, "#777777"), alpha=0.72,
+              label=scenario.title())
+        for scenario in scenarios
+    ]
+    handles.append(
+        Line2D([], [], color="#1A1A1A", linewidth=1.4, label="Median")
+    )
+    if truth_parameters is not None:
+        handles.append(
+            Line2D([], [], color="#555555", linestyle=":", linewidth=1.2,
+                   label="Generating value")
+        )
+    figure.legend(
+        handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.035),
+        ncol=len(handles), frameon=False,
+    )
+    _save_figure(figure, output_path, save, show)
+
+
+def plot_accuracy_replicate_boxplots(records, output, *, save=True, show=False):
+    """Plot replicate distributions; each value summarizes one fitted catalogue."""
+    completed = [row for row in records if row.get("status") == "ok"]
+    if not completed:
+        return
+    _plot_replicate_boxplot_grid(
+        completed,
+        _REPLICATE_BOXPLOT_METRICS,
+        Path(output) / "experiment_1_replicate_boxplots.pdf",
+        save=save,
+        show=show,
+    )
+    labels = {"alpha": r"\alpha", "gamma": r"\gamma", "beta": r"\beta"}
+    estimate_panels = tuple(
+        (
+            f"estimate_{name}",
+            rf"${labels.get(name, name)}$ posterior mean",
+            "Posterior mean",
+            False,
+        )
+        for name in PARAMETER_NAMES
+    )
+    _plot_replicate_boxplot_grid(
+        completed,
+        estimate_panels,
+        Path(output) / "experiment_1_parameter_estimate_boxplots.pdf",
+        save=save,
+        show=show,
+        truth_parameters=PARAMETER_NAMES,
+    )
+    parameter_panels = tuple(
+        (
+            f"log_error_{name}",
+            rf"${labels.get(name, name)}$ log-error",
+            "Absolute log error",
+            False,
+        )
+        for name in PARAMETER_NAMES
+    )
+    _plot_replicate_boxplot_grid(
+        completed,
+        parameter_panels,
+        Path(output) / "experiment_1_parameter_error_boxplots.pdf",
+        save=save,
+        show=show,
+    )
 
 
 def save_accuracy_posteriors(
@@ -794,8 +1074,9 @@ def plot_accuracy_parameter_marginals(
     save=True,
     show=False,
     truths=None,
+    include_replicate=False,
 ):
-    """Compare M1--M5 marginals for each representative catalogue."""
+    """Compare M1--M5 marginals for each selected catalogue."""
     for selected in selection_records:
         scenario = selected["scenario"]
         replicate = int(selected["replicate"])
@@ -821,6 +1102,9 @@ def plot_accuracy_parameter_marginals(
         truth = (truths or {}).get((scenario, replicate)) or {
             **SCENARIOS[scenario]["etas"].as_dict(), "beta": SCENARIOS[scenario]["beta"]
         }
+        figure_stem = f"experiment_1_parameter_marginals_{scenario}"
+        if include_replicate:
+            figure_stem += f"_rep{replicate:02d}"
         result = plot_spinh_parameter_marginals(
             compared or {reference["method_label"]: reference["samples"]},
             reference_posterior=(reference["samples"] if compared else None),
@@ -838,7 +1122,7 @@ def plot_accuracy_parameter_marginals(
             rng_seed=91_000 + replicate,
             title=f"{scenario.title()} scenario, replicate {replicate}",
             savefigure=save,
-            title_savefig=f"experiment_1_parameter_marginals_{scenario}",
+            title_savefig=figure_stem,
             output_dir=output,
             show=show,
         )

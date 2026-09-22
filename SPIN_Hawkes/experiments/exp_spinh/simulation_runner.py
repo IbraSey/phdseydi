@@ -213,7 +213,8 @@ def _print_run_summary(results, output):
 
 
 def postprocess_accuracy_results(
-    profile="full", *, save_figures=True, show_figures=False, output_dir=None,
+    profile="full", *, save_figures=True, show_figures=False,
+    replicate_boxplots=False, output_dir=None,
 ):
     """Rebuild tables, backgrounds, marginals and traces from saved arrays."""
     output = Path(output_dir) if output_dir is not None else RESULTS_ROOT / profile
@@ -239,6 +240,7 @@ def postprocess_accuracy_results(
     render_accuracy_outputs(
         records, summary, backgrounds, posteriors, selection, output,
         save=save_figures, show=_resolve_figure_display(show_figures),
+        replicate_boxplots=replicate_boxplots,
     )
     print(f"Experiment 1 outputs rebuilt without inference: {output}")
     if not backgrounds:
@@ -289,6 +291,7 @@ def run(
     resume=True,
     save_figures=True,
     show_figures=False,
+    replicate_boxplots=False,
     campaign_overrides=None,
     output_dir=None,
     evaluation_quadrature=None,
@@ -310,8 +313,13 @@ def run(
         worker_memory_reservation_gib=guard["memory_reservation_gib"],
     )
     _validate_execution_settings(n_jobs)
-    if not all(isinstance(value, bool) for value in (resume, save_figures, show_figures)):
-        raise ValueError("resume, save_figures and show_figures must be boolean.")
+    if not all(
+        isinstance(value, bool)
+        for value in (resume, save_figures, show_figures, replicate_boxplots)
+    ):
+        raise ValueError(
+            "resume, save_figures, show_figures and replicate_boxplots must be boolean."
+        )
     display_figures = _resolve_figure_display(show_figures)
     campaign = configure_campaign(profile, **(campaign_overrides or {}))
     quadratures = {
@@ -345,6 +353,7 @@ def run(
             "effective_workers": effective_worker_count(n_jobs),
             "memory_policy": guard,
             "resume": resume,
+            "replicate_boxplots": replicate_boxplots,
             "partition_figure_replicate": PARTITION_FIGURE_REPLICATE,
             "partition_figure_grid_size": PARTITION_FIGURE_GRID_SIZE,
             "experiment_2_durations": EXPERIMENT_2_DURATIONS,
@@ -387,7 +396,7 @@ def run(
         )
         write_records(output / "experiment_1_accuracy_table.csv", accuracy_summary)
         save_accuracy_posteriors(posteriors, output)
-        selected, selection_records = select_representative_reconstructions(
+        _, selection_records = select_representative_reconstructions(
             accuracy, reconstructions
         )
         write_records(
@@ -396,8 +405,9 @@ def run(
         )
         save_accuracy_backgrounds(reconstructions, output)
         render_accuracy_outputs(
-            accuracy, accuracy_summary, selected, posteriors, selection_records,
+            accuracy, accuracy_summary, reconstructions, posteriors, selection_records,
             output, save=save_figures, show=display_figures,
+            replicate_boxplots=replicate_boxplots,
         )
         results["experiment_1_accuracy"] = (accuracy, accuracy_summary)
         write_experiment_1_latex(output, accuracy_summary)
@@ -440,6 +450,7 @@ def run(
             )
             plot_partition_gibbs_diagnostics(
                 traces, output, save=save_figures, show=display_figures,
+                truths=generating_parameters(raw),
             )
         results["experiment_2"] = (
             raw, paired, paired_summary, surfaces, traces,
@@ -543,6 +554,14 @@ def parse_args(argv=None):
         action="store_true",
         help="Open figure windows in addition to saving figures.",
     )
+    figures.add_argument(
+        "--replicate-boxplots",
+        action="store_true",
+        help=(
+            "For Experiment 1, add boxplots of replicate-level metrics and "
+            "posterior-mean parameter estimates and errors."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -578,18 +597,24 @@ def execute(action="run", **options):
             name: value for name, value in options.items()
             if name in {"profile", "save_figures", "show_figures", "output_dir"}
         }
+        accuracy_settings = {
+            **settings,
+            "replicate_boxplots": options.get("replicate_boxplots", False),
+        }
         experiment = options.get("experiment", "all")
         if experiment not in {"1", "2", "all"}:
             raise ValueError("experiment must be '1', '2' or 'all'.")
         if experiment == "1":
-            return postprocess_accuracy_results(**settings)
+            return postprocess_accuracy_results(**accuracy_settings)
         if experiment == "2":
             return postprocess_partition_results(**settings)
         output = settings.get("output_dir")
         output = Path(output) if output is not None else RESULTS_ROOT / settings.get("profile", "full")
         results = {}
         if (output / "experiment_1_accuracy_raw.csv").is_file():
-            results["experiment_1_accuracy"] = postprocess_accuracy_results(**settings)
+            results["experiment_1_accuracy"] = postprocess_accuracy_results(
+                **accuracy_settings
+            )
         if (output / "experiment_2_fits_raw.csv").is_file():
             results["experiment_2"] = postprocess_partition_results(**settings)
         if not results:
@@ -611,6 +636,7 @@ def main(argv=None):
         resume=not args.no_resume,
         save_figures=not args.no_figures,
         show_figures=args.show_figures,
+        replicate_boxplots=args.replicate_boxplots,
         output_dir=args.output_dir,
         campaign_overrides=_overrides_from_args(args),
     )

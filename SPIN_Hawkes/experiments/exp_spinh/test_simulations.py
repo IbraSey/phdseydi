@@ -19,20 +19,22 @@ else:
     raise RuntimeError("Open the repository folder before running this script.")
 
 from experiments.exp_spinh.simulation_settings import METHODS
-from experiments.exp_spinh.simulation_runner import execute, main, run, should_use_editor_settings
+from experiments.exp_spinh.simulation_runner import execute, main, run as run, should_use_editor_settings
 
 EDITOR_ACTION = "run"             # "run" or "postprocess"
 EDITOR_PROFILE = "full"           # complete production budgets
 EDITOR_EXPERIMENT = "all"         # run Experiment 1, save it, then run Experiment 2
 EDITOR_METHODS = tuple(METHODS)    # M1--M5
 EDITOR_N_JOBS = -1                 # all safe workers, capped automatically by RAM
-EDITOR_RESUME = True               # reuse completed task checkpoints
+EDITOR_RESUME = False              # False: start over; True: reuse completed checkpoints
 EDITOR_SAVE_FIGURES = True
 EDITOR_SHOW_FIGURES = False
+EDITOR_REPLICATE_BOXPLOTS = False  # optional distribution study for Experiment 1
 EDITOR_OUTPUT_DIR = None           # None: results/spinh_test/<profile>
 
 # Optional overrides; all numerical defaults live in simulation_settings.py.
 EDITOR_CAMPAIGN_OVERRIDES = {
+    # "n_replicates": 100,
     # Example: "gibbs_iterations": 4000,
 }
 
@@ -48,6 +50,7 @@ def editor_run_options():
         "resume": EDITOR_RESUME,
         "save_figures": EDITOR_SAVE_FIGURES,
         "show_figures": EDITOR_SHOW_FIGURES,
+        "replicate_boxplots": EDITOR_REPLICATE_BOXPLOTS,
         "output_dir": EDITOR_OUTPUT_DIR,
         "campaign_overrides": dict(EDITOR_CAMPAIGN_OVERRIDES),
     }

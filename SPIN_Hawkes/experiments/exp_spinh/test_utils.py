@@ -258,14 +258,12 @@ def mcmc_diagnostics(chains):
         raise ValueError("Expected non-empty (chain, draw, parameter) arrays.")
     result = {name: np.full(chains.shape[2], np.nan) for name in ("rhat", "ess_bulk", "ess_tail", "mcse_mean")}
     az = _load_arviz()
-    if az is None:
-        return result
     for k in range(chains.shape[2]):
         values = chains[:, :, k]
         if not np.isfinite(values).all() or np.any(np.ptp(values, axis=1) == 0):
             result["rhat"][k] = np.inf
             result["ess_bulk"][k] = result["ess_tail"][k] = 0.
-        elif values.shape[1] >= 4:
+        elif az is not None and values.shape[1] >= 4:
             if len(values) >= 2:
                 result["rhat"][k] = float(az.rhat(values, method="rank"))
             result["ess_bulk"][k] = float(az.ess(values, method="bulk"))
@@ -407,7 +405,10 @@ def _fit_spinh_vi(
     spatial_compensator_quadrature,
 ):
     """Run the MF-VI starts used by M4 and M5 and retain the best ELBO."""
-    candidates = []
+    elbos = []
+    best_fit = None
+    best_elbo = -np.inf
+    best_start = None
     for start in range(campaign.vi_starts):
         start_seed = int(seed + 1009 * start)
         start_profile = vi_start_profile(start)
@@ -440,13 +441,16 @@ def _fit_spinh_vi(
             quadrature=background_quadrature,
             spatial_compensator_quadrature=spatial_compensator_quadrature,
         )
-        final_elbo = float(fit.elbo_trace[-1]) if fit.elbo_trace else -np.inf
-        candidates.append((final_elbo, fit))
+        final_elbo = float(fit.elbo_trace[-1]) if len(fit.elbo_trace) else -np.inf
+        elbos.append(final_elbo)
+        if np.isfinite(final_elbo) and (best_fit is None or final_elbo > best_elbo):
+            best_start, best_elbo, best_fit = start, final_elbo, fit
+        # Keep only the best fitted state; HSGP and branching arrays can be large.
+        del fit
     runtime = time.perf_counter() - started
-    best_start, (final_elbo, fit) = max(
-        enumerate(candidates),
-        key=lambda item: item[1][0] if np.isfinite(item[1][0]) else -np.inf,
-    )
+    if best_fit is None:
+        raise FloatingPointError("No VI start produced a finite final ELBO.")
+    fit, final_elbo = best_fit, best_elbo
     diagnostics = {
         "status": "ok",
         "runtime_seconds": float(runtime),
@@ -456,7 +460,7 @@ def _fit_spinh_vi(
         "final_elbo": float(final_elbo),
         "vi_starts_run": campaign.vi_starts,
         "vi_best_start": int(best_start),
-        "vi_start_elbos": [float(elbo) for elbo, _ in candidates],
+        "vi_start_elbos": elbos,
         "vi_start_profiles": [
             vi_start_profile(start)["name"]
             for start in range(campaign.vi_starts)
@@ -954,7 +958,7 @@ def summarize_records(records, group_fields, metrics):
     return summaries
 
 # Protocol re-exports retained for existing experiment callers.
-from .simulation_settings import (
+from .simulation_settings import (  # noqa: F401
     ACCURACY_BACKGROUND_MUS,
     ACCURACY_DURATION_CALIBRATION_REPLICATES,
     ACCURACY_DURATION_CALIBRATION_SEED,

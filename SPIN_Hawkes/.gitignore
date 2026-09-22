@@ -5,9 +5,22 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
 
-# macOS metadata
+# Editors and operating-system metadata
 .DS_Store
+**/.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+*.swp
 
 # Restartable experiment checkpoints
 .checkpoints/

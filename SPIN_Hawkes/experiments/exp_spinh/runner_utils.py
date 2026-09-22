@@ -231,9 +231,21 @@ def _checkpoint_path(directory, task_key):
 def _load_checkpoint(path):
     try:
         with Path(path).open("rb") as stream:
-            return True, pickle.load(stream)
+            result = pickle.load(stream)
     except (OSError, EOFError, pickle.UnpicklingError):
         return False, None
+    return (False, None) if _has_failed_fit(result) else (True, result)
+
+
+def _has_failed_fit(result):
+    """Retry incomplete catalogue tasks while retaining their on-disk record."""
+    if isinstance(result, dict):
+        if result.get("status") in {"error", "incomplete"}:
+            return True
+        return any(_has_failed_fit(value) for value in result.values())
+    if isinstance(result, (tuple, list)):
+        return any(_has_failed_fit(value) for value in result)
+    return False
 
 
 def _write_checkpoint(path, result):

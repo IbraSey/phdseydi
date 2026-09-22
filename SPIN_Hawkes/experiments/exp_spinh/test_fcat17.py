@@ -1,8 +1,8 @@
 """FCAT-17 spatial block cross-validation for the SPIN-H numerical tests.
 
-FCAT-17 is treated as a declustered background catalogue.  The script compares
-the SSGC component of SPIN-H, its zoneless SGCP special case and a KDE whose
-bandwidth and normalization are estimated from each training fold only.
+FCAT-17 is treated as a declustered background catalogue. The script compares
+Gibbs and VI fits of the SSGC component of SPIN-H, its zoneless SGCP special
+case and a KDE fitted from each training fold only.
 
 For an editor workflow, change the ``EDITOR SETTINGS`` block below and run the
 file without arguments.  Command-line arguments remain available for batch
@@ -16,6 +16,7 @@ import argparse
 import sys
 import time
 import warnings
+from dataclasses import asdict
 from numbers import Integral
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,15 +30,20 @@ from scipy.stats import gaussian_kde
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+start = Path(globals().get("__file__", Path.cwd() / "interactive.py")).resolve().parent
+search_roots = [start, *start.parents]
+for candidate in search_roots + [path / "SPIN_Hawkes" for path in search_roots]:
+    if (candidate / "package/models/spinh.py").is_file():
+        REPO_ROOT = candidate
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        break
+else:
+    raise RuntimeError("Open the repository folder before running this script.")
 
 from data import EventCatalog
+from experiments.exp_spinh.fcat_settings import CAMPAIGNS, configure_campaign
 from experiments.exp_spinh.test_utils import (
-    CAMPAIGNS,
-    RESULTS_ROOT,
-    configure_campaign,
     mean_confidence_interval,
     write_campaign,
     write_records,
@@ -58,6 +64,7 @@ from experiments.exp_ssgc.deliverable_utils import (
 )
 from spatial import DomainPartition
 
+RESULTS_ROOT = REPO_ROOT / "results" / "spinh_test"
 
 # %% ========================================================================
 # FCAT-17 SCIENTIFIC SETTINGS
@@ -71,13 +78,18 @@ EPS_PRIOR_VARIANCE = 10.0
 EPS_PRIOR_LENGTH_SCALE_KM = 3.0
 INITIAL_GP = GPParameters(variance=2.0, length_scale=50.0)
 FINAL_INTENSITY_GRID_SIZE = 90
-MODELS = ("ssgc", "sgcp", "kde")
+SSGC_METHODS = {
+    "ssgc_gibbs_sparse": "gibbs_sparse",
+    "ssgc_vi_sparse": "vi_sparse",
+}
+MODELS = (*SSGC_METHODS, "sgcp", "kde")
 MODEL_LABELS = {
-    "ssgc": "SSGC (French partition)",
+    "ssgc_gibbs_sparse": "SSGC (Gibbs sparse)",
+    "ssgc_vi_sparse": "SSGC (VI sparse)",
     "sgcp": "SGCP (J=1)",
     "kde": "KDE",
 }
-SSGC_INFERENCE_METHODS = (
+SGCP_INFERENCE_METHODS = (
     "gibbs_exact",
     "gibbs_sparse",
     "vi_exact",
@@ -92,22 +104,25 @@ SSGC_INFERENCE_METHODS = (
 # Window" workflow.  Command-line arguments take precedence when provided.
 # ``None`` means: keep the selected profile's default value.
 
-EDITOR_PROFILE = "smoke"                    # "smoke" or "full"
+EDITOR_PROFILE = "full"                     # "smoke" or "full"
 EDITOR_MODELS = tuple(MODELS)                # any subset of MODELS
-EDITOR_INFERENCE_METHOD = "vi_sparse"        # one of SSGC_INFERENCE_METHODS
-EDITOR_N_JOBS = None                         # None: one fit at a time, for both profiles
+EDITOR_INFERENCE_METHOD = "vi_sparse"        # SGCP only; SSGC variants are fixed
+EDITOR_N_JOBS = 3                            # simultaneous spatial-fold fits
 EDITOR_RESUME = True                         # reuse completed task checkpoints
 EDITOR_SAVE_FIGURES = True
 EDITOR_SHOW_FIGURES = True
+EDITOR_OUTPUT_DIR = None                     # None: results/spinh_test/<profile>
 
 EDITOR_CAMPAIGN_OVERRIDES = {
     "n_chains": None,
     "gibbs_iterations": None,
     "gibbs_thin": None,
     "vi_iterations": None,
+    "vi_tolerance": None,
     "evaluation_space_grid": None,
-    "quadrature_space_grid": None,
-    "posterior_draws": None,
+    "quadrature_space_grid": None,  # full: 70 x 70, smoke: 4 x 4
+    "score_posterior_draws": None,  # full: 1000
+    "map_posterior_draws": None,    # full: 500
     "max_parallel_calibrations": None,
     "exact_max_events": None,
     "use_calibration": None,
@@ -126,6 +141,7 @@ def editor_run_options():
         "resume": EDITOR_RESUME,
         "save_figures": EDITOR_SAVE_FIGURES,
         "show_figures": EDITOR_SHOW_FIGURES,
+        "output_dir": EDITOR_OUTPUT_DIR,
         "campaign_overrides": dict(EDITOR_CAMPAIGN_OVERRIDES),
     }
 
@@ -158,8 +174,8 @@ def validate_fcat_settings():
             raise ValueError(f"{name} must be finite and positive.")
     if not MODELS or len(set(MODELS)) != len(MODELS):
         raise ValueError("MODELS must contain unique model identifiers.")
-    if not SSGC_INFERENCE_METHODS:
-        raise ValueError("SSGC_INFERENCE_METHODS cannot be empty.")
+    if not SGCP_INFERENCE_METHODS:
+        raise ValueError("SGCP_INFERENCE_METHODS cannot be empty.")
     if (
         isinstance(FINAL_INTENSITY_GRID_SIZE, bool)
         or not isinstance(FINAL_INTENSITY_GRID_SIZE, Integral)
@@ -188,15 +204,16 @@ def _print_run_settings(
     print("SPIN-H FCAT-17 TEST")
     print("=" * 78)
     print(
-        f"Profile={campaign.name} | models={','.join(model.upper() for model in models)} | "
-        f"SSGC inference={inference_method}"
+        f"Profile={campaign.name} | models={', '.join(MODEL_LABELS[model] for model in models)} | "
+        f"SGCP inference={inference_method}"
     )
     print(
         f"Catalogue: N={len(data['catalog'])}, years >= {YEAR_MIN}, "
         f"magnitude >= {MAGNITUDE_MIN:g}, duration={data['duration']:.1f} years"
     )
     print(
-        f"Spatial folds={len(folds)} | posterior draws={campaign.posterior_draws} | "
+        f"Spatial folds={len(folds)} | score draws={campaign.score_posterior_draws} | "
+        f"map draws={campaign.map_posterior_draws} | "
         f"GP calibration={'on' if campaign.use_calibration else 'off'} | "
         f"workers={effective_worker_count(n_jobs)} (n_jobs={n_jobs})"
     )
@@ -205,16 +222,24 @@ def _print_run_settings(
             "GP calibration: complete training catalogue, "
             f"at most {campaign.max_parallel_calibrations} simultaneous fit(s)"
         )
+    if "ssgc_gibbs_sparse" in models:
+        print(
+            f"SSGC Gibbs: {campaign.n_chains} chain(s) x "
+            f"{campaign.gibbs_iterations} iterations per fit"
+        )
     print(f"Output directory: {output}")
     if campaign.name == "full":
         print("Full profile selected: this campaign can require substantial compute time.")
 
 
 _CHECKPOINT_SOURCES = (
-    Path(__file__),
-    Path(__file__).with_name("test_utils.py"),
-    Path(__file__).with_name("runner_utils.py"),
+    REPO_ROOT / "experiments/exp_spinh/test_fcat17.py",
+    REPO_ROOT / "experiments/exp_spinh/fcat_settings.py",
+    REPO_ROOT / "experiments/exp_spinh/test_utils.py",
+    REPO_ROOT / "experiments/exp_spinh/runner_utils.py",
     REPO_ROOT / "package",
+    REPO_ROOT / "data",
+    REPO_ROOT / "spatial",
     REPO_ROOT / "experiments" / "exp_ssgc" / "deliverable_utils.py",
 )
 
@@ -418,18 +443,25 @@ def _make_model(zones, data, gp_prior):
     )
 
 
-def _ssgc_campaign(campaign):
+def _ssgc_campaign(campaign, *, posterior_draws):
     """Adapt the SPIN-H campaign names to the existing SSGC fit wrapper."""
     return SimpleNamespace(
         n_chains=campaign.n_chains,
         gibbs_iterations=campaign.gibbs_iterations,
         gibbs_thin=campaign.gibbs_thin,
         vi_iterations=campaign.vi_iterations,
+        vi_tolerance=getattr(campaign, "vi_tolerance", 1e-5),
         evaluation_grid=campaign.evaluation_space_grid,
         quadrature_grid=campaign.quadrature_space_grid,
-        posterior_draws=campaign.posterior_draws,
+        posterior_draws=posterior_draws,
         exact_max_events=campaign.exact_max_events,
     )
+
+
+def _inference_for_model(model_name, sgcp_inference_method):
+    if model_name in SSGC_METHODS:
+        return SSGC_METHODS[model_name]
+    return "scott_kde" if model_name == "kde" else sgcp_inference_method
 
 
 def _calibrate_gp(training_catalog, training_zones, data, campaign, seed):
@@ -459,7 +491,10 @@ def _calibrate_gp(training_catalog, training_zones, data, campaign, seed):
             )
 
 
-def _kde_intensity(training_catalog, training_geometry, evaluation_xy, data, grid_size):
+def _kde_intensity(
+    training_catalog, training_geometry, evaluation_xy, data, grid_size,
+    *, return_log=False,
+):
     """Fit and exposure-normalize a KDE using only the training fold."""
     points = np.asarray(training_catalog.xy, dtype=float)
     quadrature_xy, quadrature_weights = area_weighted_grid(
@@ -470,16 +505,19 @@ def _kde_intensity(training_catalog, training_geometry, evaluation_xy, data, gri
         training_geometry,
     )
     if len(points) < 3 or np.linalg.matrix_rank(np.cov(points.T)) < 2:
-        return np.full(
+        intensity = np.full(
             len(evaluation_xy),
             len(points) / (data["duration"] * training_geometry.area),
         )
+        return np.log(intensity) if return_log else intensity
     kde = gaussian_kde(points.T, bw_method="scott")
     quadrature_density = kde(quadrature_xy.T)
     retained_mass = float(quadrature_weights @ quadrature_density)
     if not np.isfinite(retained_mass) or retained_mass <= 0.0:
         raise FloatingPointError("KDE training-domain normalization is not positive.")
     scale = len(points) / (data["duration"] * retained_mass)
+    if return_log:
+        return np.log(scale) + kde.logpdf(np.asarray(evaluation_xy).T)
     return scale * kde(np.asarray(evaluation_xy).T)
 
 
@@ -530,15 +568,15 @@ def _fit_full_intensity(
             "gp_calibration_n_events": 0,
         }
 
-    zones = data["zones"] if model_name == "ssgc" else [data["union"]]
+    zones = data["zones"] if model_name in SSGC_METHODS else [data["union"]]
     model = _make_model(zones, data, gp_prior)
     partition = DomainPartition.from_polygons(zones)
     domain_index = partition.locate(evaluation_xy[:, 0], evaluation_xy[:, 1])
     draws, diagnostics = fit_intensity_method(
         model,
         data["catalog"],
-        inference_method,
-        _ssgc_campaign(campaign),
+        _inference_for_model(model_name, inference_method),
+        _ssgc_campaign(campaign, posterior_draws=campaign.map_posterior_draws),
         seed,
         evaluation_xy,
         domain_index=domain_index,
@@ -557,7 +595,7 @@ def _fit_full_intensity(
         "status": "ok",
         "model": model_name,
         "model_label": MODEL_LABELS[model_name],
-        "inference_method": inference_method,
+        "inference_method": _inference_for_model(model_name, inference_method),
         "n_events": len(data["catalog"]),
         "n_posterior_draws": draws.shape[1],
         "runtime_seconds": inference_seconds + calibration_seconds,
@@ -582,7 +620,7 @@ def _full_intensity_task(model_name, data, campaign, inference_method, evaluatio
             )
         else:
             calibration_zones = (
-                data["zones"] if model_name == "ssgc" else [data["union"]]
+                data["zones"] if model_name in SSGC_METHODS else [data["union"]]
             )
             (
                 gp_prior,
@@ -654,12 +692,22 @@ def fit_full_intensity_maps(
     return estimates, [record for _, _, record in results]
 
 
-def _score_draws(event_draws, quadrature_draws, quadrature_weights, duration):
+def _score_draws(
+    event_draws, quadrature_draws, quadrature_weights, duration,
+    *, event_log_draws=None,
+):
+    """Log-mean likelihood across aligned posterior draws, before normalization."""
+    if event_log_draws is None:
+        with np.errstate(divide="ignore"):
+            event_log_draws = np.log(event_draws)
     log_likelihood = (
-        np.sum(np.log(np.maximum(event_draws, np.finfo(float).tiny)), axis=0)
+        np.sum(event_log_draws, axis=0)
         - duration * (quadrature_weights @ quadrature_draws)
     )
-    return float(logsumexp(log_likelihood) - np.log(log_likelihood.size))
+    score = float(logsumexp(log_likelihood) - np.log(log_likelihood.size))
+    if not np.isfinite(score):
+        raise FloatingPointError("The posterior predictive log score is not finite.")
+    return score
 
 
 def _fit_fold_model(
@@ -682,14 +730,16 @@ def _fit_fold_model(
     n_events = len(held_event_xy)
     n_quadrature = len(held_quadrature_xy)
     if model_name == "kde":
-        estimate = _kde_intensity(
+        log_estimate = _kde_intensity(
             training_catalog,
             training_geometry,
             evaluation_xy,
             data,
             campaign.evaluation_space_grid,
+            return_log=True,
         )
-        draws = estimate[:, None]
+        log_draws = log_estimate[:, None]
+        draws = np.exp(log_draws)
         diagnostics = {
             "status": "ok",
             "inference_seconds": time.perf_counter() - started,
@@ -697,7 +747,7 @@ def _fit_fold_model(
             "converged": True,
         }
     else:
-        full_zones = data["zones"] if model_name == "ssgc" else [data["union"]]
+        full_zones = data["zones"] if model_name in SSGC_METHODS else [data["union"]]
         training_zones = _training_zones(full_zones, held_geometry)
         model = _make_model(training_zones, data, gp_prior)
         partition = DomainPartition.from_polygons(full_zones)
@@ -705,12 +755,12 @@ def _fit_fold_model(
         draws, diagnostics = fit_intensity_method(
             model,
             training_catalog,
-            inference_method,
-            _ssgc_campaign(campaign),
+            _inference_for_model(model_name, inference_method),
+            _ssgc_campaign(campaign, posterior_draws=campaign.score_posterior_draws),
             seed,
             evaluation_xy,
             domain_index=domain_index,
-            return_log_intensity=False,
+            return_log_intensity=True,
             show_progress=False,
         )
         diagnostics.pop("peak_memory_mb", None)
@@ -722,6 +772,7 @@ def _fit_fold_model(
                 **diagnostics,
             }
         diagnostics["inference_seconds"] = diagnostics.pop("runtime_seconds")
+        log_draws = diagnostics.pop("_log_intensity_draws")
     event_draws = draws[:n_events]
     quadrature_draws = draws[n_events : n_events + n_quadrature]
     score = _score_draws(
@@ -729,12 +780,13 @@ def _fit_fold_model(
         quadrature_draws,
         held_quadrature_weights,
         data["duration"],
+        event_log_draws=log_draws[:n_events],
     )
     record = {
         "status": "ok",
         "model": model_name,
         "model_label": MODEL_LABELS[model_name],
-        "inference_method": "scott_kde" if model_name == "kde" else inference_method,
+        "inference_method": _inference_for_model(model_name, inference_method),
         "n_train": len(training_catalog),
         "n_held_out": n_events,
         "predictive_log_score": score,
@@ -790,7 +842,7 @@ def _fcat_fold_task(
             0,
         )
     else:
-        full_zones = data["zones"] if model_name == "ssgc" else [data["union"]]
+        full_zones = data["zones"] if model_name in SSGC_METHODS else [data["union"]]
         calibration_zones = _training_zones(full_zones, held_geometry)
         (
             gp_prior,
@@ -883,7 +935,7 @@ def _write_latex_table(path, summary):
         if np.isfinite(lower) and np.isfinite(upper):
             score += f" [{lower:.3f}, {upper:.3f}]"
         lines.append(
-            f"{row['model'].upper()} & {score} \\\\"
+            f"{row['model_label']} & {score} \\\\"
         )
     lines.extend([r"\bottomrule", r"\end{tabular}"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -981,16 +1033,20 @@ def _plot_intensity_maps(
     color_map = plt.get_cmap("viridis")
 
     model_names = list(estimates)
+    ncols = 2 if len(model_names) == 4 else len(model_names)
+    nrows = int(np.ceil(len(model_names) / ncols))
     figure, axes = plt.subplots(
-        1,
-        len(model_names),
-        figsize=(4.4 * len(model_names) + 1.0, 6.2),
+        nrows,
+        ncols,
+        figsize=(4.4 * ncols + 1.0, 4.6 * nrows),
         sharex=True,
         sharey=True,
         squeeze=False,
         layout="constrained",
     )
     axes = axes.ravel()
+    for axis in axes[len(model_names):]:
+        axis.set_visible(False)
     image = None
     for index, (axis, model_name) in enumerate(zip(axes, model_names)):
         image = axis.tricontourf(
@@ -1042,7 +1098,7 @@ def _plot_intensity_maps(
             axis.set_ylabel("y (km)")
     figure.colorbar(
         image,
-        ax=list(axes),
+        ax=list(axes[:len(model_names)]),
         label=r"Annual posterior mean intensity (events km$^{-2}$ yr$^{-1}$)",
         shrink=0.84,
         pad=0.02,
@@ -1069,13 +1125,14 @@ def run(
     save_figures=True,
     show_figures=False,
     campaign_overrides=None,
+    output_dir=None,
 ):
     validate_fcat_settings()
     models = tuple(models)
     unknown = set(models) - set(MODELS)
-    if not models or unknown:
+    if not models or unknown or len(set(models)) != len(models):
         raise ValueError(f"At least one valid model is required; unknown={sorted(unknown)}.")
-    if inference_method not in SSGC_INFERENCE_METHODS:
+    if inference_method not in SGCP_INFERENCE_METHODS:
         raise ValueError(f"Unknown inference method {inference_method!r}.")
     n_jobs = resolve_n_jobs(profile, n_jobs)
     if not all(isinstance(value, bool) for value in (resume, save_figures, show_figures)):
@@ -1083,7 +1140,11 @@ def run(
     display_figures = _resolve_figure_display(show_figures)
     campaign = configure_campaign(profile, **(campaign_overrides or {}))
     data = load_fcat17()
-    output = RESULTS_ROOT / campaign.name
+    data_sources = tuple(
+        resolve_use_case_path() / name
+        for name in ("catalog.csv", "domaines_xy.csv")
+    )
+    output = Path(output_dir) if output_dir is not None else RESULTS_ROOT / campaign.name
     output.mkdir(parents=True, exist_ok=True)
     folds = spatial_block_folds(data, campaign.name)
     if not folds:
@@ -1125,17 +1186,19 @@ def run(
         for repeat, fold, _ in folds
         for model_name in models
     ]
+    fold_budget = asdict(campaign)
+    fold_budget.pop("map_posterior_draws")
     fold_checkpoints = checkpoint_directory(
         output,
         "fcat17_block_cv",
-        campaign,
+        fold_budget,
         settings={
             "models": models,
             "inference_method": inference_method,
             "year_min": YEAR_MIN,
             "magnitude_min": MAGNITUDE_MIN,
         },
-        source_paths=_CHECKPOINT_SOURCES,
+        source_paths=(*_CHECKPOINT_SOURCES, *data_sources),
     )
     records = [
         record
@@ -1159,16 +1222,18 @@ def run(
     _write_latex_table(output / "fcat17_table.tex", summary)
 
     _, _, _, map_xy = _intensity_map_grid(data)
+    map_budget = asdict(campaign)
+    map_budget.pop("score_posterior_draws")
     map_checkpoints = checkpoint_directory(
         output,
         "fcat17_full_maps",
-        campaign,
+        map_budget,
         settings={
             "models": models,
             "inference_method": inference_method,
             "grid_size": FINAL_INTENSITY_GRID_SIZE,
         },
-        source_paths=_CHECKPOINT_SOURCES,
+        source_paths=(*_CHECKPOINT_SOURCES, *data_sources),
     )
     full_estimates, full_fit_records = fit_full_intensity_maps(
         models,
@@ -1227,13 +1292,13 @@ def parse_args(argv=None):
         nargs="+",
         choices=MODELS,
         default=list(MODELS),
-        help="Models included in the spatial block comparison.",
+        help="Fits included in the spatial block comparison.",
     )
     selection.add_argument(
         "--inference-method",
-        choices=SSGC_INFERENCE_METHODS,
+        choices=SGCP_INFERENCE_METHODS,
         default="vi_sparse",
-        help="Inference backend used for SSGC and SGCP.",
+        help="Inference backend for SGCP; SSGC Gibbs/VI variants are fixed.",
     )
     selection.add_argument(
         "--n-jobs",
@@ -1241,15 +1306,18 @@ def parse_args(argv=None):
         default=None,
         help="Simultaneous jobs (default: 1). Test 2 before requesting more; RAM is shared.",
     )
+    selection.add_argument("--output-dir", type=Path, default=None)
 
     budget = parser.add_argument_group("campaign budget overrides")
     budget.add_argument("--n-chains", type=int, default=None)
     budget.add_argument("--gibbs-iterations", type=int, default=None)
     budget.add_argument("--gibbs-thin", type=int, default=None)
     budget.add_argument("--vi-iterations", type=int, default=None)
+    budget.add_argument("--vi-tolerance", type=float, default=None)
     budget.add_argument("--evaluation-space-grid", type=int, default=None)
     budget.add_argument("--quadrature-space-grid", type=int, default=None)
-    budget.add_argument("--posterior-draws", type=int, default=None)
+    budget.add_argument("--score-posterior-draws", type=int, default=None)
+    budget.add_argument("--map-posterior-draws", type=int, default=None)
     budget.add_argument("--max-parallel-calibrations", type=int, default=None)
     budget.add_argument("--exact-max-events", type=int, default=None)
     budget.add_argument(
@@ -1284,9 +1352,11 @@ def main(argv=None):
         "gibbs_iterations": args.gibbs_iterations,
         "gibbs_thin": args.gibbs_thin,
         "vi_iterations": args.vi_iterations,
+        "vi_tolerance": args.vi_tolerance,
         "evaluation_space_grid": args.evaluation_space_grid,
         "quadrature_space_grid": args.quadrature_space_grid,
-        "posterior_draws": args.posterior_draws,
+        "score_posterior_draws": args.score_posterior_draws,
+        "map_posterior_draws": args.map_posterior_draws,
         "max_parallel_calibrations": args.max_parallel_calibrations,
         "exact_max_events": args.exact_max_events,
         "use_calibration": False if args.no_calibration else None,
@@ -1300,6 +1370,7 @@ def main(argv=None):
         save_figures=not args.no_figures,
         show_figures=args.show_figures,
         campaign_overrides=overrides,
+        output_dir=args.output_dir,
     )
 
 
@@ -1309,3 +1380,5 @@ if __name__ == "__main__":
         run_from_editor()
     else:
         main()
+
+# %%

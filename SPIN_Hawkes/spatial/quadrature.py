@@ -111,9 +111,13 @@ def partition_midpoint_quadrature(partition, x_bounds, y_bounds, nx, ny=None):
         y_bounds,
         nx,
         ny,
-        observation_domain=partition.observation_geometry,
     )
-    points = np.array(rule.points, copy=True)
+    # Start from the full rectangle: even when no midpoint hits the partition,
+    # representative points below must still supply every small domain.
+    inside = contains_xy(
+        partition.observation_geometry, rule.points[:, 0], rule.points[:, 1]
+    )
+    points = np.array(rule.points[inside], copy=True)
     domain_index = partition.locate(points[:, 0], points[:, 1])
     points_per_domain = np.bincount(domain_index, minlength=len(partition))
     missing = np.flatnonzero(points_per_domain == 0)
