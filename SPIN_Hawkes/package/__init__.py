@@ -17,6 +17,12 @@ _EXPORTS = {
     "simulate_spatial_process": ("simulation", "simulate_spatial_process"),
     "DomainPartition": ("spatial", "DomainPartition"),
     "SpatialDomain": ("spatial", "SpatialDomain"),
+    "SpatialQuadrature": ("spatial", "SpatialQuadrature"),
+    "midpoint_quadrature": ("spatial", "midpoint_quadrature"),
+    "partition_midpoint_quadrature": (
+        "spatial",
+        "partition_midpoint_quadrature",
+    ),
     "DEFAULT_FIGURES_DIR": ("visualization", "DEFAULT_FIGURES_DIR"),
     "FIGURE_DPI": ("visualization", "FIGURE_DPI"),
     "RASTER_FIGURE_DPI": ("visualization", "RASTER_FIGURE_DPI"),

@@ -124,7 +124,8 @@ class GibbsConfig:
 
     n_iter: int = 3000
     thin: int = 1
-    mala_step: float = 0.25
+    mala_step: float | None = None
+    mala_curvature_scale: float = 1.8
     learn_nu: bool = False
     use_calibration: bool = True
     verbose: bool = True
@@ -159,13 +160,15 @@ class GibbsConfig:
         for name in ("learn_nu", "use_calibration", "verbose", "compute_emu"):
             _require_boolean(name, getattr(self, name))
         for name in (
-            "mala_step",
+            "mala_curvature_scale",
             "step_nu_init",
             "beta_init",
             "sigma_mh_beta",
             "proposal_jitter",
         ):
             _require_real(name, getattr(self, name), minimum=0.0, strict=True)
+        if self.mala_step is not None:
+            _require_real("mala_step", self.mala_step, minimum=0.0, strict=True)
         if self.fixed_beta is not None:
             _require_real("fixed_beta", self.fixed_beta, minimum=0.0, strict=True)
         if not isinstance(self.beta_prior, dict):
@@ -197,6 +200,7 @@ class SPINHGibbsConfig(GibbsConfig):
     etas_adaptation_decay: float = 0.6
     parent_time_window: float | None = None
     spatial_compensator_grid: int = 40
+    collapse_productivity: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -209,6 +213,7 @@ class SPINHGibbsConfig(GibbsConfig):
         for name, value in self.fixed_etas.items():
             _validate_etas_value(name, value)
         _require_boolean("sample_z", self.sample_z)
+        _require_boolean("collapse_productivity", self.collapse_productivity)
         _require_real(
             "sigma_mh_etas",
             self.sigma_mh_etas,
@@ -397,6 +402,7 @@ class SPINHVIConfig(SSGCVIConfig):
     etas_quadrature_nodes: int | None = None
     spatial_compensator_grid: int = 0
     parent_time_window: float | None = None
+    initial_background_fraction: float = 1.0
 
     def _allowed_initial_gamma_factors(self) -> set[str]:
         return set(VI_GAMMA_FACTOR_NAMES)
@@ -427,6 +433,14 @@ class SPINHVIConfig(SSGCVIConfig):
                 minimum=0.0,
                 strict=True,
             )
+        initial_background_fraction = _require_real(
+            "initial_background_fraction",
+            self.initial_background_fraction,
+            minimum=0.0,
+            strict=True,
+        )
+        if initial_background_fraction > 1.0:
+            raise ValueError("initial_background_fraction must be at most 1.")
 
         unknown = set(self.fixed_etas).difference(ETAS_PARAMETER_NAMES)
         if unknown:

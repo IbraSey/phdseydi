@@ -751,7 +751,12 @@ class GibbsResults(Mapping):
             rates["nu"] = self.raw["acceptance_nu"]
         if self.raw.get("acceptance_beta") is not None:
             rates["beta"] = self.raw["acceptance_beta"]
-        rates.update(self.raw.get("acceptance_etas") or {})
+        etas_rates = dict(self.raw.get("acceptance_etas") or {})
+        if "A_alpha" in etas_rates:
+            alpha_rate = etas_rates.pop("A_alpha")
+            if self.raw.get("use_magnitudes", False):
+                etas_rates["alpha"] = alpha_rate
+        rates.update(etas_rates)
         return rates
 
     def _burn_index(self, n_samples: int, burn_in: float | None = None) -> int:
@@ -1673,6 +1678,9 @@ class GibbsResults(Mapping):
         n_store = len(chains[0][1]) if chains else 0
         burn = int(n_store * burn_in)
         iters = np.arange(n_store) * thin
+        adaptation_end = (self.raw.get("proposal_steps") or {}).get(
+            "adaptation_end"
+        )
         if figsize is None:
             figsize = (10, max(2.0, 1.8 * len(chains)))
         fig, axes = plt.subplots(
@@ -1685,7 +1693,30 @@ class GibbsResults(Mapping):
         for index, (name, values) in enumerate(chains):
             label = tex.get(name, name)
             axes[index, 0].plot(iters, values, lw=0.8, alpha=0.85, color=trace_color)
-            axes[index, 0].axvline(burn * thin, c=burn_in_color, ls="--", alpha=0.45)
+            burn_iteration = burn * thin
+            if adaptation_end is not None and int(adaptation_end) == burn_iteration:
+                axes[index, 0].axvline(
+                    burn_iteration,
+                    color=burn_in_color,
+                    linewidth=1.0,
+                    label="Adaptation and burn-in end",
+                )
+            else:
+                if adaptation_end is not None:
+                    axes[index, 0].axvline(
+                        adaptation_end,
+                        color="#777777",
+                        linestyle=":",
+                        linewidth=1.0,
+                        label="Adaptation end",
+                    )
+                axes[index, 0].axvline(
+                    burn_iteration,
+                    c=burn_in_color,
+                    ls="--",
+                    alpha=0.6,
+                    label="Burn-in end",
+                )
             axes[index, 0].set_title(f"Trace {label}")
             axes[index, 0].set_xlabel(f"Iteration (thin={thin})")
             axes[index, 0].grid(alpha=0.3)
@@ -1694,6 +1725,8 @@ class GibbsResults(Mapping):
             )
             axes[index, 1].set_title(f"Posterior {label}")
             axes[index, 1].grid(alpha=0.3)
+        if chains:
+            axes[0, 0].legend(frameon=False, fontsize=8)
         if savefigure:
             save_figure(fig, title_savefig)
         plt.show()
@@ -1747,7 +1780,7 @@ class GibbsResults(Mapping):
         title_savefig="trace_acf",
         etas_only=False,
     ):
-        """Plot post-burn-in autocorrelations for the stored Gibbs chains."""
+        """Plot post-burn-in autocorrelations from the full scalar traces."""
         burn_in = self.default_burn_in if burn_in is None else burn_in
         if not 0.0 <= burn_in < 1.0:
             raise ValueError("burn_in must be in [0, 1).")
@@ -1798,13 +1831,29 @@ class GibbsResults(Mapping):
             or self.raw.get("eps_trace") is not None
             else self.raw.get("thin", 1)
         )
+        reference_bound = 1.96 / np.sqrt(n_post)
         for ax, (label, chain) in zip(axes[:, 0], plots):
             values = self._acf(chain, max_lag)
             ax.plot(lags[:len(values)], values)
             ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.axhline(
+                reference_bound,
+                color="#777777",
+                linestyle=":",
+                linewidth=0.8,
+                label="White-noise reference",
+            )
+            ax.axhline(
+                -reference_bound,
+                color="#777777",
+                linestyle=":",
+                linewidth=0.8,
+            )
             ax.set(xlim=(0, max_lag), ylim=(-1.0, 1.0), xlabel="Lag")
             ax.set_title(f"ACF - {label} (thin={thin})")
             ax.grid(alpha=0.3)
+        if plots:
+            axes[0, 0].legend(frameon=False, fontsize=8)
         if savefigure:
             save_figure(fig, title_savefig)
         plt.show()

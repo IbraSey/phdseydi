@@ -4,10 +4,8 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
-from shapely import contains_xy
-from shapely.geometry import box
-
 from package.config import ETASParameters
+from spatial import SpatialQuadrature, midpoint_quadrature
 
 
 @dataclass(frozen=True)
@@ -49,10 +47,18 @@ class OmoriKernel:
         parent_times,
         end_time: float,
         parameters: ETASParameters,
+        max_lag: float | None = None,
     ) -> np.ndarray:
         remaining = np.maximum(
             float(end_time) - np.asarray(parent_times, dtype=float), 0.0
         )
+        if max_lag is not None:
+            if isinstance(max_lag, bool):
+                raise ValueError("max_lag must be a finite positive number.")
+            max_lag = float(max_lag)
+            if not np.isfinite(max_lag) or max_lag <= 0.0:
+                raise ValueError("max_lag must be a finite positive number.")
+            remaining = np.minimum(remaining, max_lag)
         return 1.0 - (
             parameters.c / (remaining + parameters.c)
         ) ** (parameters.p - 1.0)
@@ -138,40 +144,33 @@ class SpatialPowerLawKernel:
         y_bounds: tuple[float, float],
         n_grid: int = 40,
         observation_domain=None,
+        quadrature: SpatialQuadrature | None = None,
     ) -> np.ndarray:
         """Approximate ETAS mass retained by a Shapely observation domain.
 
-        Midpoint Riemann quadrature is evaluated on the rectangular bounding
-        window.  ``observation_domain`` may be any Shapely polygonal geometry:
+        By default, midpoint quadrature is evaluated on the rectangular
+        bounding window. ``quadrature`` can supply alternative nodes and
+        weights. ``observation_domain`` may be any Shapely polygonal geometry:
         Polygon, non-convex Polygon, Polygon with holes, or MultiPolygon.  The
         rectangular window is used only when no geometry is supplied.
         """
-        if isinstance(n_grid, bool) or not isinstance(n_grid, Integral):
-            raise ValueError("n_grid must be an integer.")
-        n_grid = int(n_grid)
-        if n_grid < 1:
-            raise ValueError("n_grid must be positive.")
         xmin, xmax = map(float, x_bounds)
         ymin, ymax = map(float, y_bounds)
         if not xmin < xmax or not ymin < ymax:
             raise ValueError("Spatial bounds must be strictly increasing.")
-
-        dx = (xmax - xmin) / n_grid
-        dy = (ymax - ymin) / n_grid
-        grid_x, grid_y = np.meshgrid(
-            xmin + (np.arange(n_grid) + 0.5) * dx,
-            ymin + (np.arange(n_grid) + 0.5) * dy,
-        )
-        grid_points = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-        geometry = box(xmin, ymin, xmax, ymax) if observation_domain is None else observation_domain
-        if geometry.is_empty or not geometry.is_valid:
-            raise ValueError("observation_domain must be a non-empty valid Shapely geometry.")
-        mask = contains_xy(geometry, grid_points[:, 0], grid_points[:, 1])
-        if not mask.any():
-            raise ValueError("The observation domain contains no quadrature cell centres; increase n_grid.")
-
-        points_x = grid_points[mask, 0][None, :]
-        points_y = grid_points[mask, 1][None, :]
+        if quadrature is None:
+            if isinstance(n_grid, bool) or not isinstance(n_grid, Integral):
+                raise ValueError("n_grid must be an integer.")
+            quadrature = midpoint_quadrature(
+                x_bounds,
+                y_bounds,
+                int(n_grid),
+                observation_domain=observation_domain,
+            )
+        elif not isinstance(quadrature, SpatialQuadrature):
+            raise TypeError("quadrature must be a SpatialQuadrature instance.")
+        points_x = quadrature.points[:, 0][None, :]
+        points_y = quadrature.points[:, 1][None, :]
         parent_x = np.asarray(parent_x, dtype=float).reshape(-1, 1)
         parent_y = np.asarray(parent_y, dtype=float).reshape(-1, 1)
         magnitudes = np.asarray(parent_magnitudes, dtype=float).reshape(-1)
@@ -185,7 +184,7 @@ class SpatialPowerLawKernel:
             parameters,
             magnitude_min,
         )
-        return np.clip(dx * dy * density.sum(axis=1), 1e-8, 1.0)
+        return np.clip(density @ quadrature.weights, 1e-8, 1.0)
 
 
 @dataclass(frozen=True)

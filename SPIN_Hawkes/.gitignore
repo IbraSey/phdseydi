@@ -1,0 +1,33 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# Editors and operating-system metadata
+.DS_Store
+**/.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.vscode/
+.idea/
+*.swp
+
+# Restartable experiment checkpoints
+.checkpoints/
+
+# Local environments, build products and newly generated results
+.venv/
+build/
+dist/
+*.egg-info/
+/results/

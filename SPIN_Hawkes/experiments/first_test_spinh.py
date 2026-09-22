@@ -4,6 +4,7 @@ import sys
 import warnings
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import openturns as ot
 
@@ -32,6 +33,9 @@ BURN_IN = 0.5
 MALA_STEP = 0.12
 SIGMA_MH_ETAS = 0.05
 SIGMA_MH_BETA = 0.1
+ADAPTATION_START = 200
+ADAPTATION_END = int(BURN_IN * N_ITER)
+ETAS_TARGET_ACCEPTANCE = 0.234
 USE_SPARSE_GP = True
 MAKE_PLOTS = True
 LAMBDA_GRID_SIZE = 30
@@ -176,10 +180,11 @@ def main():
             use_calibration=True,
             beta_init=2.3,
             theta_priors=THETA_PRIORS,
-            fixed_etas={"alpha": TRUE_ETAS.alpha},
             sigma_mh_etas=SIGMA_MH_ETAS,
             sigma_mh_beta=SIGMA_MH_BETA,
-            adaptation_start=200,
+            adaptation_start=ADAPTATION_START,
+            etas_adaptation_end=ADAPTATION_END,
+            etas_target_acceptance=ETAS_TARGET_ACCEPTANCE,
             proposal_jitter=1e-6,
         ),
         gp_backend="sparse" if USE_SPARSE_GP else "exact",
@@ -195,74 +200,57 @@ def main():
     )
 
     lambda_xy = build_lambda_grid()
-    t_eval = np.full(lambda_xy.shape[0], DURATION)
-    mu_eval, trigger_eval, lambda_eval = fit.conditional_intensity(
-        t=t_eval,
-        x=lambda_xy[:, 0],
-        y=lambda_xy[:, 1],
-        burn_in=BURN_IN,
+    mu_eval = fit.background_intensity(
+        lambda_xy[:, 0], lambda_xy[:, 1], burn_in=BURN_IN
     )
 
     eps_true, f_true = true_latent_state(lambda_xy)
-    mu_true, trigger_true, lambda_true = model.conditional_intensity(
-        t_eval=t_eval,
-        x_eval=lambda_xy[:, 0],
-        y_eval=lambda_xy[:, 1],
-        history=catalog,
-        eps=eps_true,
-        latent_gp=f_true,
-        parameters=TRUE_ETAS,
+    mu_true = model.background_intensity(
+        lambda_xy[:, 0], lambda_xy[:, 1], eps_true, f_true
     )
 
     print_intensity_metrics("Background intensity", mu_eval, mu_true)
-    print_intensity_metrics("Triggering intensity", trigger_eval, trigger_true)
-    print_intensity_metrics("Total conditional intensity", lambda_eval, lambda_true)
 
     if MAKE_PLOTS:
         fit.plot_traces(burn_in=BURN_IN)
+        fit.plot_acf(burn_in=BURN_IN, max_lag=200, etas_only=True)
         fit.plot_declustering(
             burn_in=BURN_IN,
             true_parent=simulation.branching_labels,
         )
-        snapshot_times = np.linspace(0.2 * DURATION, DURATION, 4)
-        snapshot_x = np.linspace(X_BOUNDS[0], X_BOUNDS[1], LAMBDA_GRID_SIZE)
-        snapshot_y = np.linspace(Y_BOUNDS[0], Y_BOUNDS[1], LAMBDA_GRID_SIZE)
-        X_snapshot, Y_snapshot = np.meshgrid(snapshot_x, snapshot_y)
-        snapshot_xy = np.column_stack((X_snapshot.ravel(), Y_snapshot.ravel()))
-        eps_snapshot, f_snapshot = true_latent_state(snapshot_xy)
-        true_background = model.background_intensity(
-            snapshot_xy[:, 0], snapshot_xy[:, 1], eps_snapshot, f_snapshot
-        ).reshape(Y_snapshot.shape)
-        true_triggering = []
-        true_total = []
-        for time in snapshot_times:
-            _, trigger_frame, total_frame = model.conditional_intensity(
-                t_eval=np.full(snapshot_xy.shape[0], time),
-                x_eval=snapshot_xy[:, 0],
-                y_eval=snapshot_xy[:, 1],
-                history=catalog,
-                eps=eps_snapshot,
-                latent_gp=f_snapshot,
-                parameters=TRUE_ETAS,
+        x_grid = lambda_xy[:, 0].reshape(LAMBDA_GRID_SIZE, LAMBDA_GRID_SIZE)
+        y_grid = lambda_xy[:, 1].reshape(LAMBDA_GRID_SIZE, LAMBDA_GRID_SIZE)
+        panels = (
+            ("True background intensity", mu_true),
+            ("Posterior mean background intensity", mu_eval),
+        )
+        vmin = float(min(np.min(mu_true), np.min(mu_eval)))
+        vmax = float(max(np.max(mu_true), np.max(mu_eval)))
+        figure, axes = plt.subplots(
+            1, 2, figsize=(10.5, 4.5), layout="constrained", sharex=True, sharey=True
+        )
+        for axis, (title, values) in zip(axes, panels):
+            image = axis.pcolormesh(
+                x_grid,
+                y_grid,
+                values.reshape(x_grid.shape),
+                shading="auto",
+                cmap="viridis",
+                vmin=vmin,
+                vmax=vmax,
+                rasterized=True,
             )
-            true_triggering.append(trigger_frame.reshape(Y_snapshot.shape))
-            true_total.append(total_frame.reshape(Y_snapshot.shape))
-
-        intensity_snapshots = fit.plot_conditional_intensity_snapshots(
-            times=snapshot_times,
-            burn_in=BURN_IN,
-            nx=LAMBDA_GRID_SIZE,
-            ny=LAMBDA_GRID_SIZE,
-            true_background=true_background,
-            true_triggering=np.asarray(true_triggering),
-            true_total=np.asarray(true_total),
-        )
-        print(
-            "\nConditional intensity snapshots ready: "
-            f"background={intensity_snapshots['background'].shape}, "
-            f"triggering={intensity_snapshots['triggering'].shape}, "
-            f"total={intensity_snapshots['total'].shape}"
-        )
+            axis.scatter(
+                catalog.x,
+                catalog.y,
+                s=8,
+                c="white",
+                edgecolors="black",
+                linewidths=0.2,
+            )
+            axis.set(title=title, xlabel="x", ylabel="y", aspect="equal")
+        figure.colorbar(image, ax=axes.tolist(), label=r"$\mu(x,y)$")
+        plt.show()
 
 if __name__ == "__main__":
     main()

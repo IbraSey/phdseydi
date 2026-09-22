@@ -8,10 +8,10 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from simulation import SpatialProcessSimulation
 
-DEFAULT_FIGURES_DIR = Path(__file__).resolve().parents[1] / "figures"
+DEFAULT_FIGURES_DIR = Path.cwd() / "results" / "figures"
 VECTOR_FIGURE_FORMAT = "pdf"
-RASTER_FIGURE_FORMAT = "png"
-RASTER_FIGURE_DPI = 600
+RASTER_FIGURE_FORMAT = "pdf"
+RASTER_FIGURE_DPI = 300
 FIGURE_DPI = RASTER_FIGURE_DPI
 
 
@@ -22,19 +22,19 @@ def save_figure(
     figure_type: str = "vector",
     dpi: int | None = None,
 ) -> Path:
-    """Save a figure below the package ``figures`` directory.
+    """Save a PDF below ``results/figures`` in the working directory.
 
     ``figure_type='vector'`` is for curves, graphs, diagrams and histograms:
     figures are saved as PDF and no explicit DPI is passed. ``figure_type='raster'``
-    is for heatmaps, intensity maps, simulation images and other matrix-like
-    displays: figures are saved as PNG at 600 dpi by default.
+    is for figures containing rasterized artists, rendered at 300 dpi.
+    Text and other vector artists remain vector in both cases.
     """
     figure_type = str(figure_type).lower()
     if figure_type not in {"vector", "raster"}:
         raise ValueError("figure_type must be 'vector' or 'raster'.")
 
     path = Path(filename)
-    suffix = ".png" if figure_type == "raster" else ".pdf"
+    suffix = ".pdf"
     if path.suffix.lower() != suffix:
         path = path.with_suffix(suffix)
 

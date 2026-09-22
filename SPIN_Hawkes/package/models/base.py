@@ -44,11 +44,17 @@ class PointProcessModel(ABC):
         """Run a configured sampler and return its user-facing result."""
         from ..inference.results import GibbsResults
 
+        mala_step = config.mala_step
+        if mala_step is None:
+            mala_step = self.recommended_mala_step(
+                catalog,
+                curvature_scale=config.mala_curvature_scale,
+            )
         run_options = {
             "t": ot.Point(catalog.t.tolist()),
             "x": ot.Point(catalog.x.tolist()),
             "y": ot.Point(catalog.y.tolist()),
-            "mala_step": config.mala_step,
+            "mala_step": mala_step,
             "n_iter": config.n_iter,
             "learn_nu": config.learn_nu,
             "t0_nu": config.t0_nu,
