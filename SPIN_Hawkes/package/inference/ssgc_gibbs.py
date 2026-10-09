@@ -145,13 +145,19 @@ class SSGC_GibbsSampler:
     def update_beta(self, history, iteration):
         """Update the Gutenberg--Richter rate by adaptive MH on log(beta)."""
         log_current = np.log(self.beta)
-        history.append(log_current)
-        if iteration > self.t0_beta and len(history) > self.t0_beta:
+        adaptation_end = getattr(self, "adaptation_end", None)
+        adapting = adaptation_end is None or iteration < adaptation_end
+        if adapting:
+            history.append(log_current)
+        if not adapting:
+            proposal_sd = getattr(self, "_beta_proposal_sd", self.sigma_MH_beta)
+        elif iteration > self.t0_beta and len(history) > self.t0_beta:
             proposal_sd = np.sqrt(
                 2.38**2 * np.var(history, ddof=1) + self.eps_mh_beta
             )
         else:
             proposal_sd = self.sigma_MH_beta
+        self._beta_proposal_sd = proposal_sd
 
         log_proposed = (
             log_current
@@ -620,9 +626,10 @@ class SSGC_GibbsSampler:
                     [ot.Uniform(xmin, xmax), ot.Uniform(ymin, ymax)]
                 ).getSample(batch_size)
                 for k in range(points.getSize()):
-                    point = ShapelyPoint(float(points[k, 0]), float(points[k, 1]))
+                    row = points[int(k)]
+                    point = ShapelyPoint(float(row[0]), float(row[1]))
                     if prepared_polygon.covers(point):
-                        accepted.append([float(points[k, 0]), float(points[k, 1])])
+                        accepted.append([float(row[0]), float(row[1])])
                         if len(accepted) == n_candidates:
                             break
             candidates.extend(accepted)
@@ -875,6 +882,23 @@ class SSGC_GibbsSampler:
         else:
             return eps_arr, False
 
+    def _mala_relative_steps(self, eps_initial):
+        """Scale MALA coordinates by the initial conditional curvature."""
+        eps_initial = np.asarray(eps_initial, dtype=float).reshape(-1)
+        if eps_initial.size != self.J:
+            raise ValueError("eps_initial must contain one value per domain.")
+        prior_covariance = self.Sigma_eps + self.jitter * np.eye(self.J)
+        prior_precision = np.linalg.inv(prior_covariance)
+        likelihood_curvature = (
+            self.T * self.domain_areas * np.exp(eps_initial)
+        )
+        curvature = likelihood_curvature + np.diag(prior_precision)
+        if not np.all(np.isfinite(curvature)) or np.any(curvature <= 0.0):
+            raise FloatingPointError("Invalid initial curvature for MALA scaling.")
+        inverse_sqrt = curvature ** -0.5
+        relative = inverse_sqrt / np.exp(np.mean(np.log(inverse_sqrt)))
+        return np.clip(relative, 0.2, 5.0)
+
     def update_nu(self, f_Df, D_f_sample, history_log_nu, it, step_nu_init=0.1, t0=50, sd=2.38**2/2, eps_mh=1e-6):
         """Update GP kernel hyperparameters ν = (v², ℓ) via Adaptive Metropolis.
  
@@ -1116,13 +1140,16 @@ class SSGC_GibbsSampler:
     # ----------------------------------------- Run du Gibbs ------------------------------------------
     # =================================================================================================
 
-    def run(self, t, x, y, mala_step=0.05, n_iter=1000, learn_nu=False,
+    def run(self, t, x, y, mala_step, n_iter=1000, learn_nu=False,
+            mala_precondition=False,
         fixed_beta=None, t0_nu=50,
         step_nu_init=0.1, verbose=True, verbose_every=100, use_calibration=True,
         mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
         compute_emu=True, emu_every=10,
         plot_calibration_kde=False, calibration_kde_cmap="viridis",
-        gp_backend="exact", sparse_gp=None): 
+        gp_backend="exact", sparse_gp=None,
+        mala_adaptation_start=50, mala_adaptation_end=None,
+        mala_target_acceptance=0.574, mala_adaptation_decay=0.6):
         """Run the augmented SSGC Gibbs sampler.
         
         Parameters
@@ -1132,8 +1159,17 @@ class SSGC_GibbsSampler:
             used by the spatial SSGC updates.
         x, y : array_like, shape (N,)
             Event coordinates.
-        mala_step : float, optional
-            MALA step size for the zonal log-intensities.
+        mala_step : float
+            Initial MALA step size for the zonal log-intensities.
+        mala_precondition : bool, optional
+            Use fixed diagonal curvature scaling across zonal coordinates.
+        mala_adaptation_start, mala_adaptation_end : int or None, optional
+            Robbins--Monro adaptation interval. A ``None`` end keeps the MALA
+            step fixed. Adaptation must finish before retained sampling.
+        mala_target_acceptance : float, optional
+            Acceptance probability targeted during MALA adaptation.
+        mala_adaptation_decay : float, optional
+            Exponent of the diminishing Robbins--Monro gain, in ``(0.5, 1]``.
         n_iter : int, optional
             Number of Gibbs iterations.
         learn_nu : bool, optional
@@ -1182,6 +1218,36 @@ class SSGC_GibbsSampler:
             state; covariance metadata; and storage settings."""
 
         N = len(t)
+        mala_step = float(mala_step)
+        if not np.isfinite(mala_step) or mala_step <= 0.0:
+            raise ValueError("mala_step must be finite and positive.")
+        if not isinstance(mala_precondition, (bool, np.bool_)):
+            raise TypeError("mala_precondition must be boolean.")
+        if (
+            isinstance(mala_adaptation_start, bool)
+            or not isinstance(mala_adaptation_start, (int, np.integer))
+            or mala_adaptation_start < 0
+        ):
+            raise ValueError("mala_adaptation_start must be a non-negative integer.")
+        if mala_adaptation_end is not None:
+            if (
+                isinstance(mala_adaptation_end, bool)
+                or not isinstance(mala_adaptation_end, (int, np.integer))
+                or not mala_adaptation_start < mala_adaptation_end <= n_iter
+            ):
+                raise ValueError(
+                    "mala_adaptation_end must be an integer in "
+                    "(mala_adaptation_start, n_iter]."
+                )
+            mala_adaptation_end = int(mala_adaptation_end)
+        mala_adaptation_start = int(mala_adaptation_start)
+        mala_target_acceptance = float(mala_target_acceptance)
+        if not 0.0 < mala_target_acceptance < 1.0:
+            raise ValueError("mala_target_acceptance must be in (0, 1).")
+        mala_adaptation_decay = float(mala_adaptation_decay)
+        if not 0.5 < mala_adaptation_decay <= 1.0:
+            raise ValueError("mala_adaptation_decay must be in (0.5, 1].")
+        initial_mala_step = mala_step
         if self.use_magnitudes and self.m.size != N:
             raise ValueError("One magnitude is required per observed event.")
         if fixed_beta is not None:
@@ -1232,13 +1298,18 @@ class SSGC_GibbsSampler:
            print(f"[Pre-run] nu fixed at : {np.round(np.array(self.nu), 4)} [v^2, l]")
 
         eps = ot.Point(eps_mle.tolist())
+        mala_relative_steps = (
+            self._mala_relative_steps(eps_mle)
+            if mala_precondition
+            else np.ones(self.J, dtype=float)
+        )
         f_data = ot.Point([0.0] * N)
 
         if verbose:
             if gp_backend == "sparse":
                 print(f"[Initialisation] Sparse GP with {int(sparse_gp.m)} basis functions")
             print(f"[Initialisation] Using eps_mle as eps_init : {np.round(eps_mle, 4)}")
-            print(f"[Initialisation] Initialise f to zero (zero-mean prior)")
+            print("[Initialisation] Initialise f to zero (zero-mean prior)")
 
         # ---------- Grille fixe pour le calcul optionnel de Eps_mu ----------
         compute_emu = bool(compute_emu and mu_star_func is not None)
@@ -1276,6 +1347,8 @@ class SSGC_GibbsSampler:
         acc_beta = 0
         history_log_nu = []         # used only when learn_nu=True
         history_log_beta = []
+        acceptance_eps_history = np.zeros(n_iter, dtype=bool)
+        mala_step_history = np.empty(n_iter, dtype=float)
 
         if verbose:
             print("\n" + "=" * 100)
@@ -1331,9 +1404,37 @@ class SSGC_GibbsSampler:
                 # Step 4 : eps | f, pi_S (MALA) 
                 # M_j changes at each iteration as pi_S is resampled
                 _, M_j = self._count_events_per_zone(x, y, Z, Pi_S)
-                eps_arr, accepted_eps = self.update_eps(eps, N_j, M_j, step=mala_step)
+                mala_step_history[it] = mala_step
+                eps_arr, accepted_eps = self.update_eps(
+                    eps,
+                    N_j,
+                    M_j,
+                    step=mala_step * mala_relative_steps,
+                )
                 eps = ot.Point(eps_arr.tolist())
+                acceptance_eps_history[it] = accepted_eps
                 acc_eps += int(accepted_eps)
+                if (
+                    mala_adaptation_end is not None
+                    and mala_adaptation_start <= it < mala_adaptation_end
+                ):
+                    gain = (
+                        it - mala_adaptation_start + 10.0
+                    ) ** (-mala_adaptation_decay)
+                    mala_step = float(
+                        np.clip(
+                            mala_step
+                            * np.exp(
+                                gain
+                                * (
+                                    float(accepted_eps)
+                                    - mala_target_acceptance
+                                )
+                            ),
+                            1e-6,
+                            10.0,
+                        )
+                    )
 
                 # Step 5 (optional) : nu | f  (Adaptive MH)
                 if learn_nu:
@@ -1420,8 +1521,10 @@ class SSGC_GibbsSampler:
             print("=" * 100)
             print("-" * 41 + " Gibbs terminé !! " + "-" * 41)
             print("=" * 100 + "\n")
-            print(f"eps acceptance rate : {np.round(acc_eps / n_iter * 100, 1)}%"
-                  f" (target ~57% -> {'increase' if acc_eps/n_iter > 0.57 else 'decrease'} mala_step)")
+            print(
+                f"eps acceptance rate : {np.round(acc_eps / n_iter * 100, 1)}%"
+                " (asymptotic MALA reference ~57%; assess mixing as well)"
+            )
             if learn_nu:
                 print(f"nu acceptance rate : {np.round(acc_nu  / n_iter * 100, 1)}%"
                       f" (target ~23% -> {'increase' if acc_nu/n_iter > 0.23 else 'decrease'} step_nu_init)")
@@ -1438,6 +1541,18 @@ class SSGC_GibbsSampler:
             "nu"             : nu_chain[:store_idx],
             "E_mu"           : E_mu_chain,
             "acceptance_eps" : acc_eps / n_iter,
+            "acceptance_history": {"eps": acceptance_eps_history},
+            "mala_step_history": mala_step_history,
+            "proposal_steps": {
+                "mala_step": float(mala_step),
+                "initial_mala_step": float(initial_mala_step),
+                "mala_precondition": bool(mala_precondition),
+                "mala_relative_steps": mala_relative_steps.copy(),
+                "adaptation_start": int(mala_adaptation_start),
+                "adaptation_end": mala_adaptation_end,
+                "target_acceptance": float(mala_target_acceptance),
+                "adaptation_decay": float(mala_adaptation_decay),
+            },
             "acceptance_nu"  : acc_nu / n_iter if learn_nu else None,
             "beta"           : beta_chain[:store_idx] if beta_chain is not None else None,
             "acceptance_beta": acc_beta / n_iter if sample_beta else None,

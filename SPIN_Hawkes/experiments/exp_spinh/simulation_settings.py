@@ -20,6 +20,7 @@ Y_BOUNDS = (0.0, 2.0)
 MAGNITUDE_MIN = 2.0
 MAGNITUDE_MAX = 6.0
 TRUNCATION_RELATIVE_DENSITY = 1e-3
+TRUNCATION_MAX_TAIL_MASS = 0.02
 N_REGIONS = 6
 PARTITION_SEED = 15
 MISSPECIFIED_PARTITION_REGIONS = 5
@@ -27,12 +28,14 @@ MISSPECIFIED_PARTITION_SEED = 47
 PARAMETER_NAMES = ("A", "alpha", "c", "p", "d", "q", "gamma", "beta")
 ETAS_PARAMETER_NAMES = PARAMETER_NAMES[:-1]
 
-# Accuracy durations were selected from 50 generation-only pilot catalogues per
-# scenario, using seeds starting at 120_000 (easy) and 130_000 (difficult).
-# The selected horizons generated 399.0 and 398.1 events on average.
+# Durations are calibrated with generation-only seeds, independent of fitted
+# catalogues. See calibrate_simulation_durations.py and its validation report.
 ACCURACY_TARGET_EVENTS = 400
 ACCURACY_DURATION_CALIBRATION_REPLICATES = 50
 ACCURACY_DURATION_CALIBRATION_SEED = 120_000
+RECOVERY_TARGET_EVENTS = 800
+RECOVERY_METHODS = ("m2", "m3", "m4", "m5")
+ACCURACY_PANELS = ("benchmark", "recovery")
 
 # Common initialization and priors used by every compared inference method.
 INITIAL_ETAS = ETASParameters(
@@ -45,9 +48,7 @@ INITIAL_ETAS = ETASParameters(
     gamma=0.3,
 )
 INITIAL_BETA = 2.3
-# Proposal pilots live in test_proposal_steps.py. MALA uses initial conditional
-# curvature; MH standard deviations are on log parameters (log(p-1), log(q-1)).
-MALA_CURVATURE_SCALE = 1.8
+# MH standard deviations are on log parameters (log(p-1), log(q-1)).
 MH_ETAS_REFERENCE_STEP = 0.35
 MH_ETAS_REFERENCE_EVENTS = 50
 MH_BETA_SCALE = 2.4
@@ -131,32 +132,36 @@ ACCURACY_BACKGROUND_MUS = (8.0, 1.0, 2.0, 8.0, 7.0, 2.0)
 
 # Experiment 1 generating configurations.
 SCENARIOS = {
-    "easy": {
-        "duration": 51.0,
+    "concentrated": {
+        "label": "Concentrated triggering",
+        "duration": 46.03,
+        "recovery_duration": 92.38,
         "field_scale": 1.0,
         "mus": ACCURACY_BACKGROUND_MUS,
         "etas": ETASParameters(
             A=0.40,
             alpha=0.60,
-            c=0.03,
-            p=1.35,
-            d=0.06,
-            q=1.70,
+            c=0.02,
+            p=1.50,
+            d=0.03,
+            q=1.80,
             gamma=0.30,
         ),
         "beta": 2.30,
     },
-    "difficult": {
-        "duration": 52.0,
+    "diffuse": {
+        "label": "Diffuse triggering",
+        "duration": 46.23,
+        "recovery_duration": 90.38,
         "field_scale": 1.0,
         "mus": ACCURACY_BACKGROUND_MUS,
         "etas": ETASParameters(
-            A=0.50,
+            A=0.65,
             alpha=0.60,
-            c=0.08,
-            p=1.30,
-            d=0.10,
-            q=1.55,
+            c=0.10,
+            p=1.25,
+            d=0.07,
+            q=1.60,
             gamma=0.30,
         ),
         "beta": 2.30,
@@ -176,6 +181,9 @@ EXPERIMENT_2_ETAS = ETASParameters(
 EXPERIMENT_2_BETA = 2.30
 EXPERIMENT_2_METHOD = "m3"
 EXPERIMENT_2_TARGET_EVENTS = 1_000
+PARTITION_MH_BLOCK_STEPS = {"A_alpha": 0.20, "c_p": 0.15, "d_q_gamma": 0.12}
+PARTITION_MH_BLOCK_TARGETS = {"A_alpha": 0.44, "c_p": 0.35, "d_q_gamma": 0.30}
+PARTITION_MH_ADAPTATION_WINDOW = 1000
 # Validated on 20 independent generation-only catalogues per scenario, using
 # seeds starting at 210_000 and an offset of 1_000 between scenarios. Mean
 # catalogue sizes ranged from 977 to 1,023 events (1,002 overall).
@@ -193,6 +201,12 @@ HIGH_CONTRAST_MUS = (20.0, 1.0, 1.0, 1.0, 1.0, 20.0)
 # =============================================================================
 # COMPUTATIONAL PROFILES
 # =============================================================================
+
+# MALA tuning is an empirical, per-fit pilot, not a curvature-based step rule.
+# The acceptance band and pilot length are part of the experiment protocol.
+MALA_PILOT_ITERATIONS = 200
+MALA_ACCEPTANCE_BOUNDS = (0.45, 0.69)
+MALA_MAX_PILOT_TRIALS = 12
 
 
 @dataclass(frozen=True)
@@ -220,11 +234,19 @@ class CampaignConfig:
     exact_max_events: int
     dense_max_events: int
     use_calibration: bool
+    mala_step: float | None = None
+    n_recovery_replicates: int = 5
+    partition_gibbs_iterations: int = 6_000
+    partition_gibbs_thin: int = 3
+    partition_adaptation_fraction: float = 0.5
 
     def __post_init__(self):
         integer_fields = {
             "n_replicates": 1,
             "n_partition_replicates": 1,
+            "n_recovery_replicates": 1,
+            "partition_gibbs_iterations": 1,
+            "partition_gibbs_thin": 1,
             "n_chains": 1,
             "n_partition_chains": 1,
             "vi_starts": 1,
@@ -250,6 +272,7 @@ class CampaignConfig:
             "gibbs_burn_in",
             "partition_gibbs_burn_in",
             "gibbs_adaptation_fraction",
+            "partition_adaptation_fraction",
         ):
             value = getattr(self, name)
             if (
@@ -267,15 +290,21 @@ class CampaignConfig:
             raise ValueError(
                 "gibbs_adaptation_fraction must be in (0, gibbs_burn_in]."
             )
-        if self.gibbs_adaptation_fraction > self.partition_gibbs_burn_in:
-            raise ValueError(
-                "gibbs_adaptation_fraction must not exceed "
-                "partition_gibbs_burn_in."
-            )
         if not isinstance(self.use_calibration, bool):
             raise ValueError("use_calibration must be boolean.")
+        if self.mala_step is not None and (
+            isinstance(self.mala_step, bool)
+            or not isinstance(self.mala_step, Real)
+            or not np.isfinite(self.mala_step)
+            or self.mala_step <= 0.0
+        ):
+            raise ValueError("mala_step must be finite and positive when provided.")
         if int(self.gibbs_iterations * self.gibbs_adaptation_fraction) < 1:
             raise ValueError("The adaptation period must contain at least one iteration.")
+        if int(self.partition_gibbs_iterations * self.partition_adaptation_fraction) < 1:
+            raise ValueError("The partition adaptation period must contain at least one iteration.")
+        if not 0 < self.partition_adaptation_fraction <= self.partition_gibbs_burn_in:
+            raise ValueError("Partition adaptation must finish by the end of burn-in.")
 
 
 CAMPAIGNS = {
@@ -283,6 +312,8 @@ CAMPAIGNS = {
         name="smoke",
         n_replicates=1,
         n_partition_replicates=1,
+        n_recovery_replicates=1,
+        partition_gibbs_iterations=50,
         n_chains=1,
         n_partition_chains=1,
         vi_starts=1,
@@ -305,19 +336,21 @@ CAMPAIGNS = {
     "full": CampaignConfig(
         name="full",
         n_replicates=5,
-        n_partition_replicates=3,
+        n_partition_replicates=5,
         n_chains=3,
-        n_partition_chains=1,
+        n_partition_chains=3,
         vi_starts=3,
         gibbs_iterations=8000,
         gibbs_thin=5,
         gibbs_burn_in=0.25,
         partition_gibbs_burn_in=0.5,
+        partition_gibbs_iterations=6_000,
+        partition_gibbs_thin=3,
         gibbs_adaptation_fraction=0.25,
         vi_iterations=500,
         evaluation_space_grid=25,
         quadrature_space_grid=12,
-        posterior_draws=100,
+        posterior_draws=500,
         parameter_draws=1000,
         max_parallel_calibrations=1,
         duration_scale=1.0,
@@ -345,7 +378,6 @@ def validate_scientific_settings():
         if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}.")
     for name, value in (
-        ("MALA_CURVATURE_SCALE", MALA_CURVATURE_SCALE),
         ("MH_ETAS_REFERENCE_STEP", MH_ETAS_REFERENCE_STEP),
         ("MH_ETAS_REFERENCE_EVENTS", MH_ETAS_REFERENCE_EVENTS),
         ("MH_BETA_SCALE", MH_BETA_SCALE),
@@ -362,6 +394,8 @@ def validate_scientific_settings():
         raise ValueError("MAGNITUDE_MIN must be smaller than MAGNITUDE_MAX.")
     if not 0.0 < TRUNCATION_RELATIVE_DENSITY < 1.0:
         raise ValueError("TRUNCATION_RELATIVE_DENSITY must lie in (0, 1).")
+    if not 0 < TRUNCATION_MAX_TAIL_MASS < 1:
+        raise ValueError("TRUNCATION_MAX_TAIL_MASS must lie in (0, 1).")
     if not VI_START_PROFILES:
         raise ValueError("VI_START_PROFILES must contain at least one profile.")
     profile_names = set()
@@ -395,7 +429,7 @@ def validate_scientific_settings():
     ):
         raise ValueError("MISSPECIFIED_PARTITION_SEED must be an integer.")
 
-    required = {"duration", "field_scale", "mus", "etas", "beta"}
+    required = {"label", "duration", "recovery_duration", "field_scale", "mus", "etas", "beta"}
     if not SCENARIOS:
         raise ValueError("SCENARIOS must contain at least one configuration.")
     for scenario_name, scenario in SCENARIOS.items():
@@ -410,6 +444,7 @@ def validate_scientific_settings():
             )
         positive_values = {
             "duration": scenario["duration"],
+            "recovery_duration": scenario["recovery_duration"],
             "beta": scenario["beta"],
         }
         for setting_name, value in positive_values.items():
@@ -487,6 +522,10 @@ def simulation_protocol():
         "fit_scope": "complete_catalogue",
         "predictive_score": False,
         "accuracy_target_events": ACCURACY_TARGET_EVENTS,
+        "accuracy_panels": {
+            "benchmark": {"target_events": ACCURACY_TARGET_EVENTS, "methods": tuple(METHODS)},
+            "recovery": {"target_events": RECOVERY_TARGET_EVENTS, "methods": RECOVERY_METHODS},
+        },
         "accuracy_duration_calibration": {
             "replicates_per_scenario": ACCURACY_DURATION_CALIBRATION_REPLICATES,
             "base_seed": ACCURACY_DURATION_CALIBRATION_SEED,
@@ -507,12 +546,25 @@ def simulation_protocol():
         "vi_max_optimizer_iter": VI_MAX_OPTIMIZER_ITER,
         "vi_gamma_quadrature_nodes": VI_GAMMA_QUADRATURE_NODES,
         "gibbs_productivity_update": "partially_collapsed",
+        "mala_calibration": {
+            "pilot_iterations": MALA_PILOT_ITERATIONS,
+            "acceptance_bounds": MALA_ACCEPTANCE_BOUNDS,
+            "target_acceptance": sum(MALA_ACCEPTANCE_BOUNDS) / 2.0,
+            "stopping_tolerance": "one nominal binomial Monte Carlo standard error",
+            "partition_stopping_rule": "first pilot inside the acceptance band; warm-up refines the step",
+            "max_pilot_trials": MALA_MAX_PILOT_TRIALS,
+            "search": "doubling/halving then geometric bisection",
+        },
         "x_bounds": X_BOUNDS,
         "y_bounds": Y_BOUNDS,
         "magnitude_bounds": (MAGNITUDE_MIN, MAGNITUDE_MAX),
         "partition_seed": PARTITION_SEED,
         "n_regions": N_REGIONS,
         "truncation_relative_density": TRUNCATION_RELATIVE_DENSITY,
+        "truncation_max_tail_mass": TRUNCATION_MAX_TAIL_MASS,
+        "partition_mh_block_steps": dict(PARTITION_MH_BLOCK_STEPS),
+        "partition_mh_block_targets": dict(PARTITION_MH_BLOCK_TARGETS),
+        "partition_mh_adaptation_window": PARTITION_MH_ADAPTATION_WINDOW,
         "truncated_compensator": True,
         "etas_spatial_quadrature": ETAS_SPATIAL_QUADRATURE,
     }

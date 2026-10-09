@@ -11,6 +11,7 @@ import numpy as np
 from .runner_utils import parallel_map, simulation_execution_guard as execution_guard
 from .simulation_settings import (
     ACCURACY_TARGET_EVENTS,
+    RECOVERY_TARGET_EVENTS,
     EXPERIMENT_2_BETA,
     EXPERIMENT_2_DURATIONS,
     EXPERIMENT_2_ETAS,
@@ -28,7 +29,8 @@ from .simulation_settings import (
     REFERENCE_MUS,
     SCENARIOS,
 )
-from .test_utils import (
+from .simulation_utils import (
+    MALACalibrationError,
     background_recovery_metrics,
     branching_metrics,
     calibrate_gp,
@@ -85,6 +87,7 @@ def _fit_accuracy_method(
     evaluation_quadrature,
     background_quadrature,
     spatial_compensator_quadrature,
+    panel="benchmark",
 ):
     """Fit one method to the complete simulated catalogue."""
     scenario = SCENARIOS[scenario_name]
@@ -97,8 +100,9 @@ def _fit_accuracy_method(
     record.update(
         {
             "n_fitted": len(catalog),
+            "panel": panel,
             "observation_duration": duration,
-            "simulation_seed": 11_000 + 1000 * list(SCENARIOS).index(scenario_name) + replicate,
+            "simulation_seed": (31_000 if panel == "recovery" else 11_000) + 1000 * list(SCENARIOS).index(scenario_name) + replicate,
             "omitted_temporal_mass": tail_mass,
             "gp_variance": gp_prior.variance,
             "gp_length_scale": gp_prior.length_scale,
@@ -132,9 +136,7 @@ def _fit_accuracy_method(
         record.update(
             branching_metrics(
                 bundle,
-                parent_indices,
-                catalog.t,
-                cutoff,
+                parent_indices < 0,
             )
         )
         record.update(
@@ -182,7 +184,7 @@ def _fit_accuracy_method(
         )
         record.update(intensity_metrics)
         candidates = candidate_diagnostics(
-            catalog.t, parent_indices, cutoff
+            catalog.t, cutoff
         )
         dense_pairs = candidates["dense_candidate_count"]
         retained_pairs = (
@@ -200,9 +202,15 @@ def _fit_accuracy_method(
                     if METHODS[method]["truncated"]
                     else dense_pairs / max(len(catalog), 1)
                 ),
-                "candidate_count_q95": candidates["candidate_count_q95"],
+                "candidate_count_q95": (
+                    candidates["candidate_count_q95"]
+                    if METHODS[method]["truncated"]
+                    else float(np.quantile(np.searchsorted(catalog.t, catalog.t, side="left"), 0.95))
+                ),
             }
         )
+    except MALACalibrationError:
+        raise
     except Exception as error:
         record.update(
             {
@@ -222,6 +230,7 @@ def _accuracy_replicate(
     evaluation_quadrature=None,
     background_quadrature=None,
     spatial_compensator_quadrature=None,
+    panel="benchmark",
 ):
     if evaluation_quadrature is None:
         evaluation_quadrature = regular_spatial_quadrature(
@@ -229,8 +238,8 @@ def _accuracy_replicate(
         )
     scenario = SCENARIOS[scenario_name]
     zones, _ = generate_partition(N_REGIONS, seed=PARTITION_SEED)
-    duration = scenario["duration"] * campaign.duration_scale
-    seed = 11_000 + 1000 * list(SCENARIOS).index(scenario_name) + replicate
+    duration = scenario["recovery_duration" if panel == "recovery" else "duration"] * campaign.duration_scale
+    seed = (31_000 if panel == "recovery" else 11_000) + 1000 * list(SCENARIOS).index(scenario_name) + replicate
     simulation = simulate_configuration(
         zones,
         scenario["mus"],
@@ -269,6 +278,7 @@ def _accuracy_replicate(
             evaluation_quadrature,
             background_quadrature,
             spatial_compensator_quadrature,
+            panel,
         )
         for method in methods
     ]
@@ -285,10 +295,11 @@ def run_accuracy_panel(
     evaluation_quadrature=None,
     background_quadrature=None,
     spatial_compensator_quadrature=None,
+    panel="benchmark",
 ):
     if worker_memory_reservation_gib is None:
         worker_memory_reservation_gib = execution_guard(
-            "1", ACCURACY_TARGET_EVENTS
+            "1", RECOVERY_TARGET_EVENTS if panel == "recovery" else ACCURACY_TARGET_EVENTS
         )["memory_reservation_gib"]
     if evaluation_quadrature is None:
         evaluation_quadrature = regular_spatial_quadrature(
@@ -305,6 +316,7 @@ def run_accuracy_panel(
             evaluation_quadrature,
             background_quadrature,
             spatial_compensator_quadrature,
+            panel,
         )
         for scenario in SCENARIOS
         for replicate in range(campaign.n_replicates)
@@ -314,7 +326,7 @@ def run_accuracy_panel(
         _accuracy_replicate,
         tasks,
         n_jobs,
-        "Experiment 1 accuracy",
+        f"Experiment 1 {panel}",
         task_keys=task_keys,
         checkpoint_dir=checkpoint_dir,
         resume=resume,
@@ -439,6 +451,7 @@ def _partition_fit(
         parent_time_window=cutoff,
         background_quadrature=background_quadrature,
         spatial_compensator_quadrature=spatial_compensator_quadrature,
+        partition_tuning=True,
     )
     record = {
         "experiment": 2,
@@ -483,9 +496,7 @@ def _partition_fit(
     record.update(
         branching_metrics(
             bundle,
-            simulation.parent_indices,
-            catalog.t,
-            cutoff,
+            simulation.parent_indices < 0,
         )
     )
     surface = None
@@ -508,13 +519,20 @@ def _partition_fit(
         "method_label": METHODS[EXPERIMENT_2_METHOD]["label"],
         "gibbs_trace": gibbs_parameter_traces(bundle),
         **{f"true_{name}": record[f"true_{name}"] for name in PARAMETER_NAMES},
-        "burn_in_fraction": campaign.gibbs_burn_in,
+        "burn_in_fraction": bundle.burn_in,
         "adaptation_end": bundle.fits[0].raw["proposal_steps"].get(
             "adaptation_end"
         ),
         "ess_min": diagnostics.get("ess_min", np.nan),
+        "ess_background_min": diagnostics.get("ess_background_min", np.nan),
+        "rhat_max": diagnostics.get("rhat_max", np.nan),
+        "rhat_background_max": diagnostics.get("rhat_background_max", np.nan),
         "ess": {
             name: diagnostics.get(f"ess_bulk_{name}", np.nan)
+            for name in PARAMETER_NAMES
+        },
+        "rhat": {
+            name: diagnostics.get(f"rhat_{name}", np.nan)
             for name in PARAMETER_NAMES
         },
     }
@@ -536,7 +554,10 @@ def _partition_replicate(
     partition_campaign = replace(
         campaign,
         n_chains=campaign.n_partition_chains,
+        gibbs_iterations=campaign.partition_gibbs_iterations,
         gibbs_burn_in=campaign.partition_gibbs_burn_in,
+        gibbs_thin=campaign.partition_gibbs_thin,
+        gibbs_adaptation_fraction=campaign.partition_adaptation_fraction,
     )
     settings = _partition_scenarios()[scenario_name]
     duration = EXPERIMENT_2_DURATIONS[scenario_name] * campaign.duration_scale
@@ -554,7 +575,7 @@ def _partition_replicate(
     cutoff = temporal_cutoff(EXPERIMENT_2_ETAS, horizon=duration)
     calibration_zones = [unary_union(settings["true_zones"])]
     calibration_model = make_model(calibration_zones, duration, etas=INITIAL_ETAS)
-    gp_prior, calibration_seconds, _, calibration_n_events = calibrate_gp(
+    gp_prior, calibration_seconds, calibration_succeeded, calibration_n_events = calibrate_gp(
         calibration_model, simulation.catalog, campaign, seed + 71
     )
     records, traces, surface = {}, [], None
@@ -587,6 +608,8 @@ def _partition_replicate(
                 surface = fitted_surface
             if trace is not None:
                 traces.append(trace)
+        except MALACalibrationError:
+            raise
         except Exception as error:
             records[role] = {
                 "experiment": 2,
@@ -600,11 +623,21 @@ def _partition_replicate(
                 "error_type": type(error).__name__,
                 "error_message": str(error),
             }
+        records[role].update(
+            {
+                "n_background": simulation.n_background,
+                "n_triggered": simulation.n_triggered,
+                "true_background_fraction": simulation.n_background / max(len(simulation.catalog), 1),
+                "gp_variance": gp_prior.variance,
+                "gp_length_scale": gp_prior.length_scale,
+                "gp_calibration_succeeded": calibration_succeeded,
+                "omitted_temporal_mass": omitted_temporal_mass(
+                    EXPERIMENT_2_ETAS, cutoff, duration
+                ),
+            }
+        )
     oracle = records["oracle"]
-    misspecified = (
-        {**oracle, "fit_role": "misspecified"}
-        if scenario_name == "P0" else records["misspecified"]
-    )
+    misspecified = oracle if scenario_name == "P0" else records["misspecified"]
     paired = {
         "experiment": 2,
         "scenario": scenario_name,
@@ -632,7 +665,7 @@ def _partition_replicate(
         "delta_runtime_seconds": misspecified.get("runtime_seconds", np.nan)
         - oracle.get("runtime_seconds", np.nan),
     }
-    return [oracle, misspecified], [paired], surface, traces
+    return [records[role] for role in roles], [paired], surface, traces
 
 
 def run_partition_experiment(

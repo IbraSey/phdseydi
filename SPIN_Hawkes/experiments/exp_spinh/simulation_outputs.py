@@ -23,7 +23,7 @@ from .simulation_settings import (
     SCENARIOS,
 )
 from .simulation_studies import _partition_scenarios
-from .test_utils import generate_partition, write_records
+from .simulation_utils import generate_partition, write_records
 from package import plot_spinh_parameter_marginals
 from visualization import save_figure
 
@@ -42,8 +42,6 @@ ACCURACY_METRICS = (
     "background_brier",
     "background_accuracy",
     "background_f1",
-    "mean_true_state_probability",
-    "candidate_recall",
     "runtime_seconds",
 )
 
@@ -61,10 +59,17 @@ _INTERNAL_GIBBS_FIELDS = {
     "n_iter_run",
     "burn_in_fraction",
     "mala_step",
+    "mala_step_initial",
+    "mala_chain_seeds",
+    "mala_chain_acceptance_rates",
+    "mala_chain_final_steps",
+    "mala_production_runtime_seconds",
+    "mala_production_within_band",
     "sigma_mh_etas",
     "sigma_mh_beta",
 }
 _INTERNAL_GIBBS_PREFIXES = (
+    "mala_pilot_",
     "rhat_",
     "ess_",
     "mcse_",
@@ -80,6 +85,22 @@ _LEGACY_GIBBS_DIAGNOSTIC_FILES = (
 
 MAX_SAVED_REPLICATE_FIGURES = 5
 RECONSTRUCTION_DISPLAY_GRID_SIZE = 40
+_SCENARIO_COLORS = {
+    "concentrated": "#0072B2", "diffuse": "#D55E00",
+    "easy": "#0072B2", "difficult": "#D55E00",
+}
+
+
+def scenario_label(scenario):
+    return SCENARIOS.get(scenario, {}).get("label", scenario.replace("_", " ").title())
+
+
+def _scenario_names(records):
+    """Use stored scenarios when replotting results from an older protocol."""
+    observed = list(dict.fromkeys(row["scenario"] for row in records))
+    return [name for name in SCENARIOS if name in observed] + [
+        name for name in observed if name not in SCENARIOS
+    ]
 
 
 def _save_figure(
@@ -163,7 +184,7 @@ def select_replicates_for_figures(records, limit=MAX_SAVED_REPLICATE_FIGURES):
     if isinstance(limit, bool) or not isinstance(limit, (int, np.integer)) or limit < 1:
         raise ValueError("limit must be a positive integer.")
     selected = []
-    for scenario in SCENARIOS:
+    for scenario in _scenario_names(records):
         replicates = sorted({
             int(row["replicate"])
             for row in records
@@ -186,7 +207,7 @@ def select_representative_reconstructions(records, reconstructions):
     }
     selected = []
     selection_records = []
-    for scenario_name in SCENARIOS:
+    for scenario_name in _scenario_names(records):
         reference_method = next((
             method for method in METHODS
             if any(
@@ -285,10 +306,7 @@ def plot_accuracy_reconstruction(
         (payload["scenario"], payload["method"]): payload
         for payload in reconstructions
     }
-    scenarios = [
-        scenario for scenario in SCENARIOS
-        if any(key[0] == scenario for key in payloads)
-    ]
+    scenarios = _scenario_names(reconstructions)
     methods = [
         method for method in METHODS
         if any(key[1] == method for key in payloads)
@@ -376,7 +394,7 @@ def plot_accuracy_reconstruction(
             _plot_partition_boundaries(axis, zones, color="white", linewidth=0.55)
             axis.set(xlim=x_bounds, ylim=y_bounds, aspect="equal")
             axis.set_title(
-                f"{scenario.title()}\n{title}"
+                f"{scenario_label(scenario)}\n{title}"
                 if len(scenarios) > 1 and row == 0
                 else title
             )
@@ -391,7 +409,7 @@ def plot_accuracy_reconstruction(
     if len(scenarios) == 1:
         reference = next(iter(payloads.values()))
         figure.suptitle(
-            f"{scenarios[0].title()} scenario, replicate "
+            f"{scenario_label(scenarios[0])}, replicate "
             f"{int(reference['replicate'])}"
         )
     else:
@@ -460,7 +478,8 @@ def plot_accuracy(summary, output, *, save=True, show=False):
     if not summary:
         return
     figure, axes = plt.subplots(2, 4, figsize=(13.5, 6.8), layout="constrained")
-    colors = {"easy": "#0072B2", "difficult": "#D55E00"}
+    scenarios = _scenario_names(summary)
+    methods = [method for method in METHODS if any(row["method"] == method for row in summary)]
     parameter_labels = {"alpha": r"\alpha", "gamma": r"\gamma"}
     panels = [("rel_l2_background", r"Background $e_{L_2}$")] + [
         (
@@ -470,14 +489,14 @@ def plot_accuracy(summary, output, *, save=True, show=False):
         for name in ETAS_PARAMETER_NAMES
     ]
     for axis, (metric, title) in zip(axes.flat, panels):
-        width = 0.38
-        x = np.arange(len(METHODS))
-        for offset, scenario in zip((-0.5, 0.5), SCENARIOS):
+        width = 0.76 / len(scenarios)
+        x = np.arange(len(methods))
+        for offset, scenario in zip(np.arange(len(scenarios)) - (len(scenarios) - 1) / 2, scenarios):
             rows = {row["method"]: row for row in summary if row["scenario"] == scenario}
-            values = [rows.get(method, {}).get(metric, np.nan) for method in METHODS]
-            axis.bar(x + offset * width, values, width, color=colors[scenario], label=scenario.title())
+            values = [rows.get(method, {}).get(metric, np.nan) for method in methods]
+            axis.bar(x + offset * width, values, width, color=_SCENARIO_COLORS.get(scenario, "#777777"), label=scenario_label(scenario))
         axis.set_title(title)
-        axis.set_xticks(x, [method.upper() for method in METHODS])
+        axis.set_xticks(x, [method.upper() for method in methods])
         axis.set_ylabel(
             "Relative L2 error"
             if metric == "rel_l2_background"
@@ -490,7 +509,7 @@ def plot_accuracy(summary, output, *, save=True, show=False):
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.07),
-        ncol=len(SCENARIOS),
+        ncol=len(scenarios),
         frameon=False,
     )
     _save_figure(figure, output / "experiment_1_accuracy.pdf", save, show)
@@ -502,8 +521,7 @@ _REPLICATE_BOXPLOT_METRICS = (
     ("etas_parameter_log_error", "Mean ETAS log-error", "Absolute log error", False),
     ("background_brier", "Background Brier score", "Score", False),
     ("background_f1", "Background F1 score", "Score", False),
-    ("mean_true_state_probability", "True-state probability", "Probability", False),
-    ("candidate_recall", "Candidate recall", "Recall", False),
+    ("background_accuracy", "Background/triggered accuracy", "Score", False),
     ("runtime_seconds", "Wall-clock time", "Seconds", True),
 )
 
@@ -513,11 +531,8 @@ def _grouped_metric_boxplot(axis, records, metric, title, ylabel, log_scale):
         method for method in METHODS
         if any(row.get("method") == method for row in records)
     ]
-    scenarios = [
-        scenario for scenario in SCENARIOS
-        if any(row.get("scenario") == scenario for row in records)
-    ]
-    colors = {"easy": "#0072B2", "difficult": "#D55E00"}
+    scenarios = _scenario_names(records)
+    colors = _SCENARIO_COLORS
     centers = np.arange(len(methods), dtype=float)
     offsets = np.linspace(-0.22, 0.22, len(scenarios)) if len(scenarios) > 1 else [0.0]
     width = min(0.32, 0.7 / max(len(scenarios), 1))
@@ -569,12 +584,13 @@ def _plot_replicate_boxplot_grid(
     records, panels, output_path, *, save, show, truth_parameters=None,
 ):
     figure, axes = plt.subplots(2, 4, figsize=(14.5, 7.0), layout="constrained")
-    colors = {"easy": "#0072B2", "difficult": "#D55E00"}
+    colors = _SCENARIO_COLORS
+    scenarios = _scenario_names(records)
     for index, (axis, panel) in enumerate(zip(axes.flat, panels)):
         _grouped_metric_boxplot(axis, records, *panel)
         if truth_parameters is not None:
             parameter = truth_parameters[index]
-            for scenario in SCENARIOS:
+            for scenario in scenarios:
                 truths = {
                     float(row[f"true_{parameter}"])
                     for row in records
@@ -586,13 +602,11 @@ def _plot_replicate_boxplot_grid(
                         truths.pop(), color=colors.get(scenario, "#777777"),
                         linestyle=":", linewidth=1.2,
                     )
-    scenarios = [
-        scenario for scenario in SCENARIOS
-        if any(row.get("scenario") == scenario for row in records)
-    ]
+    for axis in list(axes.flat)[len(panels):]:
+        axis.set_axis_off()
     handles = [
         Patch(facecolor=colors.get(scenario, "#777777"), alpha=0.72,
-              label=scenario.title())
+              label=scenario_label(scenario))
         for scenario in scenarios
     ]
     handles.append(
@@ -734,9 +748,16 @@ def save_gibbs_traces(
             row["fit_role"] = payload["fit_role"]
         if payload.get("ess_min") is not None:
             row["ess_min"] = payload["ess_min"]
+        for field in ("ess_background_min", "rhat_max", "rhat_background_max"):
+            if field in payload:
+                row[field] = payload[field]
         row.update({
             f"ess_bulk_{name}": value
             for name, value in payload.get("ess", {}).items()
+        })
+        row.update({
+            f"rhat_{name}": value
+            for name, value in payload.get("rhat", {}).items()
         })
         row.update({
             f"true_{name}": payload[f"true_{name}"]
@@ -901,7 +922,7 @@ def plot_accuracy_gibbs_diagnostics(
                 "beta": SCENARIOS[scenario]["beta"],
             }
         role = payload.get("fit_role")
-        context = f"{scenario} scenario, replicate {replicate}"
+        context = f"{scenario_label(scenario)}, replicate {replicate}"
         if role:
             context += f", {role} fit"
         file_parts = [scenario]
@@ -1120,7 +1141,7 @@ def plot_accuracy_parameter_marginals(
                 for values in payload["samples"].values()
             ),
             rng_seed=91_000 + replicate,
-            title=f"{scenario.title()} scenario, replicate {replicate}",
+            title=f"{scenario_label(scenario)}, replicate {replicate}",
             savefigure=save,
             title_savefig=figure_stem,
             output_dir=output,
@@ -1346,7 +1367,7 @@ def write_experiment_1_latex(output, accuracy_summary):
     intensity_rows = []
     parameter_rows = []
     for row in accuracy_summary:
-        prefix = [row["scenario"].title(), row["method"].upper()]
+        prefix = [scenario_label(row["scenario"]), row["method"].upper()]
         intensity_rows.append(
             prefix
             + [
@@ -1360,8 +1381,7 @@ def write_experiment_1_latex(output, accuracy_summary):
                 _latex_metric(row, "etas_parameter_log_error"),
                 _latex_metric(row, "background_brier"),
                 _latex_metric(row, "background_f1"),
-                _latex_metric(row, "mean_true_state_probability"),
-                _latex_metric(row, "candidate_recall"),
+                _latex_metric(row, "background_accuracy"),
             ]
         )
     if accuracy_summary:
@@ -1383,8 +1403,7 @@ def write_experiment_1_latex(output, accuracy_summary):
                 "ETAS log-error",
                 r"$\mathrm{BS}_{\mathrm{bg}}$",
                 r"$F_1$",
-                r"$\pi_{z^\star}$",
-                r"$\mathrm{Rec}_{\mathcal{C}}$",
+                "Accuracy",
             ),
             parameter_rows,
         )
@@ -1424,6 +1443,31 @@ def records_for_export(records):
             and not name.startswith(_INTERNAL_GIBBS_PREFIXES)
         }
         for record in records
+    ]
+
+
+def mala_calibration_records(records):
+    """Keep tuning evidence separate from the scientific result tables."""
+    identity = (
+        "experiment", "scenario", "replicate", "fit_role", "method",
+        "n_events", "n_fitted", "inference_seed",
+    )
+    tuning = (
+        "mala_step_initial", "mala_step", "mala_pilot_seed",
+        "mala_chain_seeds", "mala_chain_acceptance_rates", "mala_chain_final_steps",
+        "mala_pilot_iterations",
+        "mala_pilot_refine_midpoint",
+        "mala_pilot_trials", "mala_pilot_steps",
+        "mala_pilot_acceptance_rates", "mala_pilot_acceptance",
+        "mala_pilot_runtime_seconds", "mala_production_runtime_seconds",
+        "mala_production_within_band",
+        "acceptance_eps_full", "acceptance_eps_initial",
+        "acceptance_eps_retained",
+    )
+    return [
+        {name: record[name] for name in (*identity, *tuning) if name in record}
+        for record in records
+        if record.get("status") == "ok" and "mala_pilot_acceptance" in record
     ]
 
 

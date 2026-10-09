@@ -46,15 +46,15 @@ class PointProcessModel(ABC):
 
         mala_step = config.mala_step
         if mala_step is None:
-            mala_step = self.recommended_mala_step(
-                catalog,
-                curvature_scale=config.mala_curvature_scale,
+            raise ValueError(
+                "mala_step must be set explicitly to a positive value for Gibbs inference."
             )
         run_options = {
             "t": ot.Point(catalog.t.tolist()),
             "x": ot.Point(catalog.x.tolist()),
             "y": ot.Point(catalog.y.tolist()),
             "mala_step": mala_step,
+            "mala_precondition": config.mala_precondition,
             "n_iter": config.n_iter,
             "learn_nu": config.learn_nu,
             "t0_nu": config.t0_nu,

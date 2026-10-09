@@ -40,11 +40,16 @@ class SPINHModel(SSGCModel):
         rng_seed=None,
         reference_intensity=None,
         spatial_quadrature=None,
+        stopping_rule=None,
     ):
         """Estimate this SPIN-H model with its Gibbs sampler.
 
         ``etas_parameters`` supplies the initial ETAS state. The model is not
         mutated; posterior chains and analyses are returned in GibbsResults.
+        An optional ``stopping_rule(iteration, traces)`` can stop at or before
+        ``config.n_iter``. It receives views of the unthinned scalar traces and
+        must not modify them. Its return value is a stop decision, not a
+        convergence certificate; burn-in remains the caller's responsibility.
         """
         config, gp_backend = self._prepare_gibbs(
             catalog, config, gp_backend, SPINHGibbsConfig
@@ -67,6 +72,10 @@ class SPINHModel(SSGCModel):
             adaptation_end=config.etas_adaptation_end,
             target_acceptance=config.etas_target_acceptance,
             adaptation_decay=config.etas_adaptation_decay,
+            block_steps=config.etas_block_steps,
+            block_targets=config.etas_block_targets,
+            adaptation_window=config.etas_adaptation_window,
+            adapt_mala=config.adapt_mala,
             eps_mh_etas=config.proposal_jitter,
             spatial_compensator_grid=config.spatial_compensator_grid,
             collapse_productivity=config.collapse_productivity,
@@ -85,6 +94,7 @@ class SPINHModel(SSGCModel):
             known_z=config.known_z,
             fixed_etas=config.fixed_etas,
             parent_time_window=config.parent_time_window,
+            stopping_rule=stopping_rule,
         )
 
     def vi(

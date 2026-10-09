@@ -92,6 +92,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         spatial_compensator_grid=40,
         collapse_productivity=True,
         spatial_quadrature=None,
+        block_steps=None,
+        block_targets=None,
+        adaptation_window=None,
+        adapt_mala=False,
     ):
         """Initialize the SPIN-Hawkes sampler; see the class docstring for parameters."""
         if not isinstance(model, SPINHModel):
@@ -146,6 +150,12 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         self.adaptation_decay = float(adaptation_decay)
         self.eps_mh_etas = eps_mh_etas
         self.sigma_MH_etas = sigma_MH_etas
+        self.block_steps = dict(block_steps or {})
+        self.block_targets = dict(block_targets or {})
+        self.adaptation_window = adaptation_window
+        self.adapt_mala = bool(adapt_mala)
+        if self.adapt_mala and self.adaptation_end is None:
+            raise ValueError("MALA adaptation requires a finite adaptation_end.")
         self._etas_adaptation = {}
 
         self.theta_phi = model.etas_parameters.as_dict()
@@ -227,6 +237,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                 "log_scale": 0.0,
                 "last_covariance": None,
                 "frozen_covariance": None,
+                "base_covariance": None,
             },
         )
         adaptation_finished = (
@@ -236,19 +247,28 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             history.append(log_cur.copy())
 
         post_initial = history[self.t0_etas :]
+        if self.adaptation_window is not None:
+            post_initial = post_initial[-self.adaptation_window :]
         if adaptation_finished and state["frozen_covariance"] is not None:
             cov = state["frozen_covariance"]
         elif it > self.t0_etas and len(post_initial) >= 2:
-            h = np.asarray(post_initial, dtype=float).reshape(-1, dim)
-            empirical = np.atleast_2d(np.cov(h.T, ddof=1))
-            base = (2.38 ** 2 / dim) * empirical
+            if (self.adaptation_window is None or state["base_covariance"] is None
+                    or it % 25 == 0 or adaptation_finished):
+                h = np.asarray(post_initial, dtype=float).reshape(-1, dim)
+                empirical = np.atleast_2d(np.cov(h.T, ddof=1))
+                base = (2.38 ** 2 / dim) * empirical
+                if self.adaptation_window is not None:
+                    initial_sd = self.block_steps.get(block, self.sigma_MH_etas)
+                    base = 0.95 * base + 0.05 * initial_sd ** 2 * np.eye(dim)
+                state["base_covariance"] = base
+            base = state["base_covariance"]
             cov = np.exp(2.0 * state["log_scale"]) * base
             cov = cov + self.eps_mh_etas * np.eye(dim)
             cov = 0.5 * (cov + cov.T)
             if adaptation_finished:
                 state["frozen_covariance"] = cov.copy()
         else:
-            cov = self.sigma_MH_etas ** 2 * np.eye(dim)
+            cov = self.block_steps.get(block, self.sigma_MH_etas) ** 2 * np.eye(dim)
 
         state["last_covariance"] = cov.copy()
         if dim == 1:
@@ -279,7 +299,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         state = self._etas_adaptation[block]
         gain = (it - self.t0_etas + 10.0) ** (-self.adaptation_decay)
         state["log_scale"] += gain * (
-            float(bool(accepted)) - self.target_acceptance
+            float(bool(accepted)) - self.block_targets.get(block, self.target_acceptance)
         )
         state["log_scale"] = float(
             np.clip(state["log_scale"], np.log(0.05), np.log(5.0))
@@ -879,7 +899,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
     #  run
     # ─────────────────────────────────────────────────────────
 
-    def run(self, t, x, y, mala_step=0.05, n_iter=1000,
+    def run(self, t, x, y, mala_step, n_iter=1000,
+            mala_precondition=False,
             learn_nu=False, fixed_beta=None,
             sample_z=True, known_z=None, fixed_etas=None,
             parent_time_window=None,
@@ -888,7 +909,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             mu_star_func=None, grid_nx=30, grid_ny=30, thin=1,
             compute_emu=False, emu_every=10,
             plot_calibration_kde=False, calibration_kde_cmap="viridis",
-            gp_backend="exact", sparse_gp=None):
+            gp_backend="exact", sparse_gp=None, stopping_rule=None):
         """Run the SPIN-Hawkes Gibbs sampler.
         
         The update conditions the latent thinned process on current background events,
@@ -900,8 +921,10 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         ----------
         t, x, y : array_like, shape (N,)
             Time-ordered event times and coordinates.
-        mala_step : float, optional
+        mala_step : float
             MALA step size for zonal log-intensities.
+        mala_precondition : bool, optional
+            Use fixed diagonal curvature scaling across zonal coordinates.
         n_iter : int, optional
             Number of Gibbs iterations.
         learn_nu : bool, optional
@@ -956,9 +979,14 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         results : dict
             SSGC chains plus ``Z``, ``theta_phi``, optional ``beta``, ETAS acceptance
             rates, model flags, transformed-state histories, and final parameter values."""
+        if not isinstance(mala_precondition, (bool, np.bool_)):
+            raise TypeError("mala_precondition must be boolean.")
+        if stopping_rule is not None and not callable(stopping_rule):
+            raise TypeError("stopping_rule must be callable or None.")
         if not self.use_etas:
             return super().run(
                 t, x, y, mala_step=mala_step, n_iter=n_iter, learn_nu=learn_nu,
+                mala_precondition=mala_precondition,
                 t0_nu=t0_nu, step_nu_init=step_nu_init, verbose=verbose,
                 verbose_every=verbose_every, use_calibration=use_calibration,
                 mu_star_func=mu_star_func, grid_nx=grid_nx, grid_ny=grid_ny, thin=thin,
@@ -989,6 +1017,7 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             self.beta = fixed_beta
         sample_beta = bool(self.use_magnitudes and fixed_beta is None)
         self._etas_adaptation = {}
+        self._beta_proposal_sd = self.sigma_MH_beta
 
         tp_names = (["A", "alpha", "c", "p", "d", "q", "gamma"]
                     if self.use_magnitudes else ["A", "c", "p", "d", "q"])
@@ -1019,7 +1048,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
         # ── Calibration GP ──────────────────────────────────────────────────
         if use_calibration:
-            if verbose: print("[Pre-run] Calibrating GP hyperparameters")
+            if verbose:
+                print("[Pre-run] Calibrating GP hyperparameters")
             self.calibrate_nu(
                 x, y, verbose=verbose,
                 plot_kde=plot_calibration_kde,
@@ -1077,6 +1107,11 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         areas_j   = np.array([self.polygons[j].area for j in range(self.J)])
         eps_mle   = np.log(np.maximum(2.0 * N_j_bg / (self.T * areas_j), 1e-6))
         eps       = ot.Point(eps_mle.tolist())
+        mala_relative_steps = (
+            self._mala_relative_steps(eps_mle)
+            if mala_precondition
+            else np.ones(self.J, dtype=float)
+        )
 
         if verbose:
             mode  = "Hawkes marqué" if self.use_magnitudes else "Hawkes ST"
@@ -1098,7 +1133,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
         # ── Grille E_μ optionnelle ───────────────────────────────────────────
         compute_emu = bool(compute_emu and mu_star_func is not None)
         if compute_emu:
-            xmin, xmax = self.X_bounds; ymin, ymax = self.Y_bounds
+            xmin, xmax = self.X_bounds
+            ymin, ymax = self.Y_bounds
             GX, GY     = np.meshgrid(np.linspace(xmin, xmax, grid_nx),
                                       np.linspace(ymin, ymax, grid_ny))
             grid_x, grid_y = GX.ravel(), GY.ravel()
@@ -1145,6 +1181,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             print(f"{'':>32}Gibbs : {n_iter} iter, N={N}{'':>32}")
             print("=" * 100)
 
+        initial_mala_step = float(mala_step)
+        mala_step_history = np.empty(n_iter)
         progress = tqdm(
             range(n_iter),
             desc=f"SPIN-H Gibbs (N={N})",
@@ -1214,9 +1252,21 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
 
                 # ── Step 4 : ε | f, π_S  (MALA) ────────────────────────────
                 N_j, M_j = self._count_events_per_zone(x, y, Z, Pi_S)
-                ea, ok   = self.update_eps(eps, N_j, M_j, step=mala_step)
+                mala_step_history[it] = mala_step
+                ea, ok = self.update_eps(
+                    eps,
+                    N_j,
+                    M_j,
+                    step=mala_step * mala_relative_steps,
+                )
                 acceptance_history["eps"][it] = ok
-                eps      = ot.Point(ea.tolist()); ae += int(ok)
+                eps = ot.Point(ea.tolist())
+                ae += int(ok)
+                if self.adapt_mala and self.t0_etas <= it < self.adaptation_end:
+                    gain = (it - self.t0_etas + 10.0) ** (-self.adaptation_decay)
+                    mala_step = float(np.clip(
+                        mala_step * np.exp(gain * (float(ok) - 0.57)), 1e-6, 10.0
+                    ))
 
                 # ── Step 5 : ν | f  (AM, optional) ─────────────────────────
                 if learn_nu:
@@ -1293,7 +1343,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                             msg += f" β={self.beta:.3f} β_fixed"
                     if learn_nu:
                         msg += f" acc_ν={an/denom*100:.0f}%"
-                    if it > self.t0_etas: msg += " [AM]"
+                    if it > self.t0_etas:
+                        msg += " [AM]"
                     progress.set_postfix_str(msg, refresh=False)
 
                 # ── E_μ (diagnostic, background GP only) ────────────────────
@@ -1306,7 +1357,8 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                         f_bg_pt = ot.Point([float(f_data[i]) for i in idx_bg])
                         Kd, Kg, Kgg = self.compute_kernel(XY_bg_g, Xg)
                         Kr = ot.CovarianceMatrix(Kd)
-                        for ii in range(len(idx_bg)): Kr[ii, ii] += self.jitter
+                        for ii in range(len(idx_bg)):
+                            Kr[ii, ii] += self.jitter
                         alpha = Kr.solveLinearSystem(f_bg_pt)
                         mg   = np.array(Kg * alpha).flatten()
                         solved_cross = Kr.solveLinearSystem(ot.Matrix(np.array(Kg).T))
@@ -1327,21 +1379,39 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
                     nu_ch[si]   = np.array(self.nu)
                     Z_ch[si]    = np.array(Z)
                     tp_ch[si]   = [self.theta_phi[k] for k in tp_names]
-                    if beta_ch is not None: beta_ch[si] = self.beta
+                    if beta_ch is not None:
+                        beta_ch[si] = self.beta
                     if gp_coeffs_ch is not None:
                         gp_coeffs_ch[si] = np.asarray(gp_coeffs, dtype=float)
                     si += 1
+
+                if stopping_rule is not None and stopping_rule(it + 1, {
+                    "theta_phi": tp_trace[:it + 1],
+                    "theta_phi_names": tp_names,
+                    "beta": beta_trace[:it + 1] if beta_trace is not None else None,
+                    "eps": eps_trace[:it + 1],
+                    "background_fraction": background_fraction_trace[:it + 1],
+                }):
+                    break
 
             except Exception as e:
                 progress.write(f"[ERROR] iter {it}: {e}")
                 raise
 
         progress.close()
+        n_iter = it + 1
+        tp_trace = tp_trace[:n_iter]
+        eps_trace = eps_trace[:n_iter]
+        background_fraction_trace = background_fraction_trace[:n_iter]
+        beta_trace = beta_trace[:n_iter] if beta_trace is not None else None
+        Emu = Emu[:n_iter]
+        acceptance_history = {key: values[:n_iter] for key, values in acceptance_history.items()}
 
         if verbose:
             print("=" * 100 + "\n")
             print(f"  ε (MALA)       : {ae/n_iter*100:.1f}%  (target ≈57%)")
-            if learn_nu: print(f"  ν (AM)         : {an/n_iter*100:.1f}%")
+            if learn_nu:
+                print(f"  ν (AM)         : {an/n_iter*100:.1f}%")
             bl = {"A_alpha": "{α}",
                   "c_p":     "{c,p}",
                   "d_q_gamma": "{d,q,γ}" if self.use_magnitudes else "{d,q}"}
@@ -1375,10 +1445,18 @@ class SPIN_H_GibbsSampler(SSGC_GibbsSampler):
             "acceptance_nu":    an/n_iter if learn_nu else None,
             "acceptance_beta":  ab/n_iter if sample_beta else None,
             "acceptance_history": acceptance_history,
+            "mala_step_history": mala_step_history[:n_iter],
             "proposal_steps": {
                 "mala_step": float(mala_step),
+                "initial_mala_step": initial_mala_step,
+                "mala_precondition": bool(mala_precondition),
+                "mala_relative_steps": mala_relative_steps.copy(),
                 "sigma_mh_etas": float(self.sigma_MH_etas),
                 "sigma_mh_beta": float(self.sigma_MH_beta),
+                "sigma_mh_beta_final": float(self._beta_proposal_sd),
+                "block_steps": dict(self.block_steps),
+                "block_targets": dict(self.block_targets),
+                "adaptation_window": self.adaptation_window,
                 "adaptation_start": int(self.t0_etas),
                 "adaptation_end": (
                     None if self.adaptation_end is None else int(self.adaptation_end)

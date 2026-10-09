@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from numbers import Integral
 from pathlib import Path
 import argparse
@@ -25,6 +26,7 @@ from .simulation_outputs import (
     generating_parameters,
     load_gibbs_traces,
     load_partition_surfaces,
+    mala_calibration_records,
     render_accuracy_outputs,
     plot_partition,
     plot_partition_gibbs_diagnostics,
@@ -41,6 +43,9 @@ from .simulation_outputs import (
 )
 from .simulation_settings import (
     ACCURACY_TARGET_EVENTS,
+    ACCURACY_PANELS,
+    RECOVERY_METHODS,
+    RECOVERY_TARGET_EVENTS,
     CAMPAIGNS,
     ETAS_PARAMETER_NAMES,
     EXPERIMENT_2_DURATIONS,
@@ -61,7 +66,7 @@ from .simulation_studies import (
     run_accuracy_panel,
     run_partition_experiment,
 )
-from .test_utils import (
+from .simulation_utils import (
     quadrature_metadata,
     summarize_records,
     write_campaign,
@@ -72,7 +77,7 @@ from .test_utils import (
 _CHECKPOINT_SOURCES = (
     Path(__file__).with_name("simulation_settings.py"),
     Path(__file__).with_name("simulation_studies.py"),
-    Path(__file__).with_name("test_utils.py"),
+    Path(__file__).with_name("simulation_utils.py"),
     Path(__file__).with_name("runner_utils.py"),
     REPO_ROOT / "package",
     REPO_ROOT / "data",
@@ -107,17 +112,13 @@ def _resolve_figure_display(show_figures):
     return bool(show_figures and can_show)
 
 
-def _print_run_settings(campaign, experiment, methods, n_jobs, output):
+def _print_run_settings(campaign, experiment, n_jobs, output):
     print("\n" + "=" * 78)
     print("SPIN-H SIMULATED-DATA TESTS")
     print("=" * 78)
     if experiment == "1":
+        print(f"Profile={campaign.name} | experiment=1")
         print(
-            f"Profile={campaign.name} | experiment=1 | "
-            f"methods={','.join(method.upper() for method in methods)}"
-        )
-        print(
-            f"Replicates per scenario={campaign.n_replicates} | "
             f"Gibbs: {campaign.n_chains} chain(s) x {campaign.gibbs_iterations} iter. | "
             f"VI: {campaign.vi_starts} start(s) x {campaign.vi_iterations} iter."
         )
@@ -129,21 +130,19 @@ def _print_run_settings(campaign, experiment, methods, n_jobs, output):
         print(
             f"Replicates per partition scenario={campaign.n_partition_replicates} | "
             f"Gibbs: {campaign.n_partition_chains} chain(s) x "
-            f"{campaign.gibbs_iterations} iter. | "
+            f"{campaign.partition_gibbs_iterations} iter. | "
             f"burn-in={campaign.partition_gibbs_burn_in:.0%}"
         )
     else:
         print(
             f"Profile={campaign.name} | experiments=1,2 | "
-            f"Experiment 1 methods={','.join(method.upper() for method in methods)} | "
             f"Experiment 2 method={EXPERIMENT_2_METHOD.upper()}"
         )
         print(
-            f"Replicates: accuracy={campaign.n_replicates}, "
-            f"partition={campaign.n_partition_replicates} | "
-            f"Gibbs chains: accuracy={campaign.n_chains}, "
+            f"Partition replicates={campaign.n_partition_replicates} | "
+            f"Gibbs chains: experiment 1={campaign.n_chains}, "
             f"partition={campaign.n_partition_chains} x "
-            f"{campaign.gibbs_iterations} iter. | "
+            f"{campaign.partition_gibbs_iterations} iter. | "
             f"VI: {campaign.vi_starts} start(s) x {campaign.vi_iterations} iter."
         )
     print(
@@ -166,10 +165,17 @@ def _print_run_summary(results, output):
     print("\n" + "-" * 78)
     print("RUN SUMMARY")
     failures = []
-    if "experiment_1_accuracy" in results:
-        raw, summary = results["experiment_1_accuracy"]
+    mala_outside = []
+    for panel in ACCURACY_PANELS:
+        if f"experiment_1_{panel}" not in results:
+            continue
+        raw, summary = results[f"experiment_1_{panel}"]
         failures.extend(record for record in raw if record.get("status") != "ok")
-        print("Experiment 1 - accuracy")
+        mala_outside.extend(
+            record for record in raw
+            if record.get("mala_production_within_band") is False
+        )
+        print(f"Experiment 1 - {panel}")
         print(f"{'Scenario':<12} {'Method':<6} {'N':>6} {'L2 bg':>10} {'ETAS err.':>10} {'Time (s)':>10}")
         for row in summary:
             completed = [
@@ -190,6 +196,10 @@ def _print_run_summary(results, output):
         raw, paired, summary, *_ = results["experiment_2"]
         failures.extend(record for record in raw if record.get("status") != "ok")
         failures.extend(record for record in paired if record.get("status") != "ok")
+        mala_outside.extend(
+            record for record in raw
+            if record.get("mala_production_within_band") is False
+        )
         print(f"\nExperiment 2 - paired partition effects ({EXPERIMENT_2_METHOD.upper()})")
         print(f"{'Case':<6} {'Delta L2 bg':>12} {'Delta ETAS err.':>16}")
         for row in summary:
@@ -208,6 +218,11 @@ def _print_run_summary(results, output):
             print(f"  {identifier}: {detail}")
     else:
         print("\nAll requested computations completed.")
+    if mala_outside:
+        print(
+            f"MALA: {len(mala_outside)} production fit(s) fell outside the "
+            "45–69% pilot band; see the separate calibration CSVs."
+        )
     print(f"Results written to: {output}")
     print("-" * 78)
 
@@ -297,6 +312,7 @@ def run(
     evaluation_quadrature=None,
     background_quadrature=None,
     spatial_compensator_quadrature=None,
+    accuracy_panels=ACCURACY_PANELS,
 ):
     validate_scientific_settings()
     methods = tuple(methods)
@@ -305,7 +321,12 @@ def run(
         raise ValueError(f"At least one valid method is required; unknown={sorted(unknown)}.")
     if experiment not in {"1", "2", "all"}:
         raise ValueError("experiment must be '1', '2' or 'all'.")
-    guard = execution_guard(experiment, ACCURACY_TARGET_EVENTS)
+    accuracy_panels = tuple(accuracy_panels)
+    if not accuracy_panels or len(set(accuracy_panels)) != len(accuracy_panels) or set(accuracy_panels) - set(ACCURACY_PANELS):
+        raise ValueError(f"accuracy_panels must select from {ACCURACY_PANELS} without duplicates.")
+    if "recovery" in accuracy_panels and experiment != "2" and not set(methods).intersection(RECOVERY_METHODS):
+        raise ValueError("The recovery panel requires at least one method among M2--M5.")
+    guard = execution_guard(experiment, RECOVERY_TARGET_EVENTS if "recovery" in accuracy_panels else ACCURACY_TARGET_EVENTS)
     n_jobs = resolve_n_jobs(
         profile,
         n_jobs,
@@ -322,6 +343,14 @@ def run(
         )
     display_figures = _resolve_figure_display(show_figures)
     campaign = configure_campaign(profile, **(campaign_overrides or {}))
+    uses_gibbs = experiment in {"2", "all"} or any(
+        METHODS[method]["family"] == "gibbs" for method in methods
+    )
+    if uses_gibbs and campaign.mala_step is None:
+        raise ValueError(
+            "Gibbs experiments require an explicit mala_step; pass --mala-step "
+            "or set EDITOR_MALA_STEP in the interactive runner."
+        )
     quadratures = {
         "evaluation": quadrature_metadata(evaluation_quadrature),
         "vi_background": quadrature_metadata(background_quadrature),
@@ -337,16 +366,36 @@ def run(
     _print_run_settings(
         campaign,
         experiment,
-        methods,
         n_jobs,
         output,
     )
+    if experiment in {"1", "all"}:
+        for panel in accuracy_panels:
+            target = ACCURACY_TARGET_EVENTS if panel == "benchmark" else RECOVERY_TARGET_EVENTS
+            replicates = campaign.n_replicates if panel == "benchmark" else campaign.n_recovery_replicates
+            selected = [method.upper() for method in methods if panel == "benchmark" or method in RECOVERY_METHODS]
+            print(f"Experiment 1 {panel}: N~{target}, {replicates} replicates per scenario, methods={','.join(selected)}.")
+    if experiment in {"2", "all"}:
+        print(f"Experiment 2: warm-up {campaign.partition_gibbs_burn_in:.0%}, "
+              f"thin={campaign.partition_gibbs_thin}, "
+              f"fixed budget={campaign.partition_gibbs_iterations} iterations per chain.")
     write_campaign(
         output / "simulation_campaign.json",
         campaign,
         {
             "methods": methods,
             "experiment_1_methods": methods,
+            "accuracy_panels": accuracy_panels,
+            "experiment_1_panels": {
+                panel: {
+                    "methods": tuple(method for method in methods
+                                     if panel == "benchmark" or method in RECOVERY_METHODS),
+                    "replicates_per_scenario": (campaign.n_replicates if panel == "benchmark"
+                                                else campaign.n_recovery_replicates),
+                    "output_directory": f"experiment_1_{panel}",
+                }
+                for panel in accuracy_panels if experiment in {"1", "all"}
+            },
             "experiment_2_method": EXPERIMENT_2_METHOD,
             "experiment": experiment,
             "n_jobs": int(n_jobs),
@@ -362,17 +411,22 @@ def run(
         },
     )
     results = {}
-    if experiment in {"1", "all"}:
+    for panel in accuracy_panels if experiment in {"1", "all"} else ():
+        panel_methods = tuple(method for method in methods if panel == "benchmark" or method in RECOVERY_METHODS)
+        panel_campaign = (replace(campaign, n_replicates=campaign.n_recovery_replicates)
+                          if panel == "recovery" else campaign)
+        panel_output = output / f"experiment_1_{panel}"
+        panel_output.mkdir(parents=True, exist_ok=True)
         accuracy_checkpoints = checkpoint_directory(
-            output,
+            panel_output,
             "simulation_accuracy",
-            campaign,
-            settings={"methods": methods, "quadratures": quadratures},
+            panel_campaign,
+            settings={"methods": panel_methods, "quadratures": quadratures, "panel": panel},
             source_paths=_CHECKPOINT_SOURCES,
         )
         accuracy, reconstructions, posteriors = run_accuracy_panel(
-            campaign,
-            methods,
+            panel_campaign,
+            panel_methods,
             n_jobs=n_jobs,
             checkpoint_dir=accuracy_checkpoints,
             resume=resume,
@@ -380,6 +434,7 @@ def run(
             evaluation_quadrature=evaluation_quadrature,
             background_quadrature=background_quadrature,
             spatial_compensator_quadrature=spatial_compensator_quadrature,
+            panel=panel,
         )
         accuracy_summary = summarize_records(
             accuracy, ("scenario", "method", "method_label"), ACCURACY_METRICS
@@ -391,26 +446,30 @@ def run(
             )
         )
         write_records(
-            output / "experiment_1_accuracy_raw.csv",
+            panel_output / "experiment_1_accuracy_raw.csv",
             records_for_export(accuracy),
         )
-        write_records(output / "experiment_1_accuracy_table.csv", accuracy_summary)
-        save_accuracy_posteriors(posteriors, output)
+        write_records(
+            panel_output / "experiment_1_mala_calibration.csv",
+            mala_calibration_records(accuracy),
+        )
+        write_records(panel_output / "experiment_1_accuracy_table.csv", accuracy_summary)
+        save_accuracy_posteriors(posteriors, panel_output)
         _, selection_records = select_representative_reconstructions(
             accuracy, reconstructions
         )
         write_records(
-            output / "experiment_1_reconstruction_selection.csv",
+            panel_output / "experiment_1_reconstruction_selection.csv",
             selection_records,
         )
-        save_accuracy_backgrounds(reconstructions, output)
+        save_accuracy_backgrounds(reconstructions, panel_output)
         render_accuracy_outputs(
             accuracy, accuracy_summary, reconstructions, posteriors, selection_records,
-            output, save=save_figures, show=display_figures,
+            panel_output, save=save_figures, show=display_figures,
             replicate_boxplots=replicate_boxplots,
         )
-        results["experiment_1_accuracy"] = (accuracy, accuracy_summary)
-        write_experiment_1_latex(output, accuracy_summary)
+        results[f"experiment_1_{panel}"] = (accuracy, accuracy_summary)
+        write_experiment_1_latex(panel_output, accuracy_summary)
     if experiment in {"2", "all"}:
         partition_checkpoints = checkpoint_directory(
             output,
@@ -438,6 +497,10 @@ def run(
             PARTITION_METRICS,
         )
         write_records(output / "experiment_2_fits_raw.csv", records_for_export(raw))
+        write_records(
+            output / "experiment_2_mala_calibration.csv",
+            mala_calibration_records(raw),
+        )
         write_records(output / "experiment_2_paired_raw.csv", records_for_export(paired))
         write_records(output / "experiment_2_table.csv", paired_summary)
         write_experiment_2_latex(output, paired_summary)
@@ -504,7 +567,7 @@ def parse_args(argv=None):
     )
     selection.add_argument(
         "--output-dir", type=Path, default=None,
-        help="Output directory (default: results/<profile>).",
+        help="Output directory (default: results/spinh_test/<profile>).",
     )
     selection.add_argument(
         "--n-jobs",
@@ -514,14 +577,22 @@ def parse_args(argv=None):
     )
     budget = parser.add_argument_group("campaign budget overrides")
     budget.add_argument("--n-replicates", type=int, default=None)
+    selection.add_argument("--accuracy-panels", nargs="+", choices=ACCURACY_PANELS, default=list(ACCURACY_PANELS))
+    budget.add_argument("--n-recovery-replicates", type=int, default=None)
     budget.add_argument("--n-partition-replicates", type=int, default=None)
     budget.add_argument("--n-chains", type=int, default=None)
     budget.add_argument("--n-partition-chains", type=int, default=None)
+    budget.add_argument("--partition-gibbs-iterations", type=int, default=None)
     budget.add_argument("--vi-starts", type=int, default=None)
     budget.add_argument("--gibbs-iterations", type=int, default=None)
+    budget.add_argument(
+        "--mala-step", type=float, default=None,
+        help="Positive starting MALA step for Gibbs; each fit calibrates it with 200-iteration pilots.",
+    )
     budget.add_argument("--gibbs-thin", type=int, default=None)
     budget.add_argument("--gibbs-burn-in", type=float, default=None)
     budget.add_argument("--partition-gibbs-burn-in", type=float, default=None)
+    budget.add_argument("--partition-gibbs-thin", type=int, default=None)
     budget.add_argument("--gibbs-adaptation-fraction", type=float, default=None)
     budget.add_argument("--vi-iterations", type=int, default=None)
     budget.add_argument("--evaluation-space-grid", type=int, default=None)
@@ -568,14 +639,18 @@ def parse_args(argv=None):
 def _overrides_from_args(args):
     return {
         "n_replicates": args.n_replicates,
+        "n_recovery_replicates": args.n_recovery_replicates,
         "n_partition_replicates": args.n_partition_replicates,
         "n_chains": args.n_chains,
         "n_partition_chains": args.n_partition_chains,
+        "partition_gibbs_iterations": args.partition_gibbs_iterations,
         "vi_starts": args.vi_starts,
         "gibbs_iterations": args.gibbs_iterations,
+        "mala_step": args.mala_step,
         "gibbs_thin": args.gibbs_thin,
         "gibbs_burn_in": args.gibbs_burn_in,
         "partition_gibbs_burn_in": args.partition_gibbs_burn_in,
+        "partition_gibbs_thin": args.partition_gibbs_thin,
         "gibbs_adaptation_fraction": args.gibbs_adaptation_fraction,
         "vi_iterations": args.vi_iterations,
         "evaluation_space_grid": args.evaluation_space_grid,
@@ -604,18 +679,22 @@ def execute(action="run", **options):
         experiment = options.get("experiment", "all")
         if experiment not in {"1", "2", "all"}:
             raise ValueError("experiment must be '1', '2' or 'all'.")
-        if experiment == "1":
-            return postprocess_accuracy_results(**accuracy_settings)
         if experiment == "2":
             return postprocess_partition_results(**settings)
         output = settings.get("output_dir")
         output = Path(output) if output is not None else RESULTS_ROOT / settings.get("profile", "full")
         results = {}
+        for panel in options.get("accuracy_panels", ACCURACY_PANELS):
+            panel_output = output / f"experiment_1_{panel}"
+            if (panel_output / "experiment_1_accuracy_raw.csv").is_file():
+                results[f"experiment_1_{panel}"] = postprocess_accuracy_results(
+                    **{**accuracy_settings, "output_dir": panel_output}
+                )
         if (output / "experiment_1_accuracy_raw.csv").is_file():
             results["experiment_1_accuracy"] = postprocess_accuracy_results(
                 **accuracy_settings
             )
-        if (output / "experiment_2_fits_raw.csv").is_file():
+        if experiment == "all" and (output / "experiment_2_fits_raw.csv").is_file():
             results["experiment_2"] = postprocess_partition_results(**settings)
         if not results:
             raise FileNotFoundError(f"No saved simulation results found in {output}")
@@ -632,6 +711,7 @@ def main(argv=None):
         profile=args.profile,
         experiment=args.experiment,
         methods=args.methods,
+        accuracy_panels=args.accuracy_panels,
         n_jobs=args.n_jobs,
         resume=not args.no_resume,
         save_figures=not args.no_figures,
