@@ -56,7 +56,6 @@ class SSGCModel(PointProcessModel):
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
             setattr(self, name, value)
-
         observation_window = box(
             self.x_bounds[0],
             self.y_bounds[0],
@@ -151,39 +150,6 @@ class SSGCModel(PointProcessModel):
             -squared_distance / (2.0 * self.eps_prior_length_scale**2)
         )
 
-    def recommended_mala_step(
-        self,
-        catalog: EventCatalog,
-        curvature_scale: float = 1.8,
-    ) -> float:
-        """Choose a zonal MALA step from the initial posterior curvature.
-
-        The event counts make the epsilon posterior increasingly concentrated
-        as a catalogue grows. Scaling the proposal by the inverse square root
-        of its largest initial curvature avoids using the same step at every
-        catalogue size.
-        """
-        domain_index = self.validate_catalog(catalog)
-        if len(catalog) == 0:
-            raise ValueError("MALA step selection requires at least one event.")
-        if isinstance(curvature_scale, bool):
-            raise ValueError("curvature_scale must be finite and positive.")
-        try:
-            curvature_scale = float(curvature_scale)
-        except (TypeError, ValueError) as error:
-            raise ValueError("curvature_scale must be finite and positive.") from error
-        if not np.isfinite(curvature_scale) or curvature_scale <= 0.0:
-            raise ValueError("curvature_scale must be finite and positive.")
-
-        counts = np.bincount(domain_index, minlength=self.n_domains).astype(float)
-        covariance = self.epsilon_prior_covariance()
-        covariance = covariance + self.jitter * np.eye(self.n_domains)
-        precision = np.linalg.solve(covariance, np.eye(self.n_domains))
-        largest_curvature = float(
-            np.linalg.eigvalsh(precision + np.diag(2.0 * counts))[-1]
-        )
-        return float(curvature_scale / np.sqrt(largest_curvature))
-
     def calibrate_gp_prior(
         self,
         catalog: EventCatalog,
@@ -245,6 +211,10 @@ class SSGCModel(PointProcessModel):
             sparse_gp=sparse_gp,
             reference_intensity=reference_intensity,
             fixed_beta=config.fixed_beta,
+            mala_adaptation_start=config.adaptation_start,
+            mala_adaptation_end=config.mala_adaptation_end,
+            mala_target_acceptance=config.mala_target_acceptance,
+            mala_adaptation_decay=config.mala_adaptation_decay,
         )
 
     def vi(self, catalog, config=None, rng_seed=None, quadrature=None):

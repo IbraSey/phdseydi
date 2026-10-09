@@ -59,7 +59,8 @@ def simulation_execution_guard(experiment, accuracy_target_events=400):
         return {
             "name": f"accuracy-N{int(accuracy_target_events)}",
             "max_workers": _SIMULATION_ACCURACY_MAX_WORKERS,
-            "memory_reservation_gib": _SIMULATION_ACCURACY_MEMORY_GIB,
+            "memory_reservation_gib": (_SIMULATION_ACCURACY_MEMORY_GIB
+                                       if accuracy_target_events <= 500 else 2.0),
         }
     if experiment in {"2", "all"}:
         return {

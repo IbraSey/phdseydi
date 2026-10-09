@@ -287,10 +287,9 @@ class VIResults:
     ) -> np.ndarray:
         """Draw log background-intensity fields without exponential underflow.
 
-        ``domain_index`` is normally inferred from the fitted partition. It can
-        be supplied explicitly for spatial block cross-validation, where the
-        training exposure excludes a held-out block but predictions still use
-        the original domain labels.
+        ``domain_index`` is normally inferred from the fitted partition. Supply
+        it explicitly when the evaluation points already have validated domain
+        labels, for example when reusing a quadrature grid.
         """
         n_samples = _positive_integer("n_samples", n_samples)
         if rng_seed is not None:
@@ -1869,8 +1868,7 @@ class GibbsResults(Mapping):
         point_edge_color="black",
         link_color="black",
         magnitudes=None,
-        true_parent=None,
-        true_parent_convention="auto",
+        true_background=None,
         background_threshold=0.5,
     ):
         """Plot background probabilities and the two-stage branching tree."""
@@ -1936,36 +1934,14 @@ class GibbsResults(Mapping):
         linked = valid_link
         max_generation = int(generation.max()) if N else 0
 
-        true_labels = None
-        true_background = None
-        parent_truth_probability = None
-        parent_correct = None
         classification_report_text = None
-        supervised = true_parent is not None
+        supervised = true_background is not None
 
         if supervised:
-            truth = np.asarray(true_parent, dtype=int).reshape(-1)
-            if truth.size != N:
-                raise ValueError("true_parent must have one label per event.")
-            convention = str(true_parent_convention).lower()
-            if convention not in {"auto", "branching", "indices"}:
-                raise ValueError("true_parent_convention must be 'auto', 'branching', or 'indices'.")
-            if convention == "auto":
-                convention = "indices" if np.any(truth < 0) else "branching"
-            true_labels = (
-                np.where(truth < 0, 0, truth + 1).astype(int)
-                if convention == "indices"
-                else truth.astype(int)
-            )
-            if np.any(true_labels < 0):
-                raise ValueError("true_parent contains invalid negative labels.")
-            for child, label in enumerate(true_labels):
-                if label > 0 and label - 1 >= child:
-                    raise ValueError("true_parent must only reference earlier events as parents.")
-
-            true_background = true_labels == 0
-            parent_truth_probability = np.mean(Z_post == true_labels.reshape(1, -1), axis=0)
-            parent_correct = parent_mode == true_labels
+            truth = np.asarray(true_background).reshape(-1)
+            if truth.size != N or not np.isin(truth, [0, 1]).all():
+                raise ValueError("true_background must contain one boolean label per event.")
+            true_background = truth.astype(bool)
 
             from sklearn.metrics import classification_report
 
@@ -2051,19 +2027,10 @@ class GibbsResults(Mapping):
         if supervised:
             print("\nDeclustering classification report")
             print(classification_report_text)
-            triggered_truth = true_labels > 0
-            parent_accuracy_triggered = np.nan
-            if np.any(triggered_truth):
-                parent_accuracy_triggered = float(
-                    np.mean(parent_mode[triggered_truth] == true_labels[triggered_truth])
-                )
             diagnostics.update({
-                "true_parent": true_labels,
                 "true_background": true_background,
-                "parent_correct": parent_correct,
-                "parent_truth_probability": parent_truth_probability,
-                "parent_accuracy": float(np.mean(parent_correct)),
-                "parent_accuracy_triggered": parent_accuracy_triggered,
+                "background_brier": float(np.mean((p_bg - true_background) ** 2)),
+                "background_accuracy": float(np.mean(background_mode == true_background)),
                 "classification_report": classification_report_text,
             })
 

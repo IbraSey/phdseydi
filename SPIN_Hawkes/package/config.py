@@ -125,7 +125,6 @@ class GibbsConfig:
     n_iter: int = 3000
     thin: int = 1
     mala_step: float | None = None
-    mala_curvature_scale: float = 1.8
     learn_nu: bool = False
     use_calibration: bool = True
     verbose: bool = True
@@ -144,6 +143,10 @@ class GibbsConfig:
     sigma_mh_beta: float = 0.1
     adaptation_start: int = 50
     proposal_jitter: float = 1e-6
+    mala_adaptation_end: int | None = None
+    mala_target_acceptance: float = 0.574
+    mala_adaptation_decay: float = 0.6
+    mala_precondition: bool = False
 
     def __post_init__(self):
         for name in (
@@ -157,10 +160,15 @@ class GibbsConfig:
             _require_integer(name, getattr(self, name), minimum=1)
         for name in ("t0_nu", "adaptation_start"):
             _require_integer(name, getattr(self, name), minimum=0)
-        for name in ("learn_nu", "use_calibration", "verbose", "compute_emu"):
+        for name in (
+            "learn_nu",
+            "use_calibration",
+            "verbose",
+            "compute_emu",
+            "mala_precondition",
+        ):
             _require_boolean(name, getattr(self, name))
         for name in (
-            "mala_curvature_scale",
             "step_nu_init",
             "beta_init",
             "sigma_mh_beta",
@@ -169,6 +177,22 @@ class GibbsConfig:
             _require_real(name, getattr(self, name), minimum=0.0, strict=True)
         if self.mala_step is not None:
             _require_real("mala_step", self.mala_step, minimum=0.0, strict=True)
+        target = _require_real("mala_target_acceptance", self.mala_target_acceptance)
+        if not 0.0 < target < 1.0:
+            raise ValueError("mala_target_acceptance must be in (0, 1).")
+        decay = _require_real("mala_adaptation_decay", self.mala_adaptation_decay)
+        if not 0.5 < decay <= 1.0:
+            raise ValueError("mala_adaptation_decay must be in (0.5, 1].")
+        if self.mala_adaptation_end is not None:
+            _require_integer(
+                "mala_adaptation_end", self.mala_adaptation_end, minimum=1
+            )
+            if self.mala_adaptation_end <= self.adaptation_start:
+                raise ValueError(
+                    "mala_adaptation_end must be greater than adaptation_start."
+                )
+            if self.mala_adaptation_end > self.n_iter:
+                raise ValueError("mala_adaptation_end cannot exceed n_iter.")
         if self.fixed_beta is not None:
             _require_real("fixed_beta", self.fixed_beta, minimum=0.0, strict=True)
         if not isinstance(self.beta_prior, dict):
@@ -198,6 +222,10 @@ class SPINHGibbsConfig(GibbsConfig):
     etas_adaptation_end: int | None = None
     etas_target_acceptance: float = 0.234
     etas_adaptation_decay: float = 0.6
+    etas_block_steps: dict[str, float] = field(default_factory=dict)
+    etas_block_targets: dict[str, float] = field(default_factory=dict)
+    etas_adaptation_window: int | None = None
+    adapt_mala: bool = False
     parent_time_window: float | None = None
     spatial_compensator_grid: int = 40
     collapse_productivity: bool = True
@@ -214,6 +242,19 @@ class SPINHGibbsConfig(GibbsConfig):
             _validate_etas_value(name, value)
         _require_boolean("sample_z", self.sample_z)
         _require_boolean("collapse_productivity", self.collapse_productivity)
+        _require_boolean("adapt_mala", self.adapt_mala)
+        if self.adapt_mala and self.etas_adaptation_end is None:
+            raise ValueError("MALA adaptation requires a finite etas_adaptation_end.")
+        for name in ("etas_block_steps", "etas_block_targets"):
+            values = getattr(self, name)
+            if not isinstance(values, dict) or set(values) - {"A_alpha", "c_p", "d_q_gamma"}:
+                raise ValueError(f"{name} must map ETAS block names to positive numbers.")
+            for block, value in values.items():
+                _require_real(f"{name}[{block}]", value, minimum=0, strict=True)
+                if name == "etas_block_targets" and value >= 1:
+                    raise ValueError("ETAS block acceptance targets must be below one.")
+        if self.etas_adaptation_window is not None:
+            _require_integer("etas_adaptation_window", self.etas_adaptation_window, minimum=20)
         _require_real(
             "sigma_mh_etas",
             self.sigma_mh_etas,

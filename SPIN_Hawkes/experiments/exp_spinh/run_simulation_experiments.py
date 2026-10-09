@@ -18,21 +18,28 @@ for candidate in search_roots + [path / "SPIN_Hawkes" for path in search_roots]:
 else:
     raise RuntimeError("Open the repository folder before running this script.")
 
-from experiments.exp_spinh.simulation_settings import METHODS
-from experiments.exp_spinh.simulation_runner import execute, main, run as run, should_use_editor_settings
+from experiments.exp_spinh.simulation_settings import METHODS  # noqa: E402
+from experiments.exp_spinh.simulation_runner import (  # noqa: E402
+    execute,
+    main,
+    run as run,
+    should_use_editor_settings,
+)
 
 EDITOR_ACTION = "run"             # "run" or "postprocess"
 EDITOR_PROFILE = "full"           # complete production budgets
 EDITOR_EXPERIMENT = "all"         # run Experiment 1, save it, then run Experiment 2
 EDITOR_METHODS = tuple(METHODS)    # M1--M5
+EDITOR_ACCURACY_PANELS = ("benchmark", "recovery")  # N~400 M1--M5, then N~800 M2--M5
+EDITOR_MALA_STEP = 0.5             # validated positive start; 200-iteration pilots tune each Gibbs fit
 EDITOR_N_JOBS = -1                 # all safe workers, capped automatically by RAM
-EDITOR_RESUME = False              # False: start over; True: reuse completed checkpoints
+EDITOR_RESUME = True               # resume compatible tasks after an interruption
 EDITOR_SAVE_FIGURES = True
 EDITOR_SHOW_FIGURES = False
 EDITOR_REPLICATE_BOXPLOTS = False  # optional distribution study for Experiment 1
 EDITOR_OUTPUT_DIR = None           # None: results/spinh_test/<profile>
 
-# Optional overrides; all numerical defaults live in simulation_settings.py.
+# Other optional overrides; numerical defaults live in simulation_settings.py.
 EDITOR_CAMPAIGN_OVERRIDES = {
     # "n_replicates": 100,
     # Example: "gibbs_iterations": 4000,
@@ -46,13 +53,17 @@ def editor_run_options():
         "profile": EDITOR_PROFILE,
         "experiment": EDITOR_EXPERIMENT,
         "methods": tuple(EDITOR_METHODS),
+        "accuracy_panels": EDITOR_ACCURACY_PANELS,
         "n_jobs": EDITOR_N_JOBS,
         "resume": EDITOR_RESUME,
         "save_figures": EDITOR_SAVE_FIGURES,
         "show_figures": EDITOR_SHOW_FIGURES,
         "replicate_boxplots": EDITOR_REPLICATE_BOXPLOTS,
         "output_dir": EDITOR_OUTPUT_DIR,
-        "campaign_overrides": dict(EDITOR_CAMPAIGN_OVERRIDES),
+        "campaign_overrides": {
+            **EDITOR_CAMPAIGN_OVERRIDES,
+            "mala_step": EDITOR_MALA_STEP,
+        },
     }
 
 

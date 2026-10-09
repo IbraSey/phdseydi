@@ -1,4 +1,9 @@
 .DS_Store
+**/.DS_Store
+*.gitkeep
+._*
+.AppleDouble
+.LSOverride
 
 # Pictures
 *.png
@@ -8,6 +13,30 @@
 
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# Restartable experiment checkpoints and generated outputs
+.checkpoints/
+results/
+
+# Local environments and Python build products
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
+*.swp
 # pixi environments
 .pixi/*
 !.pixi/config.toml

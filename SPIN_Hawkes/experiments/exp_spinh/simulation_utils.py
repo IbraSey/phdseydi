@@ -18,6 +18,9 @@ import numpy as np
 
 from .runner_utils import calibration_slot
 from .simulation_settings import (
+    PARTITION_MH_BLOCK_STEPS,
+    PARTITION_MH_BLOCK_TARGETS,
+    PARTITION_MH_ADAPTATION_WINDOW,
     ETAS_PARAMETER_NAMES,
     ETAS_SPATIAL_QUADRATURE,
     INITIAL_BETA,
@@ -25,7 +28,9 @@ from .simulation_settings import (
     INITIAL_GAMMA_FACTORS,
     MAGNITUDE_MAX,
     MAGNITUDE_MIN,
-    MALA_CURVATURE_SCALE,
+    MALA_ACCEPTANCE_BOUNDS,
+    MALA_MAX_PILOT_TRIALS,
+    MALA_PILOT_ITERATIONS,
     METHODS,
     MH_BETA_SCALE,
     MH_ETAS_REFERENCE_EVENTS,
@@ -36,6 +41,7 @@ from .simulation_settings import (
     REPO_ROOT,
     THETA_PRIORS,
     TRUNCATION_RELATIVE_DENSITY,
+    TRUNCATION_MAX_TAIL_MASS,
     VI_ETAS_UPDATE_EVERY,
     VI_ETAS_UPDATE_START,
     VI_GAMMA_QUADRATURE_NODES,
@@ -60,6 +66,62 @@ from spatial import SpatialQuadrature, midpoint_quadrature
 
 _ARVIZ_MODULE = None
 _ARVIZ_IMPORT_ATTEMPTED = False
+
+
+class MALACalibrationError(RuntimeError):
+    """No tested MALA step reached the specified pilot acceptance band."""
+
+
+def calibrate_mala_step(initial_step, evaluate_acceptance, *, refine_midpoint=True):
+    """Bracket the interval midpoint using common-seed 200-step pilots.
+
+    Stop when the observed acceptance is within one nominal Monte Carlo
+    standard error of the midpoint; this is a numerical tuning tolerance,
+    not a confidence guarantee for a dependent MCMC acceptance sequence.
+    When production includes warm-up adaptation, finding the acceptance band
+    suffices: that adaptation will refine the step before retained sampling.
+    """
+    lower, upper = MALA_ACCEPTANCE_BOUNDS
+    target = (lower + upper) / 2.0
+    tolerance = math.sqrt(target * (1.0 - target) / MALA_PILOT_ITERATIONS)
+    step = float(initial_step)
+    too_small = None  # Its acceptance was above the target.
+    too_large = None  # Its acceptance was below the target.
+    trials = []
+    best_trial = None
+    for _ in range(MALA_MAX_PILOT_TRIALS):
+        if not math.isfinite(step) or step <= 0.0:
+            break
+        rate = float(evaluate_acceptance(step))
+        if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise MALACalibrationError(
+                f"Invalid MALA pilot acceptance {rate!r} at step {step:.6g}."
+            )
+        trial = {"step": step, "acceptance": rate}
+        trials.append(trial)
+        if lower <= rate <= upper and (
+            best_trial is None
+            or abs(rate - target) < abs(best_trial["acceptance"] - target)
+        ):
+            best_trial = trial
+        if (not refine_midpoint and lower <= rate <= upper) or abs(rate - target) <= tolerance:
+            return step, trials, rate
+        if rate < target:
+            too_large = step
+            step = math.sqrt(too_small * too_large) if too_small else step / 2.0
+        else:
+            too_small = step
+            step = math.sqrt(too_small * too_large) if too_large else step * 2.0
+    if best_trial is not None:
+        return best_trial["step"], trials, best_trial["acceptance"]
+    history = ", ".join(
+        f"{trial['step']:.6g}: {trial['acceptance']:.1%}" for trial in trials
+    )
+    raise MALACalibrationError(
+        f"No MALA step reached {lower:.0%}–{upper:.0%} acceptance in "
+        f"{MALA_PILOT_ITERATIONS}-iteration pilots after {len(trials)} trials "
+        f"(initial step {initial_step:.6g}; {history})."
+    )
 
 
 def latent_field(x, y, scale=1.0):
@@ -161,16 +223,25 @@ def simulate_configuration(
     )
 
 
-def temporal_cutoff(parameters, relative_density=TRUNCATION_RELATIVE_DENSITY, *, horizon=None):
-    """Return the first lag below a chosen relative temporal-kernel height."""
+def temporal_cutoff(parameters, relative_density=TRUNCATION_RELATIVE_DENSITY, *,
+                    horizon=None, max_tail_mass=TRUNCATION_MAX_TAIL_MASS):
+    """Kernel-height cutoff, enlarged to bound the omitted temporal mass."""
     relative_density = float(relative_density)
     if not 0.0 < relative_density < 1.0:
         raise ValueError("relative_density must lie in (0, 1).")
     cutoff = float(parameters.c * (relative_density ** (-1.0 / parameters.p) - 1.0))
+    if not np.isfinite(max_tail_mass) or not 0.0 < max_tail_mass < 1.0:
+        raise ValueError("max_tail_mass must lie in (0, 1).")
+    horizon_tail = 0.0
     if horizon is not None:
         horizon = float(horizon)
         if not np.isfinite(horizon) or horizon <= 0:
             raise ValueError("horizon must be finite and positive.")
+        horizon_tail = (parameters.c / (parameters.c + horizon)) ** (parameters.p - 1.0)
+    tail = horizon_tail + max_tail_mass * (1.0 - horizon_tail)
+    mass_cutoff = parameters.c * np.expm1(-np.log(tail) / (parameters.p - 1.0))
+    cutoff = max(cutoff, float(mass_cutoff))
+    if horizon is not None:
         cutoff = min(horizon, cutoff)
     return cutoff
 
@@ -267,7 +338,9 @@ def mcmc_diagnostics(chains):
             if len(values) >= 2:
                 result["rhat"][k] = float(az.rhat(values, method="rank"))
             result["ess_bulk"][k] = float(az.ess(values, method="bulk"))
-            result["ess_tail"][k] = float(az.ess(values, method="tail"))
+            result["ess_tail"][k] = float(
+                az.ess(values, method="tail", prob=(0.05, 0.95))
+            )
             result["mcse_mean"][k] = float(az.mcse(values, method="mean"))
     return result
 
@@ -345,24 +418,12 @@ def gibbs_parameter_traces(bundle):
     return np.stack([chain[-minimum:] for chain in chains], axis=0)
 
 
-def epsilon_precision(model, counts):
-    """Initial epsilon curvature, matching the all-background Gibbs start."""
-    counts = np.asarray(counts, dtype=float).reshape(-1)
-    if counts.size != model.n_domains or np.any(counts < 0) or not np.all(np.isfinite(counts)):
-        raise ValueError("counts must contain one finite non-negative count per zone.")
-    covariance = model.epsilon_prior_covariance() + model.jitter * np.eye(model.n_domains)
-    return np.linalg.solve(covariance, np.eye(model.n_domains)) + np.diag(2 * counts)
-
-
 def proposal_steps(model, catalog):
-    """Catalogue-specific steps chosen before inference, with no truth leakage."""
+    """Catalogue-specific Metropolis starts, excluding the explicit MALA step."""
     if len(catalog) == 0:
         raise ValueError("Proposal initialization requires observed events.")
-    indices = model.validate_catalog(catalog)
-    counts = np.bincount(indices, minlength=model.n_domains)
-    curvature = float(np.linalg.eigvalsh(epsilon_precision(model, counts))[-1])
+    model.validate_catalog(catalog)
     return {
-        "mala_step": MALA_CURVATURE_SCALE / np.sqrt(curvature),
         "sigma_mh_etas": MH_ETAS_REFERENCE_STEP * np.sqrt(MH_ETAS_REFERENCE_EVENTS / len(catalog)),
         "sigma_mh_beta": MH_BETA_SCALE / np.sqrt(len(catalog)),
     }
@@ -491,6 +552,7 @@ def fit_spinh_method(
     mala_step=None,
     background_quadrature=None,
     spatial_compensator_quadrature=None,
+    partition_tuning=False,
 ):
     """Fit one of M1--M5 and return a uniform result bundle."""
     if method not in METHODS:
@@ -515,11 +577,17 @@ def fit_spinh_method(
             background_quadrature,
             spatial_compensator_quadrature,
         )
-    steps = proposal_steps(model, catalog)
-    if mala_step is not None:
-        steps["mala_step"] = float(mala_step)
-    fits = []
-    for chain in range(campaign.n_chains):
+    proposal_scales = proposal_steps(model, catalog)
+    block_steps = (dict(PARTITION_MH_BLOCK_STEPS)
+                   if partition_tuning else {})
+    warmup_iterations = int(campaign.gibbs_iterations * campaign.gibbs_burn_in)
+    initial_mala_step = campaign.mala_step if mala_step is None else mala_step
+    if initial_mala_step is None:
+        raise ValueError("mala_step must be set explicitly for Gibbs inference.")
+    if not math.isfinite(float(initial_mala_step)) or initial_mala_step <= 0:
+        raise ValueError("mala_step must be finite and positive.")
+
+    def run_gibbs(step, iterations, thin, chain_seed, production=False):
         sparse_gp = None
         if settings["gp_backend"] == "sparse":
             sparse_gp = SparseGP.from_bounds(
@@ -528,39 +596,93 @@ def fit_spinh_method(
                 model.gp_prior.variance,
                 model.gp_prior.length_scale,
             )
-        adaptation_end = int(campaign.gibbs_iterations * campaign.gibbs_adaptation_fraction)
-        adaptation_start = min(200, campaign.gibbs_iterations // 4, adaptation_end - 1)
+        adaptation_end = max(1, int(iterations * campaign.gibbs_adaptation_fraction))
+        adaptation_start = min(200, iterations // 4, adaptation_end - 1)
         config = SPINHGibbsConfig(
-            n_iter=campaign.gibbs_iterations,
-            thin=campaign.gibbs_thin,
-            **steps,
+            n_iter=iterations,
+            thin=thin,
+            mala_step=step,
+            **proposal_scales,
             verbose=False,
             use_calibration=False,
             beta_init=INITIAL_BETA,
             theta_priors=THETA_PRIORS,
             adaptation_start=adaptation_start,
             etas_adaptation_end=adaptation_end,
+            etas_block_steps=block_steps,
+            etas_block_targets=(dict(PARTITION_MH_BLOCK_TARGETS)
+                                if partition_tuning else {}),
+            etas_adaptation_window=PARTITION_MH_ADAPTATION_WINDOW if partition_tuning else None,
+            adapt_mala=partition_tuning and production,
             proposal_jitter=1e-6,
             spatial_compensator_grid=ETAS_SPATIAL_QUADRATURE,
             parent_time_window=cutoff,
         )
-        fits.append(
-            model.gibbs(
-                catalog,
-                config=config,
-                gp_backend=settings["gp_backend"],
-                sparse_gp=sparse_gp,
-                rng_seed=int(seed + 1009 * chain),
-                spatial_quadrature=spatial_compensator_quadrature,
-            )
+        return model.gibbs(
+            catalog,
+            config=config,
+            gp_backend=settings["gp_backend"],
+            sparse_gp=sparse_gp,
+            rng_seed=chain_seed,
+            spatial_quadrature=spatial_compensator_quadrature,
         )
+
+    # Common random numbers make candidate steps comparable. The production
+    # chains retain their original seeds and never reuse the pilot draw stream.
+    pilot_seed = int(
+        np.random.SeedSequence([int(seed), 0x4D414C41]).generate_state(1)[0]
+    )
+
+    def pilot_acceptance(step):
+        try:
+            pilot = run_gibbs(step, MALA_PILOT_ITERATIONS, 1, pilot_seed)
+        except Exception as error:
+            raise MALACalibrationError(
+                f"MALA pilot failed at step {step:.6g}: {error}"
+            ) from error
+        history = np.asarray(pilot.raw["acceptance_history"]["eps"])
+        if len(history) != MALA_PILOT_ITERATIONS:
+            raise MALACalibrationError(
+                "MALA pilot returned an incomplete acceptance history."
+            )
+        return float(np.mean(history))
+
+    pilot_started = time.perf_counter()
+    chosen_mala_step, pilot_trials, pilot_acceptance_rate = calibrate_mala_step(
+        initial_mala_step, pilot_acceptance, refine_midpoint=not partition_tuning
+    )
+    pilot_runtime_seconds = time.perf_counter() - pilot_started
+    steps = {**proposal_scales, "mala_step": chosen_mala_step}
+    chain_seeds = [int(seed + 1009 * chain) for chain in range(campaign.n_chains)]
+    production_started = time.perf_counter()
+    fits = [
+        run_gibbs(
+            chosen_mala_step,
+            campaign.gibbs_iterations,
+            campaign.gibbs_thin,
+            chain_seed,
+            production=True,
+        )
+        for chain_seed in chain_seeds
+    ]
+    production_runtime_seconds = time.perf_counter() - production_started
+    iterations_run = int(fits[0].raw["n_iter"])
+    if len({fit.raw["n_iter"] for fit in fits}) != 1:
+        raise ValueError("Every Gibbs chain in one fit must use the same iteration budget.")
+    burn_in = warmup_iterations / iterations_run
+    main_adaptation_end = max(
+        1, int(campaign.gibbs_iterations * campaign.gibbs_adaptation_fraction)
+    )
+    main_adaptation_start = min(
+        200, campaign.gibbs_iterations // 4, main_adaptation_end - 1
+    )
     runtime = time.perf_counter() - started
     parameter_chains = _gibbs_parameter_chains(
-        fits, burn_in=campaign.gibbs_burn_in
+        fits, burn_in=burn_in
     )
     parameter_diagnostics = mcmc_diagnostics(parameter_chains)
     ess = float(np.min(parameter_diagnostics["ess_bulk"]))
-    background_chains = _gibbs_background_chains(fits, campaign.gibbs_burn_in)
+    background_chains = _gibbs_background_chains(fits, burn_in)
     background_diagnostics = mcmc_diagnostics(background_chains)
     diagnostics = {
         "status": "ok",
@@ -572,9 +694,26 @@ def fit_spinh_method(
         "ess_background_min": float(np.min(background_diagnostics["ess_bulk"])),
         "ess_background_tail_min": float(np.min(background_diagnostics["ess_tail"])),
         "mcmc_diagnostic_method": "arviz_rank_bulk_tail",
-        "n_iter_run": campaign.gibbs_iterations,
-        "burn_in_fraction": campaign.gibbs_burn_in,
+        "n_iter_run": iterations_run,
+        "burn_in_fraction": burn_in,
+        "warmup_iterations": warmup_iterations,
         "collapse_productivity": bool(fits[0].raw["collapse_productivity"]),
+        "mala_step_initial": float(initial_mala_step),
+        "mala_chain_final_steps": [
+            fit.raw["proposal_steps"]["mala_step"] for fit in fits
+        ],
+        "mala_pilot_seed": pilot_seed,
+        "mala_chain_seeds": chain_seeds,
+        "mala_pilot_iterations": MALA_PILOT_ITERATIONS,
+        "mala_pilot_refine_midpoint": not partition_tuning,
+        "mala_pilot_trials": len(pilot_trials),
+        "mala_pilot_steps": [trial["step"] for trial in pilot_trials],
+        "mala_pilot_acceptance_rates": [
+            trial["acceptance"] for trial in pilot_trials
+        ],
+        "mala_pilot_acceptance": pilot_acceptance_rate,
+        "mala_pilot_runtime_seconds": float(pilot_runtime_seconds),
+        "mala_production_runtime_seconds": float(production_runtime_seconds),
         **steps,
     }
     if len(fits) < 2:
@@ -596,16 +735,27 @@ def fit_spinh_method(
     for block in fits[0].raw["acceptance_history"]:
         histories = [fit.raw["acceptance_history"][block] for fit in fits]
         for phase, start, stop in (
-            ("initial", 0, config.adaptation_start + 1),
+            ("initial", 0, main_adaptation_start + 1),
             (
                 "retained",
-                int(campaign.gibbs_iterations * campaign.gibbs_burn_in),
-                campaign.gibbs_iterations,
+                warmup_iterations,
+                iterations_run,
             ),
         ):
             diagnostics[f"acceptance_{block}_{phase}"] = float(np.mean(
                 np.concatenate([history[start:stop] for history in histories])
             ))
+        diagnostics[f"acceptance_{block}_full"] = float(np.mean(
+            np.concatenate(histories)
+        ))
+    diagnostics["mala_chain_acceptance_rates"] = [
+        float(np.mean(fit.raw["acceptance_history"]["eps"][warmup_iterations:])) for fit in fits
+    ]
+    lower_acceptance, upper_acceptance = MALA_ACCEPTANCE_BOUNDS
+    diagnostics["mala_production_within_band"] = all(
+        lower_acceptance <= rate <= upper_acceptance
+        for rate in diagnostics["mala_chain_acceptance_rates"]
+    )
     if campaign.gibbs_iterations >= 200:
         problematic = []
         for block in fits[0].raw["acceptance_history"]:
@@ -623,7 +773,7 @@ def fit_spinh_method(
     for block, adaptation in fits[0].raw.get("etas_adaptation", {}).items():
         diagnostics[f"proposal_scale_{block}"] = adaptation["scale"]
     return FitBundle(
-        method, model, tuple(fits), runtime, diagnostics, campaign.gibbs_burn_in
+        method, model, tuple(fits), runtime, diagnostics, burn_in
     ), diagnostics
 
 
@@ -710,10 +860,12 @@ def _binary_f1(truth, predicted):
     return float(2 * true_positive / denominator) if denominator else 1.0
 
 
-def branching_metrics(bundle, true_parent_indices, event_times, cutoff):
-    true_parent_indices = np.asarray(true_parent_indices, dtype=int)
-    true_labels = np.where(true_parent_indices < 0, 0, true_parent_indices + 1)
-    true_background = true_parent_indices < 0
+def branching_metrics(bundle, true_background):
+    """Binary background/triggered recovery; no parent-identity scoring."""
+    true_background = np.asarray(true_background)
+    if true_background.ndim != 1 or not np.isin(true_background, [0, 1]).all():
+        raise ValueError("true_background must be a one-dimensional binary array.")
+    true_background = true_background.astype(bool)
     if METHODS[bundle.method]["family"] == "gibbs":
         chains = []
         burn_in = getattr(bundle, "burn_in", 0.5)
@@ -722,55 +874,27 @@ def branching_metrics(bundle, true_parent_indices, event_times, cutoff):
             chains.append(values[int(burn_in * len(values)) :])
         labels = np.concatenate(chains, axis=0)
         p_background = np.mean(labels == 0, axis=0)
-        true_probability = np.mean(labels == true_labels[None, :], axis=0)
     else:
-        probabilities = bundle.fits[0].state.branching.probabilities
         p_background = bundle.fits[0].state.branching.p_background
-        if hasattr(probabilities, "tocsr"):
-            probabilities = probabilities.tocsr()
-            true_probability = np.array(
-                [probabilities[event, label] for event, label in enumerate(true_labels)],
-                dtype=float,
-            )
-        else:
-            true_probability = probabilities[np.arange(len(true_labels)), true_labels]
+    if np.shape(p_background) != true_background.shape:
+        raise ValueError("Background truth and posterior probabilities must align.")
     predicted_background = p_background >= 0.5
-    triggered = ~true_background
-    if METHODS[bundle.method]["truncated"]:
-        retained = np.ones(len(true_labels), dtype=bool)
-        child = np.flatnonzero(triggered)
-        retained[child] = (
-            np.asarray(event_times)[child] - np.asarray(event_times)[true_parent_indices[child]]
-            <= float(cutoff)
-        )
-        candidate_recall = float(np.mean(retained[triggered])) if np.any(triggered) else float("nan")
-    else:
-        candidate_recall = 1.0
     return {
         "background_brier": float(np.mean((p_background - true_background) ** 2)),
         "background_accuracy": float(np.mean(predicted_background == true_background)),
         "background_f1": _binary_f1(true_background, predicted_background),
-        "mean_true_state_probability": float(np.mean(true_probability)),
-        "candidate_recall": candidate_recall,
         "estimated_background_fraction": float(np.mean(p_background)),
     }
 
 
-def candidate_diagnostics(event_times, parent_indices, cutoff):
+def candidate_diagnostics(event_times, cutoff):
     times = np.asarray(event_times, dtype=float)
     graph = TemporalCandidateGraph.from_times(times, cutoff)
-    parent_indices = np.asarray(parent_indices, dtype=int)
-    triggered = parent_indices >= 0
-    child = np.flatnonzero(triggered)
-    recall = float(
-        np.mean(times[child] - times[parent_indices[child]] <= cutoff)
-    ) if child.size else float("nan")
     counts = np.diff(graph.indptr)
     return {
         **graph.diagnostics(),
         "mean_candidate_count": float(np.mean(counts)) if counts.size else 0.0,
         "candidate_count_q95": float(np.quantile(counts, 0.95)) if counts.size else 0.0,
-        "true_parent_candidate_recall": recall,
     }
 
 
@@ -958,7 +1082,7 @@ def summarize_records(records, group_fields, metrics):
     return summaries
 
 # Protocol re-exports retained for existing experiment callers.
-from .simulation_settings import (  # noqa: F401
+from .simulation_settings import (  # noqa: E402, F401
     ACCURACY_BACKGROUND_MUS,
     ACCURACY_DURATION_CALIBRATION_REPLICATES,
     ACCURACY_DURATION_CALIBRATION_SEED,
